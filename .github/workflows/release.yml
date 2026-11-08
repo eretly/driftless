@@ -1,0 +1,34 @@
+name: Tagged Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+      - name: Test
+        run: go test -race ./...
+      - name: Build Cross-Platform Binaries
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o driftless-linux-amd64 main.go
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o driftless-linux-arm64 main.go
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o driftless-windows-amd64.exe main.go
+          CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -ldflags="-s -w" -o driftless-windows-arm64.exe main.go
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o driftless-darwin-amd64 main.go
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o driftless-darwin-arm64 main.go
+          sha256sum driftless-* > checksums.txt
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            driftless-*
+            checksums.txt
+          generate_release_notes: true
