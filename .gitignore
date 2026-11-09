@@ -1,0 +1,10 @@
+driftless
+driftless.exe
+driftless-*
+*.pem
+*.key
+*.crt
+.driftless-certs/
+.driftless-upnp.json
+.driftless-upnp.json.tmp
+.driftless-ddns.json

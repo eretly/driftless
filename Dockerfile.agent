@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1
+ARG GO_VERSION=1.23
+
+FROM golang:${GO_VERSION}-alpine AS builder
+WORKDIR /src
+RUN apk add --no-cache git ca-certificates tzdata
+COPY go.mod go.sum ./
+RUN go mod download
+COPY main.go .
+ARG TARGETARCH=amd64
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o /out/driftless main.go
+
+FROM scratch
+COPY --from=builder /out/driftless /driftless
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+USER 65532:65532
+ENTRYPOINT ["/driftless", "client"]
