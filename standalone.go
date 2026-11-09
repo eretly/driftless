@@ -254,6 +254,15 @@ var (
 	activeUPnPMappings []trackedRouterMapping
 )
 
+func sameTrackedRouterMapping(a, b trackedRouterMapping) bool {
+	return a.Kind == b.Kind &&
+		a.CtrlURL == b.CtrlURL &&
+		a.ServiceType == b.ServiceType &&
+		a.GatewayIP == b.GatewayIP &&
+		a.Port == b.Port &&
+		strings.EqualFold(a.Proto, b.Proto)
+}
+
 func saveTrackedRouterMappingsLocked() {
 	if len(activeUPnPMappings) == 0 {
 		_ = os.Remove(upnpStateFile)
@@ -269,7 +278,7 @@ func recordTrackedRouterMapping(m trackedRouterMapping) {
 	upnpStateMu.Lock()
 	defer upnpStateMu.Unlock()
 	for _, ex := range activeUPnPMappings {
-		if ex.Kind == m.Kind && ex.CtrlURL == m.CtrlURL && ex.ServiceType == m.ServiceType && ex.GatewayIP == m.GatewayIP && ex.Port == m.Port && ex.Proto == m.Proto {
+		if sameTrackedRouterMapping(ex, m) {
 			return
 		}
 	}
@@ -277,20 +286,29 @@ func recordTrackedRouterMapping(m trackedRouterMapping) {
 	saveTrackedRouterMappingsLocked()
 }
 
-func cleanupRouterMappingsList(list []trackedRouterMapping) int {
+func deleteSingleRouterMapping(m trackedRouterMapping) error {
+	if m.Kind == "upnp" && m.CtrlURL != "" && m.ServiceType != "" {
+		return upnpDeletePortMapping(m.CtrlURL, m.ServiceType, m.Port, m.Proto)
+	}
+	if m.Kind == "natpmp" && m.GatewayIP != "" {
+		return natPMPDeletePortMapping(m.GatewayIP, m.Port, m.Proto)
+	}
+	return nil
+}
+
+// cleanupRouterMappingsList attempts to delete each rule on the router and returns
+// both the count of deleted rules and the slice of rules whose deletion failed.
+func cleanupRouterMappingsList(list []trackedRouterMapping) (int, []trackedRouterMapping) {
 	removed := 0
+	var failed []trackedRouterMapping
 	for _, m := range list {
-		if m.Kind == "upnp" && m.CtrlURL != "" && m.ServiceType != "" {
-			if err := upnpDeletePortMapping(m.CtrlURL, m.ServiceType, m.Port, m.Proto); err == nil {
-				removed++
-			}
-		} else if m.Kind == "natpmp" && m.GatewayIP != "" {
-			if err := natPMPDeletePortMapping(m.GatewayIP, m.Port, m.Proto); err == nil {
-				removed++
-			}
+		if err := deleteSingleRouterMapping(m); err == nil {
+			removed++
+		} else {
+			failed = append(failed, m)
 		}
 	}
-	return removed
+	return removed, failed
 }
 
 func cleanupStaleUPnPState() int {
@@ -303,10 +321,51 @@ func cleanupStaleUPnPState() int {
 		_ = os.Remove(upnpStateFile)
 		return 0
 	}
-	removed := cleanupRouterMappingsList(stale)
-	_ = os.Remove(upnpStateFile)
+	removed, failed := cleanupRouterMappingsList(stale)
+	upnpStateMu.Lock()
+	var kept []trackedRouterMapping
+	for _, cur := range activeUPnPMappings {
+		wasDeleted := false
+		for _, st := range stale {
+			if sameTrackedRouterMapping(cur, st) {
+				stillFailed := false
+				for _, fm := range failed {
+					if sameTrackedRouterMapping(st, fm) {
+						stillFailed = true
+						break
+					}
+				}
+				if !stillFailed {
+					wasDeleted = true
+				}
+				break
+			}
+		}
+		if !wasDeleted {
+			kept = append(kept, cur)
+		}
+	}
+	for _, fm := range failed {
+		exists := false
+		for _, ex := range kept {
+			if sameTrackedRouterMapping(ex, fm) {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			kept = append(kept, fm)
+		}
+	}
+	activeUPnPMappings = kept
+	saveTrackedRouterMappingsLocked()
+	upnpStateMu.Unlock()
+
 	if removed > 0 {
 		log.Printf("[standalone] cleaned up %d stale UPnP/NAT-PMP router port rule(s) from previous session", removed)
+	}
+	if len(failed) > 0 {
+		log.Printf("[standalone] %d stale UPnP/NAT-PMP rule(s) could not be deleted yet (retained in %s for retry)", len(failed), upnpStateFile)
 	}
 	return removed
 }
@@ -314,16 +373,52 @@ func cleanupStaleUPnPState() int {
 func cleanupActiveUPnPMappings() int {
 	upnpStateMu.Lock()
 	toRemove := append([]trackedRouterMapping(nil), activeUPnPMappings...)
-	activeUPnPMappings = nil
-	_ = os.Remove(upnpStateFile)
 	upnpStateMu.Unlock()
 
 	if len(toRemove) == 0 {
+		upnpStateMu.Lock()
+		saveTrackedRouterMappingsLocked()
+		upnpStateMu.Unlock()
 		return 0
 	}
-	removed := cleanupRouterMappingsList(toRemove)
+
+	removed, failed := cleanupRouterMappingsList(toRemove)
+
+	upnpStateMu.Lock()
+	var remaining []trackedRouterMapping
+	for _, cur := range activeUPnPMappings {
+		wasAttempted := false
+		for _, att := range toRemove {
+			if sameTrackedRouterMapping(cur, att) {
+				wasAttempted = true
+				break
+			}
+		}
+		if !wasAttempted {
+			remaining = append(remaining, cur)
+		}
+	}
+	for _, fm := range failed {
+		exists := false
+		for _, r := range remaining {
+			if sameTrackedRouterMapping(r, fm) {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			remaining = append(remaining, fm)
+		}
+	}
+	activeUPnPMappings = remaining
+	saveTrackedRouterMappingsLocked()
+	upnpStateMu.Unlock()
+
 	if removed > 0 {
 		log.Printf("[standalone] removed %d UPnP/NAT-PMP router port rule(s) on shutdown", removed)
+	}
+	if len(failed) > 0 {
+		log.Printf("[standalone] warning: %d UPnP/NAT-PMP rule(s) could not be removed (router unreachable); kept in %s for next startup cleanup", len(failed), upnpStateFile)
 	}
 	return removed
 }

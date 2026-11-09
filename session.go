@@ -537,8 +537,39 @@ func (us *gwUDPSession) detachPendingForReplayLocked() [][]byte {
 	return out
 }
 
+func (us *gwUDPSession) restoreUnsentReplayLocked(unsent [][]byte) {
+	if len(unsent) == 0 {
+		return
+	}
+	combined := make([][]byte, 0, len(unsent)+len(us.pendingPkts))
+	var addedBytes int64
+	for i, pkt := range unsent {
+		unsent[i] = nil
+		if pkt != nil {
+			combined = append(combined, pkt)
+			addedBytes += int64(len(pkt))
+		}
+	}
+	for i, pkt := range us.pendingPkts {
+		us.pendingPkts[i] = nil
+		if pkt != nil {
+			combined = append(combined, pkt)
+		}
+	}
+	us.pendingPkts = combined
+	us.queuedBytes += addedBytes
+	for len(us.pendingPkts) > 0 && (len(us.pendingPkts) > maxUDPBufferedPkts || us.queuedBytes > maxPerSessionUDPBytes) {
+		droppedLen := int64(len(us.pendingPkts[0]))
+		us.pendingPkts[0] = nil
+		us.pendingPkts = us.pendingPkts[1:]
+		us.queuedBytes -= droppedLen
+		globalUDPBufferedBytes.Add(-droppedLen)
+		metricUDPDroppedTotal.Add(1)
+	}
+}
+
 // replayPendingToStream attaches st to the session and writes all queued packets while holding
-// their globalUDPBufferedBytes reservation until each packet leaves memory.
+// their globalUDPBufferedBytes reservation until each packet leaves memory and its slice slot is nilled.
 func (us *gwUDPSession) replayPendingToStream(st TunnelStream) error {
 	us.mu.Lock()
 	if us.stream != nil && us.stream != st {
@@ -552,20 +583,22 @@ func (us *gwUDPSession) replayPendingToStream(st TunnelStream) error {
 	for idx, qPkt := range queued {
 		if err := writeUDPPacket(st, qPkt); err != nil {
 			us.mu.Lock()
-			for _, rem := range queued[idx:] {
-				globalUDPBufferedBytes.Add(-int64(len(rem)))
-				us.enqueuePacketLocked(rem)
-			}
+			us.restoreUnsentReplayLocked(queued[idx:])
 			us.mu.Unlock()
 			return err
 		}
-		globalUDPBufferedBytes.Add(-int64(len(qPkt)))
+		pktLen := int64(len(qPkt))
+		queued[idx] = nil
+		globalUDPBufferedBytes.Add(-pktLen)
 		metricUDPReplayedTotal.Add(1)
 	}
 	return nil
 }
 
 func (us *gwUDPSession) releasePendingLocked() {
+	for i := range us.pendingPkts {
+		us.pendingPkts[i] = nil
+	}
 	if us.queuedBytes > 0 {
 		globalUDPBufferedBytes.Add(-us.queuedBytes)
 		us.queuedBytes = 0
@@ -684,6 +717,37 @@ func (u *agentUDPSession) detachPendingForReplayLocked() [][]byte {
 	return out
 }
 
+func (u *agentUDPSession) restoreUnsentReplayLocked(unsent [][]byte) {
+	if len(unsent) == 0 {
+		return
+	}
+	combined := make([][]byte, 0, len(unsent)+len(u.pendingPkts))
+	var addedBytes int64
+	for i, pkt := range unsent {
+		unsent[i] = nil
+		if pkt != nil {
+			combined = append(combined, pkt)
+			addedBytes += int64(len(pkt))
+		}
+	}
+	for i, pkt := range u.pendingPkts {
+		u.pendingPkts[i] = nil
+		if pkt != nil {
+			combined = append(combined, pkt)
+		}
+	}
+	u.pendingPkts = combined
+	u.queuedBytes += addedBytes
+	for len(u.pendingPkts) > 0 && (len(u.pendingPkts) > maxUDPBufferedPkts || u.queuedBytes > maxPerSessionUDPBytes) {
+		droppedLen := int64(len(u.pendingPkts[0]))
+		u.pendingPkts[0] = nil
+		u.pendingPkts = u.pendingPkts[1:]
+		u.queuedBytes -= droppedLen
+		globalUDPBufferedBytes.Add(-droppedLen)
+		metricUDPDroppedTotal.Add(1)
+	}
+}
+
 func (u *agentUDPSession) replayPendingToStream(st TunnelStream) error {
 	u.mu.Lock()
 	if u.stream != nil && u.stream != st {
@@ -697,25 +761,25 @@ func (u *agentUDPSession) replayPendingToStream(st TunnelStream) error {
 	for idx, qPkt := range queued {
 		if err := writeUDPPacket(st, qPkt); err != nil {
 			u.mu.Lock()
-			for _, rem := range queued[idx:] {
-				globalUDPBufferedBytes.Add(-int64(len(rem)))
-				u.enqueuePacketLocked(rem)
-			}
+			u.restoreUnsentReplayLocked(queued[idx:])
 			u.mu.Unlock()
 			return err
 		}
-		globalUDPBufferedBytes.Add(-int64(len(qPkt)))
+		pktLen := int64(len(qPkt))
+		queued[idx] = nil
+		globalUDPBufferedBytes.Add(-pktLen)
 		metricUDPReplayedTotal.Add(1)
 	}
 	return nil
 }
 
 func (u *agentUDPSession) releasePendingLocked() {
+	for i := range u.pendingPkts {
+		u.pendingPkts[i] = nil
+	}
 	if u.queuedBytes > 0 {
 		globalUDPBufferedBytes.Add(-u.queuedBytes)
 		u.queuedBytes = 0
 	}
 	u.pendingPkts = nil
 }
-
-

@@ -830,6 +830,7 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 	activeRouterRules := make(map[string]bool)
 	var lease3600Attempts int
 	var deleteCalls int
+	var failDeletePort int
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ctl/WANPPP", func(w http.ResponseWriter, r *http.Request) {
@@ -877,6 +878,10 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 					proto = bodyStr[i+len("<NewProtocol>") : i+end]
 				}
 			}
+			if failDeletePort > 0 && port == failDeletePort {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
 			delete(activeRouterRules, fmt.Sprintf("%s:%d", proto, port))
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`<s:Envelope><s:Body><u:DeletePortMappingResponse/></s:Body></s:Envelope>`))
@@ -917,6 +922,8 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 		upnpMu.Unlock()
 		t.Fatalf("missing expected UPnP rules on router: %+v", activeRouterRules)
 	}
+	// Simulate router failing to delete port 8080 on first shutdown attempt
+	failDeletePort = 8080
 	upnpMu.Unlock()
 
 	// Verify crash-recovery state file (.driftless-upnp-state.json) was persisted
@@ -924,19 +931,32 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 		t.Fatalf("expected %s to exist while UPnP mappings are active: %v", upnpStateFile, err)
 	}
 
-	// Verify graceful shutdown deletes all created UPnP mappings from the router and removes state file
+	// First shutdown attempt: 2 rules deleted, 1 rule (8080) fails -> state file MUST remain with only port 8080!
 	removed := cleanupActiveUPnPMappings()
-	if removed != 3 {
-		t.Fatalf("expected 3 UPnP rules deleted on shutdown, got %d", removed)
+	if removed != 2 {
+		t.Fatalf("expected 2 UPnP rules deleted when port 8080 fails, got %d", removed)
+	}
+	if _, err := os.Stat(upnpStateFile); err != nil {
+		t.Fatalf("expected %s to be retained when a UPnP DeletePortMapping call fails: %v", upnpStateFile, err)
+	}
+
+	// Router recovers on next startup -> cleanupStaleUPnPState retries remaining rule (8080) and deletes state file
+	upnpMu.Lock()
+	failDeletePort = 0
+	upnpMu.Unlock()
+
+	staleRemoved := cleanupStaleUPnPState()
+	if staleRemoved != 1 {
+		t.Fatalf("expected 1 remaining stale UPnP rule (8080) deleted on retry, got %d", staleRemoved)
 	}
 	upnpMu.Lock()
-	if len(activeRouterRules) != 0 || deleteCalls != 3 {
+	if len(activeRouterRules) != 0 || deleteCalls != 4 {
 		upnpMu.Unlock()
-		t.Fatalf("expected 0 remaining router rules and 3 DeletePortMapping calls, got rules=%+v deletes=%d", activeRouterRules, deleteCalls)
+		t.Fatalf("expected 0 remaining router rules and 4 total DeletePortMapping calls, got rules=%+v deletes=%d", activeRouterRules, deleteCalls)
 	}
 	upnpMu.Unlock()
 	if _, err := os.Stat(upnpStateFile); !os.IsNotExist(err) {
-		t.Fatalf("expected %s to be deleted after clean shutdown", upnpStateFile)
+		t.Fatalf("expected %s to be deleted after all rules are removed", upnpStateFile)
 	}
 
 	// 3. Verify UDP global memory budget stays reserved DURING replay and is released only after write finishes
@@ -965,10 +985,9 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 		t.Fatalf("UDP replay memory leak/accounting bug: expected 8192 bytes still reserved during replay, got %d", got)
 	}
 
-	// Re-queue and replay through a real TunnelStream pair to verify full release to 0 after stream write
+	// Restore and replay through a real TunnelStream pair to verify full release to 0 after stream write
 	us.mu.Lock()
-	us.pendingPkts = detached
-	us.queuedBytes = 8192
+	us.restoreUnsentReplayLocked(detached)
 	us.mu.Unlock()
 
 	p1, p2 := net.Pipe()
