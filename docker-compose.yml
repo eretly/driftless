@@ -1,0 +1,35 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    ports:
+      - "4242:4242/udp"
+      - "4242:4242/tcp"
+      - "8080:8080"
+      - "8096:8096"
+      - "8888:8888"
+    environment:
+      - DRIFTLESS_TOKEN=${DRIFTLESS_TOKEN:-}
+    volumes:
+      - gateway-certs:/src/.driftless-certs
+    command: >
+      -quic 0.0.0.0:4242
+      -ports 8080:80,8096:8096
+      -direct :8888
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    network_mode: host
+    environment:
+      - DRIFTLESS_TOKEN=${DRIFTLESS_TOKEN:?Set DRIFTLESS_TOKEN in .env or environment}
+    command: >
+      -quic 127.0.0.1:4242
+      -host 127.0.0.1
+    restart: unless-stopped
+
+volumes:
+  gateway-certs:
