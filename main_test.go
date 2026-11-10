@@ -949,9 +949,9 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 	}
 
 	// First shutdown attempt: 2 rules deleted, 1 rule (8080) fails -> state file MUST remain with only port 8080!
-	removed := cleanupActiveUPnPMappings()
-	if removed != 2 {
-		t.Fatalf("expected 2 UPnP rules deleted when port 8080 fails, got %d", removed)
+	removed, cleanErr := cleanupActiveUPnPMappings()
+	if cleanErr != nil || removed != 2 {
+		t.Fatalf("expected 2 UPnP rules deleted without persistence error when port 8080 fails, got removed=%d err=%v", removed, cleanErr)
 	}
 	if _, err := os.Stat(upnpStateFile); err != nil {
 		t.Fatalf("expected %s to be retained when a UPnP DeletePortMapping call fails: %v", upnpStateFile, err)
@@ -962,9 +962,9 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 	failDeletePort = 0
 	upnpMu.Unlock()
 
-	staleRemoved := cleanupStaleUPnPState()
-	if staleRemoved != 1 {
-		t.Fatalf("expected 1 remaining stale UPnP rule (8080) deleted on retry, got %d", staleRemoved)
+	staleRemoved, staleErr := cleanupStaleUPnPState()
+	if staleErr != nil || staleRemoved != 1 {
+		t.Fatalf("expected 1 remaining stale UPnP rule (8080) deleted on retry without error, got removed=%d err=%v", staleRemoved, staleErr)
 	}
 	upnpMu.Lock()
 	if len(activeRouterRules) != 0 || deleteCalls != 4 {
@@ -1111,12 +1111,12 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 	upnpStateMu.Lock()
 	activeUPnPMappings = nil
 	upnpStateMu.Unlock()
-	recoveredDeletes := cleanupStaleUPnPState()
+	recoveredDeletes, recErr := cleanupStaleUPnPState()
 	upnpMu.Lock()
 	stillOnRouterAfterRecovery := activeRouterRules["TCP:9999"]
 	upnpMu.Unlock()
-	if recoveredDeletes != 1 || stillOnRouterAfterRecovery {
-		t.Fatalf("expected failed-rollback rule TCP:9999 to be recovered and deleted by cleanupStaleUPnPState (recovered=%d, stillOnRouter=%v)", recoveredDeletes, stillOnRouterAfterRecovery)
+	if recErr != nil || recoveredDeletes != 1 || stillOnRouterAfterRecovery {
+		t.Fatalf("expected failed-rollback rule TCP:9999 to be recovered and deleted by cleanupStaleUPnPState (recovered=%d, stillOnRouter=%v, err=%v)", recoveredDeletes, stillOnRouterAfterRecovery, recErr)
 	}
 
 	// 5c. Verify writeFileAtomic0600 atomicity (temp file -> fsync -> rename, 0600 mode)
@@ -1188,7 +1188,7 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 	if abortedCount != 0 || port9998Created {
 		t.Fatalf("expected critical failure on port 9999 to abort before mapping port 9998 (abortedCount=%d, port9998Created=%v)", abortedCount, port9998Created)
 	}
-	_ = cleanupActiveUPnPMappings()
+	_, _ = cleanupActiveUPnPMappings()
 
 	// 5f. Verify corrupted state file is preserved as .corrupt-* (not deleted) AND valid JSON objects inside it are salvaged
 	upnpMu.Lock()
@@ -1198,7 +1198,7 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 	if err := writeFileAtomic0600(upnpStateFile, []byte(corruptContent)); err != nil {
 		t.Fatalf("write corrupt test state file: %v", err)
 	}
-	salvagedRemoved := cleanupStaleUPnPState()
+	salvagedRemoved, salvErr := cleanupStaleUPnPState()
 	matches, _ := filepath.Glob(upnpStateFile + ".corrupt-*")
 	for _, m := range matches {
 		_ = os.Remove(m)
@@ -1209,7 +1209,53 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 	if len(matches) == 0 {
 		t.Fatalf("expected corrupted state file %s to be preserved as %s.corrupt-* for diagnostics", upnpStateFile, upnpStateFile)
 	}
-	if salvagedRemoved != 1 || port7777StillOnRouter {
-		t.Fatalf("expected intact mapping TCP:7777 inside corrupted state file to be salvaged and deleted from router (salvagedRemoved=%d, stillOnRouter=%v)", salvagedRemoved, port7777StillOnRouter)
+	if salvErr != nil || salvagedRemoved != 1 || port7777StillOnRouter {
+		t.Fatalf("expected intact mapping TCP:7777 inside corrupted state file to be salvaged and deleted from router (salvagedRemoved=%d, stillOnRouter=%v, err=%v)", salvagedRemoved, port7777StillOnRouter, salvErr)
+	}
+
+	// 5g. Verify withUPnPStateFileLock returns an error and NEVER executes fn() when held by an active process,
+	// and automatically recovers locks held by dead PIDs.
+	lockPath := resolveUPnPStateLockFile()
+	_ = os.Remove(lockPath)
+	origLockTimeout := upnpLockAcquireTimeout
+	upnpLockAcquireTimeout = 60 * time.Millisecond
+	// Write a lock held by the current live PID
+	livePayload := fmt.Sprintf("%d:active-holder-token\n", os.Getpid())
+	if err := os.WriteFile(lockPath, []byte(livePayload), 0o600); err != nil {
+		upnpLockAcquireTimeout = origLockTimeout
+		t.Fatalf("write live lock file: %v", err)
+	}
+	fnExecutedOnContention := false
+	lockErr := withUPnPStateFileLock(func() error {
+		fnExecutedOnContention = true
+		return nil
+	})
+	if lockErr == nil || fnExecutedOnContention {
+		_ = os.Remove(lockPath)
+		upnpLockAcquireTimeout = origLockTimeout
+		t.Fatalf("SECURITY/CONCURRENCY BUG: withUPnPStateFileLock must fail and NOT execute fn() when lock is held by an active process (err=%v, executed=%v)", lockErr, fnExecutedOnContention)
+	}
+	// Ensure the active owner's lock file was NOT deleted by the timed-out waiter
+	if rawAfter, err := os.ReadFile(lockPath); err != nil || string(rawAfter) != livePayload {
+		_ = os.Remove(lockPath)
+		upnpLockAcquireTimeout = origLockTimeout
+		t.Fatalf("timed-out waiter corrupted or deleted active holder's lock file: err=%v content=%q", err, string(rawAfter))
+	}
+	// Now write a lock belonging to a dead PID (99999999) and verify automatic recovery
+	deadPayload := "99999999:dead-holder-token\n"
+	if err := os.WriteFile(lockPath, []byte(deadPayload), 0o600); err != nil {
+		_ = os.Remove(lockPath)
+		upnpLockAcquireTimeout = origLockTimeout
+		t.Fatalf("write dead lock file: %v", err)
+	}
+	fnExecutedAfterDeadRecovery := false
+	recLockErr := withUPnPStateFileLock(func() error {
+		fnExecutedAfterDeadRecovery = true
+		return nil
+	})
+	upnpLockAcquireTimeout = origLockTimeout
+	_ = os.Remove(lockPath)
+	if recLockErr != nil || !fnExecutedAfterDeadRecovery {
+		t.Fatalf("expected dead-PID lock to be recovered and fn() executed (err=%v, executed=%v)", recLockErr, fnExecutedAfterDeadRecovery)
 	}
 }

@@ -182,39 +182,6 @@ func runGateway(ctx context.Context, quicAddr, token, directHTTPAddr, vhostAddr,
 		}()
 	}
 
-	_, quicPort, _ := net.SplitHostPort(quicAddr)
-	if quicPort == "" {
-		quicPort = "4242"
-	}
-	pubIP := detectPublicIP()
-	if pubIP == "" {
-		pubIP = "YOUR_VPS_IP"
-	}
-
-	cmdDir := strings.TrimSpace(certDir)
-	if cmdDir == "" {
-		cmdDir = ".driftless-certs"
-	}
-	if err := os.MkdirAll(cmdDir, 0o700); err != nil {
-		log.Printf("[gateway] ERROR: failed to create directory %s for client connect command: %v", cmdDir, err)
-		return fmt.Errorf("create directory %s: %w", cmdDir, err)
-	}
-	connectCmdPath := cmdDir + "/client-connect.cmd"
-	connectCmdContent := fmt.Sprintf("./driftless client -quic %s:%s -token %s -fingerprint %s\n", pubIP, quicPort, primaryTok, fp[:16])
-	if err := writeFileAtomic0600(connectCmdPath, []byte(connectCmdContent)); err != nil {
-		log.Printf("[gateway] ERROR: failed to save client connect command file %s: %v", connectCmdPath, err)
-		return fmt.Errorf("save client connect command file %s: %w", connectCmdPath, err)
-	}
-
-	log.Printf("[gateway] driftless %s listening on %s (QUIC+TCP-Mux, cert sha256: %s, auth=[token=valid, hidden, slots=%d])", versionString, quicAddr, fp[:16], len(tokList))
-	log.Printf("[gateway] ==========================================================")
-	log.Printf("[gateway] Client connection command saved to %s (mode 0600; secret never printed to stdout/logs)", connectCmdPath)
-	log.Printf("[gateway] To view ready-to-copy command on VPS, run:")
-	log.Printf("[gateway]   ./driftless show-token   (or: cat %s)", connectCmdPath)
-	log.Printf("[gateway] Redacted command preview:")
-	log.Printf("[gateway]   ./driftless client -quic %s:%s -token [token=valid,hidden] -fingerprint %s", pubIP, quicPort, fp[:16])
-	log.Printf("[gateway] ==========================================================")
-
 	go gw.cleanupLoop(ctx)
 
 	if directHTTPAddr != "" {
@@ -261,6 +228,44 @@ func runGateway(ctx context.Context, quicAddr, token, directHTTPAddr, vhostAddr,
 			go gw.authenticateAndServeAgent(ctx, &quicTunnelConn{conn: conn})
 		}
 	}()
+
+	quicHost, quicPort, _ := net.SplitHostPort(quicAddr)
+	if quicPort == "" {
+		quicPort = "4242"
+	}
+	var pubIP string
+	if quicHost == "127.0.0.1" || quicHost == "localhost" || quicHost == "::1" {
+		pubIP = quicHost
+	} else {
+		pubIP = detectPublicIP()
+	}
+	if pubIP == "" {
+		pubIP = "YOUR_VPS_IP"
+	}
+
+	cmdDir := strings.TrimSpace(certDir)
+	if cmdDir == "" {
+		cmdDir = ".driftless-certs"
+	}
+	if err := os.MkdirAll(cmdDir, 0o700); err != nil {
+		log.Printf("[gateway] ERROR: failed to create directory %s for client connect command: %v", cmdDir, err)
+		return fmt.Errorf("create directory %s: %w", cmdDir, err)
+	}
+	connectCmdPath := cmdDir + "/client-connect.cmd"
+	connectCmdContent := fmt.Sprintf("./driftless client -quic %s:%s -token %s -fingerprint %s\n", pubIP, quicPort, primaryTok, fp[:16])
+	if err := writeFileAtomic0600(connectCmdPath, []byte(connectCmdContent)); err != nil {
+		log.Printf("[gateway] ERROR: failed to save client connect command file %s: %v", connectCmdPath, err)
+		return fmt.Errorf("save client connect command file %s: %w", connectCmdPath, err)
+	}
+
+	log.Printf("[gateway] driftless %s listening on %s (QUIC+TCP-Mux, cert sha256: %s, auth=[token=valid, hidden, slots=%d])", versionString, quicAddr, fp[:16], len(tokList))
+	log.Printf("[gateway] ==========================================================")
+	log.Printf("[gateway] Client connection command saved to %s (mode 0600; secret never printed to stdout/logs)", connectCmdPath)
+	log.Printf("[gateway] To view ready-to-copy command on VPS, run:")
+	log.Printf("[gateway]   ./driftless show-token   (or: cat %s)", connectCmdPath)
+	log.Printf("[gateway] Redacted command preview:")
+	log.Printf("[gateway]   ./driftless client -quic %s:%s -token [token=valid,hidden] -fingerprint %s", pubIP, quicPort, fp[:16])
+	log.Printf("[gateway] ==========================================================")
 
 	<-ctx.Done()
 	log.Printf("[gateway] shutting down cleanly...")

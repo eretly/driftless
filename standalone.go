@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -256,6 +257,7 @@ var (
 	activeUPnPMappings     []trackedRouterMapping
 	upnpInstanceIDOverride string
 	upnpFallbackStateDir   = os.TempDir()
+	upnpLockAcquireTimeout = 2 * time.Second
 )
 
 func currentUPnPInstanceID() string {
@@ -289,33 +291,97 @@ func resolveUPnPStateLockFile() string {
 	return filepath.Join(baseDir, fmt.Sprintf(".driftless-upnp-state-%s.lock", currentUPnPInstanceID()))
 }
 
-// withUPnPStateFileLock acquires a cross-process lock file scoped to the current installation
-// before reading, writing, or removing UPnP state files.
+func parseLockFilePayload(raw []byte) (int, string, bool) {
+	s := strings.TrimSpace(string(raw))
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) != 2 {
+		return 0, "", false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	tok := strings.TrimSpace(parts[1])
+	if err != nil || pid <= 0 || tok == "" {
+		return 0, "", false
+	}
+	return pid, tok, true
+}
+
+func releaseUPnPStateFileLock(lockPath, expectedPayload string) {
+	raw, err := os.ReadFile(lockPath)
+	if err != nil {
+		return
+	}
+	if string(raw) != expectedPayload {
+		// Lock does not belong to us; never remove another owner's lock.
+		return
+	}
+	_ = os.Remove(lockPath)
+}
+
+// withUPnPStateFileLock acquires an exclusive cross-process lock file scoped to the current
+// installation before reading, writing, or removing UPnP state files.
+// If the lock cannot be acquired within upnpLockAcquireTimeout, it returns an error and NEVER executes fn().
+// Stale locks are only recovered if the recorded owner PID is no longer alive in the OS kernel.
 func withUPnPStateFileLock(fn func() error) error {
 	lockPath := resolveUPnPStateLockFile()
-	deadline := time.Now().Add(2 * time.Second)
-	var lockFile *os.File
+	var tokBytes [16]byte
+	if _, err := rand.Read(tokBytes[:]); err != nil {
+		return fmt.Errorf("generate lock owner token: %w", err)
+	}
+	ownerToken := hex.EncodeToString(tokBytes[:])
+	payload := fmt.Sprintf("%d:%s\n", os.Getpid(), ownerToken)
+
+	timeout := upnpLockAcquireTimeout
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
 	for {
 		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
-			_, _ = fmt.Fprintf(f, "%d %d\n", os.Getpid(), time.Now().UnixNano())
-			_ = f.Close()
-			lockFile = f
-			break
+			_, writeErr := f.Write([]byte(payload))
+			syncErr := f.Sync()
+			closeErr := f.Close()
+			if writeErr != nil || syncErr != nil || closeErr != nil {
+				_ = os.Remove(lockPath)
+				if writeErr != nil {
+					return fmt.Errorf("write UPnP state lock %s: %w", lockPath, writeErr)
+				}
+				if syncErr != nil {
+					return fmt.Errorf("sync UPnP state lock %s: %w", lockPath, syncErr)
+				}
+				return fmt.Errorf("close UPnP state lock %s: %w", lockPath, closeErr)
+			}
+			// Verify ownership in case of concurrent filesystem intervention
+			if verifyRaw, rErr := os.ReadFile(lockPath); rErr != nil || string(verifyRaw) != payload {
+				return fmt.Errorf("verify UPnP state lock ownership for %s failed", lockPath)
+			}
+			defer releaseUPnPStateFileLock(lockPath, payload)
+			return fn()
 		}
-		if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) > 10*time.Second {
-			_ = os.Remove(lockPath)
-			continue
+
+		if !os.IsExist(err) {
+			return fmt.Errorf("acquire UPnP state lock %s: %w", lockPath, err)
 		}
+
+		// Inspect existing lock file: only recover if the owner process is confirmed dead by the OS kernel.
+		if raw, rErr := os.ReadFile(lockPath); rErr == nil {
+			if holderPID, holderTok, ok := parseLockFilePayload(raw); ok {
+				if holderPID != os.Getpid() && !isLockOwnerProcessAlive(holderPID) {
+					deadPath := fmt.Sprintf("%s.dead-%s", lockPath, holderTok)
+					if os.Rename(lockPath, deadPath) == nil {
+						_ = os.Remove(deadPath)
+						continue
+					}
+				}
+			}
+		}
+
 		if time.Now().After(deadline) {
-			break
+			log.Printf("[standalone] ERROR: timed out waiting for UPnP state lock %s; refusing unlocked state modification", lockPath)
+			return fmt.Errorf("timed out acquiring UPnP state lock %s: %w", lockPath, err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if lockFile != nil {
-		defer os.Remove(lockPath)
-	}
-	return fn()
 }
 
 func sameTrackedRouterMapping(a, b trackedRouterMapping) bool {
@@ -371,10 +437,14 @@ func saveTrackedRouterMappingsLocked() error {
 			}
 		}
 		if len(activeUPnPMappings) == 0 {
-			_ = removeInstanceFallbackStateFileLocked()
+			fbErr := removeInstanceFallbackStateFileLocked()
 			if err := os.Remove(upnpStateFile); err != nil && !os.IsNotExist(err) {
 				log.Printf("[standalone] ERROR: failed to remove UPnP state file %s: %v", upnpStateFile, err)
 				return err
+			}
+			if fbErr != nil {
+				log.Printf("[standalone] ERROR: failed to remove fallback UPnP state file %s: %v", resolveUPnPFallbackStateFile(), fbErr)
+				return fbErr
 			}
 			return nil
 		}
@@ -387,7 +457,10 @@ func saveTrackedRouterMappingsLocked() error {
 			log.Printf("[standalone] ERROR: failed to save UPnP state file %s: %v (WARNING: router port mappings will not be guaranteed to be removed automatically after a crash or restart)", upnpStateFile, err)
 			return err
 		}
-		_ = removeInstanceFallbackStateFileLocked()
+		if fbErr := removeInstanceFallbackStateFileLocked(); fbErr != nil {
+			log.Printf("[standalone] WARNING: saved UPnP state file %s, but failed to clean up fallback state file %s: %v", upnpStateFile, resolveUPnPFallbackStateFile(), fbErr)
+			return fbErr
+		}
 		return nil
 	})
 }
@@ -583,12 +656,12 @@ func loadTrackedMappingsFromFile(path string) ([]trackedRouterMapping, bool) {
 	return owned, len(owned) > 0
 }
 
-func cleanupStaleUPnPState() int {
+func cleanupStaleUPnPState() (int, error) {
 	fbPath := resolveUPnPFallbackStateFile()
 	primaryList, hasPrimary := loadTrackedMappingsFromFile(upnpStateFile)
 	fallbackList, hasFallback := loadTrackedMappingsFromFile(fbPath)
 	if !hasPrimary && !hasFallback {
-		return 0
+		return 0, nil
 	}
 	var stale []trackedRouterMapping
 	for _, m := range primaryList {
@@ -598,7 +671,7 @@ func cleanupStaleUPnPState() int {
 		stale = appendUniqueTrackedMapping(stale, m)
 	}
 	if len(stale) == 0 {
-		return 0
+		return 0, nil
 	}
 
 	removed, failed := cleanupRouterMappingsList(stale)
@@ -629,8 +702,14 @@ func cleanupStaleUPnPState() int {
 		kept = appendUniqueTrackedMapping(kept, fm)
 	}
 	activeUPnPMappings = kept
+	var persistErr error
 	if err := saveTrackedRouterMappingsLocked(); err != nil {
-		_ = saveFallbackRouterMappingsLocked()
+		if fbErr := saveFallbackRouterMappingsLocked(); fbErr != nil {
+			persistErr = fmt.Errorf("primary state save failed (%v) and fallback state save failed (%w)", err, fbErr)
+			log.Printf("[standalone] CRITICAL: failed to persist remaining stale UPnP state: %v (automatic recovery of %d router rule(s) is NOT guaranteed)", persistErr, len(activeUPnPMappings))
+		} else {
+			log.Printf("[standalone] WARNING: primary UPnP state save failed (%v); saved %d remaining stale rule(s) to fallback %s", err, len(activeUPnPMappings), fbPath)
+		}
 	}
 	upnpStateMu.Unlock()
 
@@ -640,19 +719,27 @@ func cleanupStaleUPnPState() int {
 	if len(failed) > 0 {
 		log.Printf("[standalone] %d stale UPnP/NAT-PMP rule(s) could not be deleted yet (retained in %s for retry)", len(failed), upnpStateFile)
 	}
-	return removed
+	return removed, persistErr
 }
 
-func cleanupActiveUPnPMappings() int {
+func cleanupActiveUPnPMappings() (int, error) {
 	upnpStateMu.Lock()
 	toRemove := append([]trackedRouterMapping(nil), activeUPnPMappings...)
 	upnpStateMu.Unlock()
 
 	if len(toRemove) == 0 {
 		upnpStateMu.Lock()
-		_ = saveTrackedRouterMappingsLocked()
+		var persistErr error
+		if err := saveTrackedRouterMappingsLocked(); err != nil {
+			if fbErr := saveFallbackRouterMappingsLocked(); fbErr != nil {
+				persistErr = fmt.Errorf("primary state cleanup failed (%v) and fallback state cleanup failed (%w)", err, fbErr)
+			}
+		}
 		upnpStateMu.Unlock()
-		return 0
+		if persistErr != nil {
+			log.Printf("[standalone] ERROR: failed to clean up empty UPnP state files: %v", persistErr)
+		}
+		return 0, persistErr
 	}
 
 	removed, failed := cleanupRouterMappingsList(toRemove)
@@ -675,8 +762,14 @@ func cleanupActiveUPnPMappings() int {
 		remaining = appendUniqueTrackedMapping(remaining, fm)
 	}
 	activeUPnPMappings = remaining
+	var persistErr error
 	if err := saveTrackedRouterMappingsLocked(); err != nil {
-		_ = saveFallbackRouterMappingsLocked()
+		if fbErr := saveFallbackRouterMappingsLocked(); fbErr != nil {
+			persistErr = fmt.Errorf("primary state save failed (%v) and fallback state save failed (%w)", err, fbErr)
+			log.Printf("[standalone] CRITICAL: failed to persist remaining UPnP state on shutdown: %v (automatic recovery of %d router rule(s) on next startup is NOT guaranteed)", persistErr, len(activeUPnPMappings))
+		} else {
+			log.Printf("[standalone] WARNING: primary UPnP state save failed (%v); saved %d remaining rule(s) to fallback %s", err, len(activeUPnPMappings), resolveUPnPFallbackStateFile())
+		}
 	}
 	upnpStateMu.Unlock()
 
@@ -686,7 +779,7 @@ func cleanupActiveUPnPMappings() int {
 	if len(failed) > 0 {
 		log.Printf("[standalone] warning: %d UPnP/NAT-PMP rule(s) could not be removed (router unreachable); kept in %s for next startup cleanup", len(failed), upnpStateFile)
 	}
-	return removed
+	return removed, persistErr
 }
 
 // autoForwardRouterPorts maps public ports on the home router using UPnP IGD (WANPPPConnection & WANIPConnection) and NAT-PMP.
@@ -1350,14 +1443,20 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 
 	log.Printf("[standalone] driftless %s Zero-VPS mode active (LAN=%s, Public IP=%s)", versionString, lanIP, pubIP)
 	if cfg.EnableUPnP {
-		cleanupStaleUPnPState()
+		if _, err := cleanupStaleUPnPState(); err != nil {
+			log.Printf("[standalone] ERROR: stale UPnP state cleanup could not persist remaining state: %v", err)
+		}
 		mapped := autoForwardRouterPorts(lanIP, allowedMappings, upnpVHostAddr, upnpHTTPSAddr)
 		if mapped == 0 {
 			log.Printf("[standalone] warning: router UPnP/NAT-PMP mapped 0 ports (verify UPnP is enabled on your active WAN/PPTP interface)")
 		} else {
 			log.Printf("[standalone] router UPnP/NAT-PMP auto-forwarded %d port rules to %s", mapped, lanIP)
 		}
-		defer cleanupActiveUPnPMappings()
+		defer func() {
+			if _, err := cleanupActiveUPnPMappings(); err != nil {
+				log.Printf("[standalone] CRITICAL: shutdown UPnP cleanup failed to persist remaining state: %v", err)
+			}
+		}()
 	}
 
 	hasDDNSProvider := cfg.DDNS.Provider != "" || cfg.DDNS.Webhook != ""

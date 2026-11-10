@@ -44,7 +44,7 @@ Windows:
 ```powershell
 .\driftless-windows-amd64.exe server -ports 8096,25565
 ```
-The server generates a 128-bit password and saves a ready-to-copy Home PC command to `.driftless-certs/client-connect.cmd` (`0600`, never printed to `stdout` or logs by default). Run `./driftless show-token` (or `cat .driftless-certs/client-connect.cmd`) on the VPS to view it.
+The server automatically creates a password and saves a ready-to-copy command for your Home PC. Run `./driftless show-token` on the VPS to display it.
 
 **Step 2. Copy that command and run it on your Home PC:**
 ```powershell
@@ -56,7 +56,7 @@ Done. Your Home PC is now reachable at `YOUR_VPS_IP:8096` and `YOUR_VPS_IP:25565
 
 #### Way 2. Without a VPS (only on your Home PC, for dynamic public IP)
 
-If your ISP gives you a public ("white") dynamic IP (not static), you don't need a VPS. `standalone` mode automatically opens ports on your home router via UPnP (including PPPoE/PPTP `WANPPPConnection` with permanent lease fallback) and checks for IP changes every second via STUN:
+If your ISP gives you a public ("white") dynamic IP, you don't need a VPS. `standalone` mode automatically opens ports on your home router via UPnP / NAT-PMP and checks for IP changes every second via STUN:
 
 ```powershell
 .\driftless-windows-amd64.exe standalone -ports 8096,25565
@@ -183,7 +183,7 @@ Windows:
 ```powershell
 .\driftless-windows-amd64.exe server -ports 8096,25565
 ```
-Сервер сам создаст 128-битный пароль и сохранит готовую команду подключения в `.driftless-certs/client-connect.cmd` (права `0600`, без вывода секрета в `stdout`/логи). Чтобы посмотреть её на ВПС, выполни `./driftless show-token` (или `cat .driftless-certs/client-connect.cmd`).
+Сервер сам создаст пароль и сохранит готовую команду подключения для домашнего ПК. Чтобы вывести её на экран, выполни на ВПС `./driftless show-token`.
 
 **Шаг 2. Скопируй эту команду и запусти дома на ПК:**
 ```powershell
@@ -195,7 +195,7 @@ Windows:
 
 #### Вариант 2. Вообще без ВПС (если IP не статичный, но "белый")
 
-Если провайдер дает динамический "белый" IP (включая PPTP/PPPoE), покупать ВПС не нужно. Режим `standalone` сам откроет порты на домашнем роутере через UPnP (`WANPPPConnection` и `WANIPConnection`) и каждую секунду следит за сменой IP по STUN:
+Если провайдер дает динамический "белый" IP, покупать ВПС не нужно. Режим `standalone` сам откроет порты на домашнем роутере через UPnP / NAT-PMP и каждую секунду следит за сменой IP по STUN:
 
 ```powershell
 .\driftless-windows-amd64.exe standalone -ports 8096,25565
