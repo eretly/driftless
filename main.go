@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	versionString = "v1.4.3"
+	versionString = "v1.4.4"
 	alpnProtocol  = "driftless-v1"
 	cmdAuth       = uint8(0)
 	cmdNewConn    = uint8(1)
@@ -474,16 +474,24 @@ func loadOrGenerateToken(isServer bool, tokenFlag, tokenFile string) (string, er
 				log.Printf("[gateway] loaded persistent token from %s [token=valid, hidden]", defaultTokenPath)
 				return saved, nil
 			}
+		} else if !os.IsNotExist(err) {
+			log.Printf("[gateway] ERROR: failed to read persistent token file %s: %v", defaultTokenPath, err)
+			return "", fmt.Errorf("read persistent token file %s: %w", defaultTokenPath, err)
 		}
 		var b [16]byte // 128-bit cryptographic token (32 hex chars)
 		if _, err := rand.Read(b[:]); err != nil {
 			return "", fmt.Errorf("generate token: %w", err)
 		}
 		autoTok := hex.EncodeToString(b[:])
-		registerSecretForLogRedaction(autoTok)
-		if err := os.MkdirAll(".driftless-certs", 0o700); err == nil {
-			_ = os.WriteFile(defaultTokenPath, []byte(autoTok+"\n"), 0o600)
+		if err := os.MkdirAll(".driftless-certs", 0o700); err != nil {
+			log.Printf("[gateway] ERROR: failed to create token directory .driftless-certs: %v", err)
+			return "", fmt.Errorf("create token directory .driftless-certs: %w", err)
 		}
+		if err := os.WriteFile(defaultTokenPath, []byte(autoTok+"\n"), 0o600); err != nil {
+			log.Printf("[gateway] ERROR: failed to persist generated token to %s: %v", defaultTokenPath, err)
+			return "", fmt.Errorf("persist generated token to %s: %w", defaultTokenPath, err)
+		}
+		registerSecretForLogRedaction(autoTok)
 		log.Printf("[gateway] no -token specified; generated 128-bit password (saved to %s) [token=valid, hidden]", defaultTokenPath)
 		fmt.Fprintf(os.Stdout, "[console] Generated 128-bit password (saved to %s, hidden in logs): %s\n", defaultTokenPath, autoTok)
 		return autoTok, nil

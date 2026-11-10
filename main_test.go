@@ -681,6 +681,16 @@ func TestHardeningMultiGatewayFailoverAndResourceLimits(t *testing.T) {
 	if err != nil || tok2 != tok {
 		t.Fatalf("expected persisted token %q to reload identically, got %q (err=%v)", tok, tok2, err)
 	}
+	// Verify loadOrGenerateToken returns an error instead of continuing with an unsaved token when persistence fails
+	_ = os.RemoveAll(".driftless-certs")
+	if err := os.WriteFile(".driftless-certs", []byte("conflict"), 0o600); err != nil {
+		t.Fatalf("write file .driftless-certs: %v", err)
+	}
+	_, persistErr := loadOrGenerateToken(true, "", "")
+	_ = os.RemoveAll(".driftless-certs")
+	if persistErr == nil {
+		t.Fatalf("expected loadOrGenerateToken to fail when .driftless-certs/token.secret cannot be persisted")
+	}
 
 	// 2. Verify pre-auth tcpMuxConn stream & buffer protection
 	c1, c2 := net.Pipe()
