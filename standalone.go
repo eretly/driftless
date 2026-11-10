@@ -250,8 +250,9 @@ type trackedRouterMapping struct {
 const upnpStateFile = ".driftless-upnp-state.json"
 
 var (
-	upnpStateMu        sync.Mutex
-	activeUPnPMappings []trackedRouterMapping
+	upnpStateMu           sync.Mutex
+	activeUPnPMappings    []trackedRouterMapping
+	upnpFallbackStateFile = filepath.Join(os.TempDir(), ".driftless-upnp-state-fallback.json")
 )
 
 func sameTrackedRouterMapping(a, b trackedRouterMapping) bool {
@@ -263,8 +264,18 @@ func sameTrackedRouterMapping(a, b trackedRouterMapping) bool {
 		strings.EqualFold(a.Proto, b.Proto)
 }
 
+func appendUniqueTrackedMapping(list []trackedRouterMapping, m trackedRouterMapping) []trackedRouterMapping {
+	for _, ex := range list {
+		if sameTrackedRouterMapping(ex, m) {
+			return list
+		}
+	}
+	return append(list, m)
+}
+
 func saveTrackedRouterMappingsLocked() error {
 	if len(activeUPnPMappings) == 0 {
+		_ = os.Remove(upnpFallbackStateFile)
 		if err := os.Remove(upnpStateFile); err != nil && !os.IsNotExist(err) {
 			log.Printf("[standalone] ERROR: failed to remove UPnP state file %s: %v", upnpStateFile, err)
 			return err
@@ -276,11 +287,25 @@ func saveTrackedRouterMappingsLocked() error {
 		log.Printf("[standalone] ERROR: failed to serialize UPnP state for %s: %v (WARNING: router port mappings will not be guaranteed to be removed automatically after a crash)", upnpStateFile, err)
 		return err
 	}
-	if err := os.WriteFile(upnpStateFile, raw, 0o600); err != nil {
+	if err := writeFileAtomic0600(upnpStateFile, raw); err != nil {
 		log.Printf("[standalone] ERROR: failed to save UPnP state file %s: %v (WARNING: router port mappings will not be guaranteed to be removed automatically after a crash or restart)", upnpStateFile, err)
 		return err
 	}
+	_ = os.Remove(upnpFallbackStateFile)
 	return nil
+}
+
+func saveFallbackRouterMappingsLocked() {
+	if upnpFallbackStateFile == "" {
+		return
+	}
+	if len(activeUPnPMappings) == 0 {
+		_ = os.Remove(upnpFallbackStateFile)
+		return
+	}
+	if raw, err := json.MarshalIndent(activeUPnPMappings, "", "  "); err == nil {
+		_ = writeFileAtomic0600(upnpFallbackStateFile, raw)
+	}
 }
 
 func recordTrackedRouterMapping(m trackedRouterMapping) error {
@@ -297,6 +322,32 @@ func recordTrackedRouterMapping(m trackedRouterMapping) error {
 		return err
 	}
 	return nil
+}
+
+// rollbackOrRetainRouterMapping attempts to immediately delete a newly created UPnP/NAT-PMP rule
+// when persisting the state file fails. If the rollback deletion also fails after retries, the rule
+// is retained in activeUPnPMappings and atomically saved to upnpFallbackStateFile so it is guaranteed
+// to be cleaned up on shutdown or next startup.
+func rollbackOrRetainRouterMapping(m trackedRouterMapping) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(25 * time.Millisecond)
+		}
+		if err := deleteSingleRouterMapping(m); err == nil {
+			log.Printf("[standalone] rolled back %s mapping %s/%d because state file %s could not be saved", strings.ToUpper(m.Kind), m.Proto, m.Port, upnpStateFile)
+			return
+		} else {
+			lastErr = err
+		}
+	}
+	upnpStateMu.Lock()
+	activeUPnPMappings = appendUniqueTrackedMapping(activeUPnPMappings, m)
+	if err := saveTrackedRouterMappingsLocked(); err != nil {
+		saveFallbackRouterMappingsLocked()
+	}
+	upnpStateMu.Unlock()
+	log.Printf("[standalone] ERROR: failed to rollback %s mapping %s/%d after state-file write error: %v (retained in memory and fallback state %s for recovery cleanup)", strings.ToUpper(m.Kind), m.Proto, m.Port, lastErr, upnpFallbackStateFile)
 }
 
 func deleteSingleRouterMapping(m trackedRouterMapping) error {
@@ -324,16 +375,39 @@ func cleanupRouterMappingsList(list []trackedRouterMapping) (int, []trackedRoute
 	return removed, failed
 }
 
-func cleanupStaleUPnPState() int {
-	raw, err := os.ReadFile(upnpStateFile)
+func loadTrackedMappingsFromFile(path string) ([]trackedRouterMapping, bool) {
+	if path == "" {
+		return nil, false
+	}
+	raw, err := os.ReadFile(path)
 	if err != nil || len(raw) == 0 {
+		return nil, false
+	}
+	var list []trackedRouterMapping
+	if err := json.Unmarshal(raw, &list); err != nil || len(list) == 0 {
+		_ = os.Remove(path)
+		return nil, false
+	}
+	return list, true
+}
+
+func cleanupStaleUPnPState() int {
+	primaryList, hasPrimary := loadTrackedMappingsFromFile(upnpStateFile)
+	fallbackList, hasFallback := loadTrackedMappingsFromFile(upnpFallbackStateFile)
+	if !hasPrimary && !hasFallback {
 		return 0
 	}
 	var stale []trackedRouterMapping
-	if err := json.Unmarshal(raw, &stale); err != nil || len(stale) == 0 {
-		_ = os.Remove(upnpStateFile)
+	for _, m := range primaryList {
+		stale = appendUniqueTrackedMapping(stale, m)
+	}
+	for _, m := range fallbackList {
+		stale = appendUniqueTrackedMapping(stale, m)
+	}
+	if len(stale) == 0 {
 		return 0
 	}
+
 	removed, failed := cleanupRouterMappingsList(stale)
 	upnpStateMu.Lock()
 	var kept []trackedRouterMapping
@@ -355,23 +429,16 @@ func cleanupStaleUPnPState() int {
 			}
 		}
 		if !wasDeleted {
-			kept = append(kept, cur)
+			kept = appendUniqueTrackedMapping(kept, cur)
 		}
 	}
 	for _, fm := range failed {
-		exists := false
-		for _, ex := range kept {
-			if sameTrackedRouterMapping(ex, fm) {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			kept = append(kept, fm)
-		}
+		kept = appendUniqueTrackedMapping(kept, fm)
 	}
 	activeUPnPMappings = kept
-	_ = saveTrackedRouterMappingsLocked()
+	if err := saveTrackedRouterMappingsLocked(); err != nil {
+		saveFallbackRouterMappingsLocked()
+	}
 	upnpStateMu.Unlock()
 
 	if removed > 0 {
@@ -408,23 +475,16 @@ func cleanupActiveUPnPMappings() int {
 			}
 		}
 		if !wasAttempted {
-			remaining = append(remaining, cur)
+			remaining = appendUniqueTrackedMapping(remaining, cur)
 		}
 	}
 	for _, fm := range failed {
-		exists := false
-		for _, r := range remaining {
-			if sameTrackedRouterMapping(r, fm) {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			remaining = append(remaining, fm)
-		}
+		remaining = appendUniqueTrackedMapping(remaining, fm)
 	}
 	activeUPnPMappings = remaining
-	_ = saveTrackedRouterMappingsLocked()
+	if err := saveTrackedRouterMappingsLocked(); err != nil {
+		saveFallbackRouterMappingsLocked()
+	}
 	upnpStateMu.Unlock()
 
 	if removed > 0 {
@@ -494,11 +554,7 @@ func autoForwardRouterPortsWithEndpoints(lanIP string, mappings []PortMapping, v
 					Proto:       sp.proto,
 				}
 				if err := recordTrackedRouterMapping(rule); err != nil {
-					if delErr := upnpDeletePortMapping(ep.ctrlURL, ep.serviceType, sp.port, sp.proto); delErr != nil {
-						log.Printf("[standalone] ERROR: failed to rollback UPnP mapping %s/%d after state-file write error: %v", sp.proto, sp.port, delErr)
-					} else {
-						log.Printf("[standalone] rolled back UPnP mapping %s/%d because state file %s could not be saved", sp.proto, sp.port, upnpStateFile)
-					}
+					rollbackOrRetainRouterMapping(rule)
 					continue
 				}
 				ok = true
@@ -514,11 +570,7 @@ func autoForwardRouterPortsWithEndpoints(lanIP string, mappings []PortMapping, v
 					Proto:     sp.proto,
 				}
 				if err := recordTrackedRouterMapping(rule); err != nil {
-					if delErr := natPMPDeletePortMapping(gwIP, sp.port, sp.proto); delErr != nil {
-						log.Printf("[standalone] ERROR: failed to rollback NAT-PMP mapping %s/%d after state-file write error: %v", sp.proto, sp.port, delErr)
-					} else {
-						log.Printf("[standalone] rolled back NAT-PMP mapping %s/%d because state file %s could not be saved", sp.proto, sp.port, upnpStateFile)
-					}
+					rollbackOrRetainRouterMapping(rule)
 				} else {
 					ok = true
 				}

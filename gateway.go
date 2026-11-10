@@ -201,7 +201,7 @@ func runGateway(ctx context.Context, quicAddr, token, directHTTPAddr, vhostAddr,
 	}
 	connectCmdPath := cmdDir + "/client-connect.cmd"
 	connectCmdContent := fmt.Sprintf("./driftless client -quic %s:%s -token %s -fingerprint %s\n", pubIP, quicPort, primaryTok, fp[:16])
-	if err := os.WriteFile(connectCmdPath, []byte(connectCmdContent), 0o600); err != nil {
+	if err := writeFileAtomic0600(connectCmdPath, []byte(connectCmdContent)); err != nil {
 		log.Printf("[gateway] ERROR: failed to save client connect command file %s: %v", connectCmdPath, err)
 		return fmt.Errorf("save client connect command file %s: %w", connectCmdPath, err)
 	}

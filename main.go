@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,7 +24,7 @@ import (
 )
 
 const (
-	versionString = "v1.4.5"
+	versionString = "v1.4.6"
 	alpnProtocol  = "driftless-v1"
 	cmdAuth       = uint8(0)
 	cmdNewConn    = uint8(1)
@@ -446,6 +447,55 @@ func sanitizeLogString(s string) string {
 	return redactURLQuerySecrets(s)
 }
 
+// writeFileAtomic0600 writes data to targetPath atomically using a temporary file in the same
+// directory (0600 mode), explicit fsync (tmpFile.Sync), close, atomic os.Rename, and parent directory sync.
+func writeFileAtomic0600(targetPath string, data []byte) error {
+	if fi, err := os.Stat(targetPath); err == nil && fi.IsDir() {
+		return fmt.Errorf("target path %s is a directory", targetPath)
+	}
+	dir := filepath.Dir(targetPath)
+	base := filepath.Base(targetPath)
+	tmpFile, err := os.CreateTemp(dir, "."+base+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmpFile.Name()
+	cleanupTmp := func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpName)
+	}
+	if err := tmpFile.Chmod(0o600); err != nil {
+		cleanupTmp()
+		return err
+	}
+	n, err := tmpFile.Write(data)
+	if err != nil {
+		cleanupTmp()
+		return err
+	}
+	if n != len(data) {
+		cleanupTmp()
+		return io.ErrShortWrite
+	}
+	if err := tmpFile.Sync(); err != nil {
+		cleanupTmp()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, targetPath); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if dirFile, err := os.Open(dir); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
+	}
+	return nil
+}
+
 func loadOrGenerateToken(isServer bool, tokenFlag, tokenFile string) (string, error) {
 	if tokenFlag != "" {
 		tok := strings.TrimSpace(tokenFlag)
@@ -487,7 +537,7 @@ func loadOrGenerateToken(isServer bool, tokenFlag, tokenFile string) (string, er
 			log.Printf("[gateway] ERROR: failed to create token directory .driftless-certs: %v", err)
 			return "", fmt.Errorf("create token directory .driftless-certs: %w", err)
 		}
-		if err := os.WriteFile(defaultTokenPath, []byte(autoTok+"\n"), 0o600); err != nil {
+		if err := writeFileAtomic0600(defaultTokenPath, []byte(autoTok+"\n")); err != nil {
 			log.Printf("[gateway] ERROR: failed to persist generated token to %s: %v", defaultTokenPath, err)
 			return "", fmt.Errorf("persist generated token to %s: %w", defaultTokenPath, err)
 		}

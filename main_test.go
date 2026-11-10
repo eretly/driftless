@@ -1068,8 +1068,8 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 	deleteCallsBeforeRollback := deleteCalls
 	upnpMu.Unlock()
 	mappedOnWriteFail := autoForwardRouterPortsWithEndpoints("192.168.1.50", []PortMapping{{PublicPort: 9999, TargetPort: 9999, Proto: "tcp"}}, "", "", mockEndpoints, "")
-	_ = os.RemoveAll(upnpStateFile)
 	if mappedOnWriteFail != 0 {
+		_ = os.RemoveAll(upnpStateFile)
 		t.Fatalf("expected 0 successful mappings when state file %s cannot be persisted, got %d", upnpStateFile, mappedOnWriteFail)
 	}
 	upnpMu.Lock()
@@ -1077,6 +1077,57 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 	rollbackDeletes := deleteCalls - deleteCallsBeforeRollback
 	upnpMu.Unlock()
 	if stillOnRouter || rollbackDeletes != 1 {
+		_ = os.RemoveAll(upnpStateFile)
 		t.Fatalf("expected UPnP rule TCP:9999 to be immediately rolled back on state-file write error (stillOnRouter=%v, rollbackDeletes=%d)", stillOnRouter, rollbackDeletes)
+	}
+
+	// 5b. Verify recovery after a FAILED rollback (state file write fails AND router refuses DeletePortMapping during rollback):
+	// the rule must be retained in memory + fallback state file and cleaned up once the router recovers.
+	upnpMu.Lock()
+	failDeletePort = 9999
+	deleteCallsBeforeFailedRollback := deleteCalls
+	upnpMu.Unlock()
+
+	mappedOnFailedRollback := autoForwardRouterPortsWithEndpoints("192.168.1.50", []PortMapping{{PublicPort: 9999, TargetPort: 9999, Proto: "tcp"}}, "", "", mockEndpoints, "")
+	_ = os.RemoveAll(upnpStateFile)
+	if mappedOnFailedRollback != 0 {
+		t.Fatalf("expected 0 successful mappings when state file write & rollback both fail, got %d", mappedOnFailedRollback)
+	}
+	upnpMu.Lock()
+	retryAttempts := deleteCalls - deleteCallsBeforeFailedRollback
+	stillOnRouterAfterFailedRollback := activeRouterRules["TCP:9999"]
+	failDeletePort = 0 // router recovers
+	upnpMu.Unlock()
+	if retryAttempts != 3 || !stillOnRouterAfterFailedRollback {
+		t.Fatalf("expected 3 rollback delete attempts and rule still on router when router rejects delete (attempts=%d, onRouter=%v)", retryAttempts, stillOnRouterAfterFailedRollback)
+	}
+	if _, err := os.Stat(upnpFallbackStateFile); err != nil {
+		t.Fatalf("expected fallback state file %s to exist after failed rollback: %v", upnpFallbackStateFile, err)
+	}
+
+	// Simulate crash recovery via cleanupStaleUPnPState reading from fallback state file and deleting TCP:9999
+	upnpStateMu.Lock()
+	activeUPnPMappings = nil
+	upnpStateMu.Unlock()
+	recoveredDeletes := cleanupStaleUPnPState()
+	upnpMu.Lock()
+	stillOnRouterAfterRecovery := activeRouterRules["TCP:9999"]
+	upnpMu.Unlock()
+	if recoveredDeletes != 1 || stillOnRouterAfterRecovery {
+		t.Fatalf("expected failed-rollback rule TCP:9999 to be recovered and deleted by cleanupStaleUPnPState (recovered=%d, stillOnRouter=%v)", recoveredDeletes, stillOnRouterAfterRecovery)
+	}
+
+	// 5c. Verify writeFileAtomic0600 atomicity (temp file -> fsync -> rename, 0600 mode)
+	atomicTestPath := ".driftless-atomic-test.json"
+	defer os.Remove(atomicTestPath)
+	if err := writeFileAtomic0600(atomicTestPath, []byte(`{"v":1}`)); err != nil {
+		t.Fatalf("writeFileAtomic0600 initial write failed: %v", err)
+	}
+	if err := writeFileAtomic0600(atomicTestPath, []byte(`{"v":2,"ok":true}`)); err != nil {
+		t.Fatalf("writeFileAtomic0600 overwrite failed: %v", err)
+	}
+	gotAtomic, err := os.ReadFile(atomicTestPath)
+	if err != nil || string(gotAtomic) != `{"v":2,"ok":true}` {
+		t.Fatalf("unexpected content after atomic overwrite: %q (err=%v)", string(gotAtomic), err)
 	}
 }
