@@ -672,10 +672,16 @@ func TestHardeningMultiGatewayFailoverAndResourceLimits(t *testing.T) {
 	}
 	globalUDPBufferedBytes.Add(-512)
 
-	// 1b. Verify 128-bit (32 hex chars) default token generation & persistence
+	// 1b. Verify 128-bit (32 hex chars) default token generation & persistence with 0600 permissions
+	_ = os.RemoveAll(".driftless-certs")
 	tok, err := loadOrGenerateToken(true, "", "")
 	if err != nil || len(tok) < 32 {
 		t.Fatalf("expected >= 128-bit (32 hex chars) auto-generated token, got len=%d err=%v", len(tok), err)
+	}
+	if fi, statErr := os.Stat(".driftless-certs/token.secret"); statErr != nil {
+		t.Fatalf("expected .driftless-certs/token.secret to exist: %v", statErr)
+	} else if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("expected .driftless-certs/token.secret to have 0600 permissions, got %04o", perm)
 	}
 	tok2, err := loadOrGenerateToken(true, "", "")
 	if err != nil || tok2 != tok {

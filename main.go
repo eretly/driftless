@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	versionString = "v1.4.4"
+	versionString = "v1.4.5"
 	alpnProtocol  = "driftless-v1"
 	cmdAuth       = uint8(0)
 	cmdNewConn    = uint8(1)
@@ -492,11 +492,29 @@ func loadOrGenerateToken(isServer bool, tokenFlag, tokenFile string) (string, er
 			return "", fmt.Errorf("persist generated token to %s: %w", defaultTokenPath, err)
 		}
 		registerSecretForLogRedaction(autoTok)
-		log.Printf("[gateway] no -token specified; generated 128-bit password (saved to %s) [token=valid, hidden]", defaultTokenPath)
-		fmt.Fprintf(os.Stdout, "[console] Generated 128-bit password (saved to %s, hidden in logs): %s\n", defaultTokenPath, autoTok)
+		log.Printf("[gateway] no -token specified; generated 128-bit password (saved to %s with mode 0600; run './driftless show-token' or 'cat %s' to view) [token=valid, hidden]", defaultTokenPath, defaultTokenPath)
 		return autoTok, nil
 	}
 	return "", errors.New("password required: run './driftless client -quic VPS_IP:4242 -token YOUR_PASSWORD'")
+}
+
+func printSavedTokenAndCommand() error {
+	const (
+		defaultTokenPath = ".driftless-certs/token.secret"
+		defaultCmdPath   = ".driftless-certs/client-connect.cmd"
+	)
+	tokBytes, tokErr := os.ReadFile(defaultTokenPath)
+	cmdBytes, cmdErr := os.ReadFile(defaultCmdPath)
+	if tokErr != nil && cmdErr != nil {
+		return fmt.Errorf("no saved token or command found in .driftless-certs/ (start './driftless server' first): %w", tokErr)
+	}
+	if tokErr == nil {
+		fmt.Fprintf(os.Stdout, "Token (%s):\n  %s\n", defaultTokenPath, strings.TrimSpace(string(tokBytes)))
+	}
+	if cmdErr == nil {
+		fmt.Fprintf(os.Stdout, "Ready-to-copy Home PC command (%s):\n  %s\n", defaultCmdPath, strings.TrimSpace(string(cmdBytes)))
+	}
+	return nil
 }
 
 func main() {
@@ -512,6 +530,12 @@ func main() {
 		case "standalone", "direct", "p2p":
 			defaultMode = "standalone"
 			os.Args = append(os.Args[:1], os.Args[2:]...)
+		case "show-token", "token", "connect-cmd":
+			if err := printSavedTokenAndCommand(); err != nil {
+				fmt.Fprintf(os.Stderr, "[driftless] %v\n", err)
+				os.Exit(1)
+			}
+			return
 		case "version", "-v", "--version":
 			fmt.Printf("driftless %s (QUIC+TCP-Mux/TCP/UDP/HTTP-VHost/Auto-TLS/Zero-VPS STUN+UPnP)\n", versionString)
 			return

@@ -44,7 +44,7 @@ Windows:
 ```powershell
 .\driftless-windows-amd64.exe server -ports 8096,25565
 ```
-The server generates a password and prints a ready-to-copy command for your Home PC in the console.
+The server generates a 128-bit password and saves a ready-to-copy Home PC command to `.driftless-certs/client-connect.cmd` (`0600`, never printed to `stdout` or logs by default). Run `./driftless show-token` (or `cat .driftless-certs/client-connect.cmd`) on the VPS to view it.
 
 **Step 2. Copy that command and run it on your Home PC:**
 ```powershell
@@ -183,9 +183,9 @@ Windows:
 ```powershell
 .\driftless-windows-amd64.exe server -ports 8096,25565
 ```
-Сервер сам создаст пароль и выведет в консоль готовую строчку для твоего домашнего ПК.
+Сервер сам создаст 128-битный пароль и сохранит готовую команду подключения в `.driftless-certs/client-connect.cmd` (права `0600`, без вывода секрета в `stdout`/логи). Чтобы посмотреть её на ВПС, выполни `./driftless show-token` (или `cat .driftless-certs/client-connect.cmd`).
 
-**Шаг 2. Скопируй эту строчку из консоли ВПС и запусти дома на ПК:**
+**Шаг 2. Скопируй эту команду и запусти дома на ПК:**
 ```powershell
 .\driftless-windows-amd64.exe client -quic IP_ВПС:4242 -token ПАРОЛЬ -fingerprint ОТПЕЧАТОК
 ```
