@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1101,8 +1102,9 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 	if retryAttempts != 3 || !stillOnRouterAfterFailedRollback {
 		t.Fatalf("expected 3 rollback delete attempts and rule still on router when router rejects delete (attempts=%d, onRouter=%v)", retryAttempts, stillOnRouterAfterFailedRollback)
 	}
-	if _, err := os.Stat(upnpFallbackStateFile); err != nil {
-		t.Fatalf("expected fallback state file %s to exist after failed rollback: %v", upnpFallbackStateFile, err)
+	fbStatePath := resolveUPnPFallbackStateFile()
+	if _, err := os.Stat(fbStatePath); err != nil {
+		t.Fatalf("expected fallback state file %s to exist after failed rollback: %v", fbStatePath, err)
 	}
 
 	// Simulate crash recovery via cleanupStaleUPnPState reading from fallback state file and deleting TCP:9999
@@ -1129,5 +1131,85 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 	gotAtomic, err := os.ReadFile(atomicTestPath)
 	if err != nil || string(gotAtomic) != `{"v":2,"ok":true}` {
 		t.Fatalf("unexpected content after atomic overwrite: %q (err=%v)", string(gotAtomic), err)
+	}
+
+	// 5d. Verify per-instance fallback isolation (Instance A and Instance B do not overwrite or delete each other's fallback state)
+	upnpInstanceIDOverride = "instance-alpha"
+	fbAlpha := resolveUPnPFallbackStateFile()
+	upnpInstanceIDOverride = "instance-beta"
+	fbBeta := resolveUPnPFallbackStateFile()
+	if fbAlpha == fbBeta {
+		upnpInstanceIDOverride = ""
+		t.Fatalf("expected distinct fallback state files per instance, got identical %s", fbAlpha)
+	}
+	upnpInstanceIDOverride = "instance-alpha"
+	upnpStateMu.Lock()
+	activeUPnPMappings = []trackedRouterMapping{{InstanceID: "instance-alpha", Kind: "upnp", CtrlURL: ctrlURL, ServiceType: svcType, Port: 7001, Proto: "TCP"}}
+	if err := saveFallbackRouterMappingsLocked(); err != nil {
+		upnpStateMu.Unlock()
+		upnpInstanceIDOverride = ""
+		t.Fatalf("saveFallbackRouterMappingsLocked for alpha failed: %v", err)
+	}
+	activeUPnPMappings = nil
+	upnpStateMu.Unlock()
+
+	// Switch to instance-beta and clean its empty state; alpha's fallback file MUST remain untouched
+	upnpInstanceIDOverride = "instance-beta"
+	upnpStateMu.Lock()
+	_ = saveTrackedRouterMappingsLocked()
+	upnpStateMu.Unlock()
+	if _, err := os.Stat(fbAlpha); err != nil {
+		upnpInstanceIDOverride = ""
+		t.Fatalf("instance-beta deleted instance-alpha's fallback state file %s: %v", fbAlpha, err)
+	}
+	_ = os.Remove(fbAlpha)
+	_ = os.Remove(fbBeta)
+	upnpInstanceIDOverride = ""
+
+	// 5e. Verify critical abort when primary state write, router rollback, AND fallback state write all fail:
+	// subsequent port mappings in the list (port 9998) must NOT be created on the router.
+	_ = os.MkdirAll(upnpStateFile, 0o700)
+	origFallbackDir := upnpFallbackStateDir
+	upnpFallbackStateDir = filepath.Join(os.TempDir(), "nonexistent-driftless-fb-dir-999999")
+	upnpMu.Lock()
+	failDeletePort = 9999
+	upnpMu.Unlock()
+
+	abortedCount := autoForwardRouterPortsWithEndpoints("192.168.1.50", []PortMapping{
+		{PublicPort: 9999, TargetPort: 9999, Proto: "tcp"},
+		{PublicPort: 9998, TargetPort: 9998, Proto: "tcp"},
+	}, "", "", mockEndpoints, "")
+	upnpFallbackStateDir = origFallbackDir
+	_ = os.RemoveAll(upnpStateFile)
+	upnpMu.Lock()
+	port9998Created := activeRouterRules["TCP:9998"]
+	failDeletePort = 0
+	upnpMu.Unlock()
+	if abortedCount != 0 || port9998Created {
+		t.Fatalf("expected critical failure on port 9999 to abort before mapping port 9998 (abortedCount=%d, port9998Created=%v)", abortedCount, port9998Created)
+	}
+	_ = cleanupActiveUPnPMappings()
+
+	// 5f. Verify corrupted state file is preserved as .corrupt-* (not deleted) AND valid JSON objects inside it are salvaged
+	upnpMu.Lock()
+	activeRouterRules["TCP:7777"] = true
+	upnpMu.Unlock()
+	corruptContent := fmt.Sprintf(`[{"kind":"upnp","ctrl_url":%q,"service_type":%q,"port":7777,"proto":"TCP"}, CORRUPTED_TAIL`, ctrlURL, svcType)
+	if err := writeFileAtomic0600(upnpStateFile, []byte(corruptContent)); err != nil {
+		t.Fatalf("write corrupt test state file: %v", err)
+	}
+	salvagedRemoved := cleanupStaleUPnPState()
+	matches, _ := filepath.Glob(upnpStateFile + ".corrupt-*")
+	for _, m := range matches {
+		_ = os.Remove(m)
+	}
+	upnpMu.Lock()
+	port7777StillOnRouter := activeRouterRules["TCP:7777"]
+	upnpMu.Unlock()
+	if len(matches) == 0 {
+		t.Fatalf("expected corrupted state file %s to be preserved as %s.corrupt-* for diagnostics", upnpStateFile, upnpStateFile)
+	}
+	if salvagedRemoved != 1 || port7777StillOnRouter {
+		t.Fatalf("expected intact mapping TCP:7777 inside corrupted state file to be salvaged and deleted from router (salvagedRemoved=%d, stillOnRouter=%v)", salvagedRemoved, port7777StillOnRouter)
 	}
 }

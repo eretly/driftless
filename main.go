@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,7 +25,7 @@ import (
 )
 
 const (
-	versionString = "v1.4.6"
+	versionString = "v1.4.7"
 	alpnProtocol  = "driftless-v1"
 	cmdAuth       = uint8(0)
 	cmdNewConn    = uint8(1)
@@ -489,9 +490,30 @@ func writeFileAtomic0600(targetPath string, data []byte) error {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	if dirFile, err := os.Open(dir); err == nil {
-		_ = dirFile.Sync()
-		_ = dirFile.Close()
+	if err := syncParentDir(dir); err != nil {
+		return err
+	}
+	return nil
+}
+
+func syncParentDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		log.Printf("[driftless] WARNING: failed to open parent directory %s for fsync: %v", dir, err)
+		return fmt.Errorf("open parent directory %s for fsync: %w", dir, err)
+	}
+	syncErr := dirFile.Sync()
+	closeErr := dirFile.Close()
+	if syncErr != nil && !errors.Is(syncErr, syscall.EINVAL) && !errors.Is(syncErr, syscall.ENOTSUP) && !errors.Is(syncErr, syscall.EBADF) {
+		log.Printf("[driftless] WARNING: failed to fsync parent directory %s: %v", dir, syncErr)
+		return fmt.Errorf("fsync parent directory %s: %w", dir, syncErr)
+	}
+	if closeErr != nil {
+		log.Printf("[driftless] WARNING: failed to close parent directory %s after fsync: %v", dir, closeErr)
+		return fmt.Errorf("close parent directory %s: %w", dir, closeErr)
 	}
 	return nil
 }
