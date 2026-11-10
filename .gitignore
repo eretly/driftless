@@ -1,0 +1,7 @@
+driftless
+driftless.exe
+driftless-*
+!*.service
+.driftless-*
+*.pem
+*.key

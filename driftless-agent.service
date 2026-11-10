@@ -1,0 +1,21 @@
+[Unit]
+Description=Driftless Home Agent (Zero-Drop QUIC Reverse Tunnel)
+Documentation=https://github.com/ERETLY/driftless
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=driftless
+Group=driftless
+EnvironmentFile=-/etc/driftless/agent.env
+ExecStart=/usr/local/bin/driftless client   -quic VPS_IP:4242   -host 127.0.0.1   -token-file /etc/driftless/token
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
