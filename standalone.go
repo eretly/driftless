@@ -288,11 +288,15 @@ func recordTrackedRouterMapping(m trackedRouterMapping) error {
 	defer upnpStateMu.Unlock()
 	for _, ex := range activeUPnPMappings {
 		if sameTrackedRouterMapping(ex, m) {
-			return nil
+			return saveTrackedRouterMappingsLocked()
 		}
 	}
 	activeUPnPMappings = append(activeUPnPMappings, m)
-	return saveTrackedRouterMappingsLocked()
+	if err := saveTrackedRouterMappingsLocked(); err != nil {
+		activeUPnPMappings = activeUPnPMappings[:len(activeUPnPMappings)-1]
+		return err
+	}
+	return nil
 }
 
 func deleteSingleRouterMapping(m trackedRouterMapping) error {
@@ -481,27 +485,43 @@ func autoForwardRouterPortsWithEndpoints(lanIP string, mappings []PortMapping, v
 		ok := false
 		for _, ep := range endpoints {
 			if err := upnpAddPortMapping(ep.ctrlURL, ep.serviceType, lanIP, sp.port, sp.proto); err == nil {
-				_ = recordTrackedRouterMapping(trackedRouterMapping{
+				rule := trackedRouterMapping{
 					Kind:        "upnp",
 					CtrlURL:     ep.ctrlURL,
 					ServiceType: ep.serviceType,
 					LANIP:       lanIP,
 					Port:        sp.port,
 					Proto:       sp.proto,
-				})
+				}
+				if err := recordTrackedRouterMapping(rule); err != nil {
+					if delErr := upnpDeletePortMapping(ep.ctrlURL, ep.serviceType, sp.port, sp.proto); delErr != nil {
+						log.Printf("[standalone] ERROR: failed to rollback UPnP mapping %s/%d after state-file write error: %v", sp.proto, sp.port, delErr)
+					} else {
+						log.Printf("[standalone] rolled back UPnP mapping %s/%d because state file %s could not be saved", sp.proto, sp.port, upnpStateFile)
+					}
+					continue
+				}
 				ok = true
 			}
 		}
 		if !ok && gwIP != "" {
 			if err := natPMPAddPortMapping(gwIP, sp.port, sp.proto); err == nil {
-				_ = recordTrackedRouterMapping(trackedRouterMapping{
+				rule := trackedRouterMapping{
 					Kind:      "natpmp",
 					GatewayIP: gwIP,
 					LANIP:     lanIP,
 					Port:      sp.port,
 					Proto:     sp.proto,
-				})
-				ok = true
+				}
+				if err := recordTrackedRouterMapping(rule); err != nil {
+					if delErr := natPMPDeletePortMapping(gwIP, sp.port, sp.proto); delErr != nil {
+						log.Printf("[standalone] ERROR: failed to rollback NAT-PMP mapping %s/%d after state-file write error: %v", sp.proto, sp.port, delErr)
+					} else {
+						log.Printf("[standalone] rolled back NAT-PMP mapping %s/%d because state file %s could not be saved", sp.proto, sp.port, upnpStateFile)
+					}
+				} else {
+					ok = true
+				}
 			}
 		}
 		if ok {

@@ -1029,6 +1029,7 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 	}
 
 	// 5. Verify saveTrackedRouterMappingsLocked / recordTrackedRouterMapping surfaces os.WriteFile errors explicitly
+	// and autoForwardRouterPortsWithEndpoints immediately rolls back the router rule and does not count it as successful.
 	_ = os.RemoveAll(upnpStateFile)
 	if err := os.MkdirAll(upnpStateFile, 0o700); err != nil {
 		t.Fatalf("mkdir %s failed: %v", upnpStateFile, err)
@@ -1041,11 +1042,25 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 		Port:        9999,
 		Proto:       "TCP",
 	})
-	_ = os.RemoveAll(upnpStateFile)
-	upnpStateMu.Lock()
-	activeUPnPMappings = nil
-	upnpStateMu.Unlock()
 	if writeErr == nil {
+		_ = os.RemoveAll(upnpStateFile)
 		t.Fatalf("expected recordTrackedRouterMapping to return an explicit error when %s cannot be written", upnpStateFile)
+	}
+
+	// Also verify autoForwardRouterPortsWithEndpoints rolls back the created rule on the router and returns 0
+	upnpMu.Lock()
+	deleteCallsBeforeRollback := deleteCalls
+	upnpMu.Unlock()
+	mappedOnWriteFail := autoForwardRouterPortsWithEndpoints("192.168.1.50", []PortMapping{{PublicPort: 9999, TargetPort: 9999, Proto: "tcp"}}, "", "", mockEndpoints, "")
+	_ = os.RemoveAll(upnpStateFile)
+	if mappedOnWriteFail != 0 {
+		t.Fatalf("expected 0 successful mappings when state file %s cannot be persisted, got %d", upnpStateFile, mappedOnWriteFail)
+	}
+	upnpMu.Lock()
+	stillOnRouter := activeRouterRules["TCP:9999"]
+	rollbackDeletes := deleteCalls - deleteCallsBeforeRollback
+	upnpMu.Unlock()
+	if stillOnRouter || rollbackDeletes != 1 {
+		t.Fatalf("expected UPnP rule TCP:9999 to be immediately rolled back on state-file write error (stillOnRouter=%v, rollbackDeletes=%d)", stillOnRouter, rollbackDeletes)
 	}
 }
