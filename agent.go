@@ -352,7 +352,9 @@ func (ag *Agent) resumeActiveSessions(conn TunnelConn) {
 			continue
 		}
 		go func(s *Session) {
-			st, err := conn.OpenStreamSync(context.Background())
+			openCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			st, err := conn.OpenStreamSync(openCtx)
+			cancel()
 			if err != nil {
 				return
 			}
@@ -378,7 +380,9 @@ func (ag *Agent) resumeActiveSessions(conn TunnelConn) {
 
 	for _, us := range ag.udpSessions {
 		go func(u *agentUDPSession) {
-			st, err := conn.OpenStreamSync(context.Background())
+			openCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			st, err := conn.OpenStreamSync(openCtx)
+			cancel()
 			if err != nil {
 				return
 			}
@@ -430,7 +434,7 @@ func (ag *Agent) acceptGatewayStreams(ctx context.Context, conn TunnelConn) {
 			ag.mu.Lock()
 			sess, exists := ag.sessions[sessID]
 			ag.mu.Unlock()
-			if !exists && cmd == cmdNewConn {
+			if !exists && (cmd == cmdNewConn || cmd == cmdResume) {
 				c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ag.targetHost, targetPort), 5*time.Second)
 				if err != nil {
 					_ = s.Close()
@@ -539,10 +543,21 @@ func (ag *Agent) readUDPFromGatewayStream(us *agentUDPSession, st TunnelStream) 
 func (ag *Agent) readFromLocalUDP(us *agentUDPSession) {
 	bufPtr := udpBufPool.Get().(*[]byte)
 	defer udpBufPool.Put(bufPtr)
+	defer func() {
+		ag.mu.Lock()
+		if cur, ok := ag.udpSessions[us.id]; ok && cur == us {
+			delete(ag.udpSessions, us.id)
+		}
+		ag.mu.Unlock()
+	}()
 	buf := *bufPtr
 	for {
 		n, err := us.localConn.Read(buf)
 		if err != nil {
+			if isTransientUDPReadError(err) {
+				time.Sleep(15 * time.Millisecond)
+				continue
+			}
 			return
 		}
 		if n == 0 {

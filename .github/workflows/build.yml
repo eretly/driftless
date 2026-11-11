@@ -7,7 +7,8 @@ on:
 permissions:
   contents: read
 jobs:
-  build-and-test:
+  test-linux:
+    name: Linux Integration & Race Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,7 +16,7 @@ jobs:
         with:
           go-version: '1.23'
           cache: true
-      - name: Run Vet & Race Tests
+      - name: Run Vet & Race Tests (Linux)
         run: |
           go vet ./...
           go test -v -race ./...
@@ -26,4 +27,19 @@ jobs:
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o driftless-windows-amd64.exe .
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o driftless-darwin-arm64 .
           sha256sum driftless-* > checksums.txt
+
+  test-windows:
+    name: Windows Integration Tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+      - name: Run Vet & Integration Tests (Windows)
+        run: |
+          go vet ./...
+          go test -v ./...
+
 

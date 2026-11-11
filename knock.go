@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"log"
 	"net"
 	"net/http"
@@ -638,111 +637,52 @@ func (kc *KnockController) handleKnockHTTPConn(pc *peekedConn, remoteAddr net.Ad
 		return
 	}
 
-	page := kc.buildLaunchpadHTML(reqHost, clientIP, requestedPort, exp)
+	textBody := kc.buildKnockTextResponse(reqHost, clientIP, requestedPort, exp)
 	hdr := fmt.Sprintf(
-		"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-		len(page),
+		"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+		len(textBody),
 	)
-	_, _ = pc.Write([]byte(hdr + page))
+	_, _ = pc.Write([]byte(hdr + textBody))
 }
 
-func (kc *KnockController) buildLaunchpadHTML(host, clientIP string, unlockedPort uint16, exp time.Time) string {
-	safeHost := html.EscapeString(host)
-	safeIP := html.EscapeString(clientIP)
+func (kc *KnockController) buildKnockTextResponse(host, clientIP string, unlockedPort uint16, exp time.Time) string {
 	ttlMins := int(time.Until(exp).Minutes())
-	ttlLabel := fmt.Sprintf("%d min", ttlMins)
+	ttlLabel := fmt.Sprintf("%dm", ttlMins)
 	if ttlMins >= 120 {
-		ttlLabel = fmt.Sprintf("%.1f h", time.Until(exp).Hours())
+		ttlLabel = fmt.Sprintf("%.1fh", time.Until(exp).Hours())
 	}
 	scheme := "https"
-	rdpFileURL := fmt.Sprintf("%s://%s:%d%s%s/connect.rdp", scheme, safeHost, kc.primaryPort, knockPathPrefix, kc.secret)
-	revokeURL := fmt.Sprintf("%s://%s:%d%s%s/revoke", scheme, safeHost, kc.primaryPort, knockPathPrefix, kc.secret)
-	caURL := fmt.Sprintf("%s://%s:%d%s%s/ca.crt", scheme, safeHost, kc.primaryPort, knockPathPrefix, kc.secret)
+	revokeURL := fmt.Sprintf("%s://%s:%d%s%s/revoke", scheme, host, kc.primaryPort, knockPathPrefix, kc.secret)
+	revokeAllURL := fmt.Sprintf("%s?all=1", revokeURL)
+	rdpFileURL := fmt.Sprintf("%s://%s:%d%s%s/connect.rdp", scheme, host, kc.primaryPort, knockPathPrefix, kc.secret)
+	caURL := fmt.Sprintf("%s://%s:%d%s%s/ca.crt", scheme, host, kc.primaryPort, knockPathPrefix, kc.secret)
 
-	scopeBadge := fmt.Sprintf("Mapped TCP &amp; UDP Ports Unlocked (%s)", ttlLabel)
+	scope := "all mapped ports"
 	if unlockedPort > 0 {
-		scopeBadge = fmt.Sprintf("Port :%d Unlocked (%s)", unlockedPort, ttlLabel)
+		scope = fmt.Sprintf("port %d", unlockedPort)
 	}
 
-	var cards strings.Builder
+	var b strings.Builder
+	fmt.Fprintf(&b, "OK - driftless knock unlocked\n")
+	fmt.Fprintf(&b, "client_ip: %s\n", clientIP)
+	fmt.Fprintf(&b, "unlocked: %s (ttl %s, expires %s)\n", scope, ttlLabel, exp.UTC().Format(time.RFC3339))
+	fmt.Fprintf(&b, "host: %s\n", host)
 	for _, m := range kc.mappedPorts {
-		pub := m.PublicPort
-		loc := m.TargetPort
-		portOnlyURL := fmt.Sprintf("%s://%s:%d%s%s?port=%d", scheme, safeHost, kc.primaryPort, knockPathPrefix, kc.secret, pub)
-		switch loc {
-		case 3389:
-			cards.WriteString(fmt.Sprintf(
-				`<div class="card"><div><strong>Windows Remote Desktop (RDP :%d)</strong><div class="sub">%s:%d (or single-port %s:%d)</div></div><div class="btns"><a class="btn" href="rdp://full%%20address=s:%s:%d">Open Windows App</a><a class="btn sec" href="%s">Download .rdp</a><a class="btn sec" href="%s">Unlock :%d Only</a></div></div>`,
-				pub, safeHost, pub, safeHost, kc.primaryPort, safeHost, pub, rdpFileURL, portOnlyURL, pub,
-			))
-		case 22:
-			cards.WriteString(fmt.Sprintf(
-				`<div class="card"><div><strong>SSH / SFTP Terminal (:%d)</strong><div class="sub">%s:%d (WebSSH / Termius / SFTP)</div></div><div class="btns"><a class="btn" href="ssh://%s:%d">Open SSH</a><a class="btn sec" href="sftp://%s:%d">Open SFTP</a><a class="btn sec" href="%s">Unlock :%d Only</a></div></div>`,
-				pub, safeHost, pub, safeHost, pub, safeHost, pub, portOnlyURL, pub,
-			))
-		default:
-			portScheme := scheme
-			if m.Proto == "https" || pub == 443 {
-				portScheme = "https"
-			}
-			cards.WriteString(fmt.Sprintf(
-				`<div class="card"><div><strong>Port :%d (Local :%d - %s)</strong><div class="sub">%s://%s:%d</div></div><div class="btns"><a class="btn" href="%s://%s:%d">Open in Browser</a><a class="btn sec" href="%s">Unlock :%d Only</a></div></div>`,
-				pub, loc, strings.ToUpper(m.Proto), portScheme, safeHost, pub, portScheme, safeHost, pub, portOnlyURL, pub,
-			))
-		}
+		fmt.Fprintf(&b, "port %d -> :%d (%s) | unlock only :%d: %s://%s:%d%s%s?port=%d\n",
+			m.PublicPort, m.TargetPort, m.Proto, m.PublicPort, scheme, host, kc.primaryPort, knockPathPrefix, kc.secret, m.PublicPort)
 	}
+	fmt.Fprintf(&b, "rdp_profile: %s\n", rdpFileURL)
+	fmt.Fprintf(&b, "revoke_ip: %s\n", revokeURL)
+	fmt.Fprintf(&b, "revoke_all: %s\n", revokeAllURL)
 
-	caBox := ""
 	kc.mu.RLock()
 	caFP := kc.caFingerprint
 	hasCA := len(kc.caCertPEM) > 0
 	kc.mu.RUnlock()
 	if hasCA && caFP != "" {
-		caBox = fmt.Sprintf(`  <div class="box">
-    <div style="font-size:13px;font-weight:600;color:#cbd5e1">TLS Root CA Verification (No Public Domain / IP Mode)</div>
-    <p style="margin:4px 0 8px;font-size:12px;color:#94a3b8">For public domains (e.g. DuckDNS), driftless issues a real Let's Encrypt certificate automatically. If connecting via raw IP or .sslip.io, you can verify or install this server's persistent Root CA once to prevent MITM:</p>
-    <div class="sub">Root CA SHA-256: %s</div>
-    <div class="btns" style="margin-top:8px"><a class="btn sec" href="%s">Download Root CA (ca.crt)</a></div>
-  </div>`, html.EscapeString(caFP), caURL)
+		fmt.Fprintf(&b, "ca_sha256: %s\n", caFP)
+		fmt.Fprintf(&b, "ca_cert: %s\n", caURL)
 	}
-
-	return fmt.Sprintf(`<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>driftless - Device Unlocked</title>
-<style>
-body{margin:0;padding:20px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#090d16;color:#f1f5f9}
-.wrap{max-width:640px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
-.badge{display:inline-block;padding:6px 10px;border-radius:6px;background:#064e3b;color:#6ee7b7;font-size:13px;font-weight:600}
-.box{background:#111827;border:1px solid #1f2937;border-radius:10px;padding:16px}
-.card{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid #1f2937}
-.card:last-child{border-bottom:none}
-.sub{font-size:12px;color:#94a3b8;font-family:monospace;margin-top:3px;word-break:break-all}
-.btns{display:flex;gap:8px;flex-wrap:wrap}
-.btn{padding:8px 12px;border-radius:6px;background:#38bdf8;color:#090d16;text-decoration:none;font-weight:600;font-size:13px}
-.btn.sec{background:#1e293b;color:#e2e8f0;border:1px solid #334155}
-.btn.danger{background:#7f1d1d;color:#fecaca;border:1px solid #991b1b}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="box">
-    <span class="badge">%s</span>
-    <h2 style="margin:10px 0 4px;font-size:18px">Your IP (%s) is authorized</h2>
-    <p style="margin:0 0 12px;font-size:13px;color:#94a3b8">You can now connect from native apps on this device (WebSSH, Termius, Windows App RDP, Jellyfin, Moonlight). Save this page to your bookmarks to unlock again when your mobile IP changes.</p>
-    <div class="btns">
-      <a class="btn danger" href="%s">Revoke My IP Now</a>
-      <a class="btn sec" href="%s?all=1">Revoke All Unlocked IPs</a>
-    </div>
-  </div>
-  <div class="box">
-    <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:#cbd5e1">One-Tap App Launchers &amp; Per-Port Knock</div>
-    %s
-  </div>
-%s
-</div>
-</body>
-</html>`, scopeBadge, safeIP, revokeURL, revokeURL, cards.String(), caBox)
+	return b.String()
 }
+

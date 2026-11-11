@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,11 +37,32 @@ type Session struct {
 }
 
 func tuneTCPSocket(c net.Conn) {
-	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.SetNoDelay(true)
-		_ = tc.SetKeepAlive(true)
-		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	for c != nil {
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+			_ = tc.SetKeepAlive(true)
+			_ = tc.SetKeepAlivePeriod(30 * time.Second)
+			return
+		}
+		if pc, ok := c.(*peekedConn); ok {
+			c = pc.Conn
+			continue
+		}
+		break
 	}
+}
+
+// isTransientUDPReadError returns true when a connected UDP socket receives an ICMP Port Unreachable
+// notification (ECONNREFUSED on Linux/macOS, WSAECONNREFUSED / WSAECONNRESET on Windows) while a
+// local UDP game/voice server is restarting. Ignoring this error keeps the UDP session alive 24/7.
+func isTransientUDPReadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "forcibly closed")
 }
 
 // tryReserveGlobalMemory atomically reserves delta bytes against maxGlobal so concurrent
@@ -226,6 +248,9 @@ func bridgeSessionStream(s *Session, stream TunnelStream) {
 	defer func() {
 		_ = stream.Close()
 		s.mu.Lock()
+		if s.activeStream == stream {
+			s.activeStream = nil
+		}
 		s.cond.Broadcast()
 		s.mu.Unlock()
 	}()

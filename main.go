@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	versionString = "v1.5.3"
+	versionString = "v1.5.4"
 	alpnProtocol  = "driftless-v1"
 	cmdAuth       = uint8(0)
 	cmdNewConn    = uint8(1)
@@ -566,15 +566,17 @@ func loadOrGenerateToken(isServer bool, tokenFlag, tokenFile string) (string, er
 
 func printSavedTokenAndCommand() error {
 	const (
-		defaultTokenPath = ".driftless-certs/token.secret"
-		defaultCmdPath   = ".driftless-certs/client-connect.cmd"
-		defaultKnockPath = ".driftless-certs/knock-url.txt"
+		defaultTokenPath          = ".driftless-certs/token.secret"
+		defaultCmdPath            = ".driftless-certs/client-connect.cmd"
+		defaultKnockPath          = ".driftless-certs/knock-url.txt"
+		defaultStandaloneInfoPath = ".driftless-certs/standalone-info.txt"
 	)
 	tokBytes, tokErr := os.ReadFile(defaultTokenPath)
 	cmdBytes, cmdErr := os.ReadFile(defaultCmdPath)
 	knockBytes, knockErr := os.ReadFile(defaultKnockPath)
-	if tokErr != nil && cmdErr != nil && knockErr != nil {
-		return fmt.Errorf("no saved token or command found in .driftless-certs/ (start './driftless server' or './driftless standalone -knock' first): %w", tokErr)
+	infoBytes, infoErr := os.ReadFile(defaultStandaloneInfoPath)
+	if tokErr != nil && cmdErr != nil && knockErr != nil && infoErr != nil {
+		return fmt.Errorf("no saved token or connection info found in .driftless-certs/ (start './driftless server' or './driftless standalone' first): %w", tokErr)
 	}
 	if tokErr == nil {
 		fmt.Fprintf(os.Stdout, "Token (%s):\n  %s\n", defaultTokenPath, strings.TrimSpace(string(tokBytes)))
@@ -582,8 +584,11 @@ func printSavedTokenAndCommand() error {
 	if cmdErr == nil {
 		fmt.Fprintf(os.Stdout, "Ready-to-copy Home PC command (%s):\n  %s\n", defaultCmdPath, strings.TrimSpace(string(cmdBytes)))
 	}
+	if infoErr == nil {
+		fmt.Fprintf(os.Stdout, "Standalone Connection Summary (%s):\n%s\n", defaultStandaloneInfoPath, strings.TrimSpace(string(infoBytes)))
+	}
 	if knockErr == nil {
-		fmt.Fprintf(os.Stdout, "Mobile Knock Magic Link (%s):\n  %s\n", defaultKnockPath, strings.TrimSpace(string(knockBytes)))
+		fmt.Fprintf(os.Stdout, "Magic Knock URL (%s):\n  %s\n", defaultKnockPath, strings.TrimSpace(string(knockBytes)))
 	}
 	return nil
 }
@@ -638,7 +643,7 @@ func main() {
 	lanIP := flag.String("lan-ip", "", "override auto-detected agent LAN IP")
 	allowPorts := flag.String("allow-ports", "", "optional whitelist of local ports on agent/standalone (e.g. 80,8096,25565)")
 	allowIPs := flag.String("allow-ips", "", "optional IP/CIDR ACL whitelist for public listeners (e.g. 192.168.1.0/24,203.0.113.5)")
-	enableKnock := flag.Bool("knock", false, "enable HTTPS Mobile Knock Gatekeeper (per-port unlock, instant IP revoke, .rdp/ssh:// launchers)")
+	enableKnock := flag.Bool("knock", false, "enable HTTPS Magic Knock IP gatekeeper (per-port unlock, 1h TTL, instant IP revoke)")
 	knockToken := flag.String("knock-token", "", "optional custom secret for -knock Magic Link (auto-generated and persisted if omitted)")
 	knockTTL := flag.Duration("knock-ttl", 1*time.Hour, "how long a device IP stays unlocked after opening the Magic Knock Link (default 1h)")
 	clientCA := flag.String("client-ca", "", "optional CA PEM file on server to require mTLS client certificates from agents")

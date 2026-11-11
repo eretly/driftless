@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
@@ -546,7 +548,7 @@ func TestKnockPortalAndSinglePortMultiplexerAndBridge(t *testing.T) {
 		t.Fatalf("expected downloadable .rdp profile with mypc.duckdns.org:3389 over HTTPS, got:\n%s", string(respBytes))
 	}
 
-	// Verify Launchpad HTML https:// links, Root CA fingerprint, and Revoke link (with no proxy.pac)
+	// Verify plain-text Knock response (no HTML web console), https:// revoke link, and Root CA fingerprint
 	c2, s2 := net.Pipe()
 	done2 := make(chan struct{})
 	go func() {
@@ -555,14 +557,15 @@ func TestKnockPortalAndSinglePortMultiplexerAndBridge(t *testing.T) {
 	}()
 	tlsClient2 := tls.Client(c2, &tls.Config{ServerName: "mypc.duckdns.org", InsecureSkipVerify: true})
 	_, _ = tlsClient2.Write([]byte("GET /__driftless_knock/testknocksecret123456 HTTP/1.1\r\nHost: mypc.duckdns.org:8096\r\n\r\n"))
-	launchpadBytes, _ := io.ReadAll(tlsClient2)
+	knockRespBytes, _ := io.ReadAll(tlsClient2)
 	_ = tlsClient2.Close()
 	<-done2
-	if !strings.Contains(string(launchpadBytes), "https://mypc.duckdns.org:8096/__driftless_knock/testknocksecret123456/revoke") {
-		t.Fatalf("expected Launchpad HTML to include https:// revoke link, got:\n%s", string(launchpadBytes))
+	if !strings.Contains(string(knockRespBytes), "OK - driftless knock unlocked") ||
+		!strings.Contains(string(knockRespBytes), "https://mypc.duckdns.org:8096/__driftless_knock/testknocksecret123456/revoke") {
+		t.Fatalf("expected plain-text Knock response to include https:// revoke link, got:\n%s", string(knockRespBytes))
 	}
-	if strings.Contains(string(launchpadBytes), "http://mypc.duckdns.org:8096/__driftless_knock/") {
-		t.Fatalf("expected zero http:// knock links in Launchpad HTML, got:\n%s", string(launchpadBytes))
+	if strings.Contains(string(knockRespBytes), "<html") || strings.Contains(string(knockRespBytes), "http://mypc.duckdns.org:8096/__driftless_knock/") {
+		t.Fatalf("expected zero HTML and zero http:// knock links in Knock response, got:\n%s", string(knockRespBytes))
 	}
 
 	// Verify /revoke endpoint over HTTPS
@@ -638,5 +641,233 @@ func TestKnockPortalAndSinglePortMultiplexerAndBridge(t *testing.T) {
 		t.Fatalf("expected BRIDGED-OK through standalone ephemeral bridge port %d -> %d, got %q (err=%v)", bridgedPort, occupiedPort, string(gotBridge), err)
 	}
 }
+
+func TestProductionChaosWANFlapsBackendRestartsAndRouterReboot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	prevTransport := defaultTransportMode
+	defaultTransportMode = "tcp"
+	defer func() {
+		defaultTransportMode = prevTransport
+	}()
+
+	// 1. Local TCP echo server (simulating an active SSH/RDP/Website stream that must survive WAN flaps)
+	tcpTargetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcpTargetLn.Close()
+	tcpTargetPort := uint16(tcpTargetLn.Addr().(*net.TCPAddr).Port)
+	go func() {
+		for {
+			c, err := tcpTargetLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	// 2. Local UDP game server that will be STOPPED and RESTARTED mid-session to verify 24/7 resilience
+	udpTargetPort := uint16(getFreePort(t, "udp"))
+	startLocalUDPServer := func(port uint16, tag string) *net.UDPConn {
+		uaddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		uc, err := net.ListenUDP("udp", uaddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			buf := make([]byte, 2048)
+			for {
+				n, raddr, err := uc.ReadFromUDP(buf)
+				if err != nil {
+					return
+				}
+				reply := append([]byte(tag+":"), buf[:n]...)
+				_, _ = uc.WriteToUDP(reply, raddr)
+			}
+		}()
+		return uc
+	}
+	udpSrv1 := startLocalUDPServer(udpTargetPort, "v1")
+	defer func() {
+		if udpSrv1 != nil {
+			_ = udpSrv1.Close()
+		}
+	}()
+
+	gwPort := getFreePort(t, "tcp")
+	pubTCPPort := uint16(getFreePort(t, "tcp"))
+	pubUDPPort := uint16(getFreePort(t, "udp"))
+
+	// Fault-injecting TCP WAN proxy between Agent and Gateway so we can sever the WAN link multiple times mid-stream
+	wanProxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wanProxyLn.Close()
+
+	var proxyMu sync.Mutex
+	var activeWANConns []net.Conn
+	severAllWANLinks := func() {
+		proxyMu.Lock()
+		conns := activeWANConns
+		activeWANConns = nil
+		proxyMu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}
+
+	gwAddr := fmt.Sprintf("127.0.0.1:%d", gwPort)
+	go func() {
+		for {
+			inC, err := wanProxyLn.Accept()
+			if err != nil {
+				return
+			}
+			outC, err := net.DialTimeout("tcp", gwAddr, 2*time.Second)
+			if err != nil {
+				_ = inC.Close()
+				continue
+			}
+			proxyMu.Lock()
+			activeWANConns = append(activeWANConns, inC, outC)
+			proxyMu.Unlock()
+			go pipeBidirectional(inC, outC)
+		}
+	}()
+
+	mappings := []PortMapping{
+		{PublicPort: pubTCPPort, TargetPort: tcpTargetPort, Proto: "tcp"},
+		{PublicPort: pubUDPPort, TargetPort: udpTargetPort, Proto: "udp"},
+	}
+
+	certDir := t.TempDir()
+	go func() {
+		_ = runGateway(ctx, gwAddr, "chaos-secret-token", "", "", "", nil, mappings, 64*1024*1024, 8*1024*1024, 2*time.Second, 250*time.Millisecond, 30*time.Second, certDir, "", "", false, false)
+	}()
+	time.Sleep(150 * time.Millisecond)
+
+	go func() {
+		_ = runAgent(ctx, wanProxyLn.Addr().String(), "127.0.0.1", "chaos-secret-token", "192.168.1.50", "", 8*1024*1024, 64*1024*1024, 2*time.Second, 250*time.Millisecond, 30*time.Second, nil)
+	}()
+	time.Sleep(250 * time.Millisecond)
+
+	// Part A: Stream 1.5 MiB over a single TCP connection while severing the WAN link twice mid-transfer
+	clientConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", pubTCPPort), 3*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial public TCP port: %v", err)
+	}
+	defer clientConn.Close()
+
+	totalBytes := 1536 * 1024
+	sendPayload := make([]byte, totalBytes)
+	_, _ = rand.Read(sendPayload)
+	wantHash := sha256.Sum256(sendPayload)
+
+	resumedBefore := metricResumedSessions.Load()
+	phase1Done := make(chan struct{})
+	phase2Done := make(chan struct{})
+	writeErrCh := make(chan error, 1)
+
+	go func() {
+		// Phase 1: Write first 256 KiB and wait until reader confirms epoch #1 is actively streaming
+		if _, wErr := clientConn.Write(sendPayload[:256*1024]); wErr != nil {
+			writeErrCh <- wErr
+			return
+		}
+		<-phase1Done
+
+		// Flap #1: Sever the WAN tunnel mid-stream and write 640 KiB while the tunnel is reconnecting
+		severAllWANLinks()
+		if _, wErr := clientConn.Write(sendPayload[256*1024 : 896*1024]); wErr != nil {
+			writeErrCh <- wErr
+			return
+		}
+		<-phase2Done
+
+		// Flap #2: Sever the WAN tunnel a second time on the same TCP session and write remaining 640 KiB
+		severAllWANLinks()
+		if _, wErr := clientConn.Write(sendPayload[896*1024:]); wErr != nil {
+			writeErrCh <- wErr
+			return
+		}
+		if tc, ok := clientConn.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+		writeErrCh <- nil
+	}()
+
+	_ = clientConn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	receivedPayload := make([]byte, totalBytes)
+	if _, err := io.ReadFull(clientConn, receivedPayload[:256*1024]); err != nil {
+		t.Fatalf("Phase 1 TCP read failed: %v", err)
+	}
+	close(phase1Done)
+
+	if _, err := io.ReadFull(clientConn, receivedPayload[256*1024:896*1024]); err != nil {
+		t.Fatalf("Phase 2 TCP read across WAN flap #1 failed: %v", err)
+	}
+	close(phase2Done)
+
+	if _, err := io.ReadFull(clientConn, receivedPayload[896*1024:]); err != nil {
+		t.Fatalf("Phase 3 TCP read across WAN flap #2 failed: %v", err)
+	}
+	if wErr := <-writeErrCh; wErr != nil {
+		t.Fatalf("TCP stream write failed: %v", wErr)
+	}
+	gotHash := sha256.Sum256(receivedPayload)
+	if gotHash != wantHash {
+		t.Fatalf("SHA-256 mismatch after multi-flap WAN outage: got %x, want %x", gotHash[:8], wantHash[:8])
+	}
+	if metricResumedSessions.Load() < resumedBefore+2 {
+		t.Fatalf("expected metricResumedSessions to increment by at least 2 after 2 WAN flaps (before=%d, after=%d)", resumedBefore, metricResumedSessions.Load())
+	}
+
+	// Part B: Verify Local UDP Server Restart Resilience (ECONNREFUSED / WSAECONNREFUSED immunity)
+	udpClient, err := net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", pubUDPPort))
+	if err != nil {
+		t.Fatalf("failed to dial public UDP port: %v", err)
+	}
+	defer udpClient.Close()
+
+	sendAndRecvUDP := func(msg, wantPrefix string) {
+		for attempt := 0; attempt < 15; attempt++ {
+			_, _ = udpClient.Write([]byte(msg))
+			_ = udpClient.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+			var rbuf [256]byte
+			n, rErr := udpClient.Read(rbuf[:])
+			if rErr == nil && strings.HasPrefix(string(rbuf[:n]), wantPrefix) {
+				return
+			}
+		}
+		t.Fatalf("failed to receive expected UDP reply %q for %q", wantPrefix, msg)
+	}
+
+	// 1) Initial UDP packet reaches v1 server
+	sendAndRecvUDP("ping1", "v1:ping1")
+
+	// 2) Stop the local UDP server and send packets while it is down (triggers ICMP Port Unreachable / ECONNREFUSED on connected UDP socket)
+	_ = udpSrv1.Close()
+	udpSrv1 = nil
+	for i := 0; i < 4; i++ {
+		_, _ = udpClient.Write([]byte("while-down"))
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// 3) Restart the local UDP server on the exact same port (v2) and verify the existing UDP session immediately works without restarting driftless
+	udpSrv2 := startLocalUDPServer(udpTargetPort, "v2")
+	defer udpSrv2.Close()
+	sendAndRecvUDP("ping2", "v2:ping2")
+}
+
 
 

@@ -1835,20 +1835,66 @@ func autoZeroConfigDomain(ip string) string {
 	return fmt.Sprintf("%d-%d-%d-%d.sslip.io", parsed[0], parsed[1], parsed[2], parsed[3])
 }
 
-func printStandaloneBanner(pubIP string, ddns DDNSConfig, mappings []PortMapping) {
+func printStandaloneBanner(pubIP string, ddns DDNSConfig, mappings []PortMapping, enableTLS bool, certDir string) {
+	host := pubIP
+	if ddns.Domain != "" {
+		host = ddns.Domain
+	}
+	var summary strings.Builder
 	log.Printf("[standalone] ==========================================================")
 	if ddns.Domain != "" {
-		log.Printf("[standalone] Ready-to-copy domain addresses (%s):", ddns.Domain)
-		for _, m := range mappings {
-			log.Printf("[standalone]   %s:%d", ddns.Domain, m.PublicPort)
-		}
+		log.Printf("[standalone] Ready-to-use connections (Domain: %s | IP: %s):", ddns.Domain, pubIP)
+		fmt.Fprintf(&summary, "  Host: %s (IP: %s)\n", ddns.Domain, pubIP)
 	} else {
-		log.Printf("[standalone] Ready-to-copy addresses:")
-		for _, m := range mappings {
-			log.Printf("[standalone]   %s:%d", pubIP, m.PublicPort)
+		log.Printf("[standalone] Ready-to-use connections (Public IP: %s):", pubIP)
+		fmt.Fprintf(&summary, "  Host: %s\n", pubIP)
+	}
+	for _, m := range mappings {
+		var line string
+		switch m.TargetPort {
+		case 22:
+			if m.PublicPort == 22 {
+				line = fmt.Sprintf("SSH Terminal      : ssh user@%s", host)
+			} else {
+				line = fmt.Sprintf("SSH Terminal      : ssh user@%s -p %d", host, m.PublicPort)
+			}
+		case 3389:
+			line = fmt.Sprintf("Remote Desktop    : %s:%d (Windows App / mstsc)", host, m.PublicPort)
+		case 80:
+			if enableTLS {
+				line = fmt.Sprintf("Website (HTTPS)   : https://%s:%d (or http://%s:%d)", host, m.PublicPort, host, m.PublicPort)
+			} else if m.PublicPort == 80 {
+				line = fmt.Sprintf("Website (HTTP)    : http://%s", host)
+			} else {
+				line = fmt.Sprintf("Website (HTTP)    : http://%s:%d", host, m.PublicPort)
+			}
+		case 443:
+			if m.PublicPort == 443 {
+				line = fmt.Sprintf("Website (HTTPS)   : https://%s", host)
+			} else {
+				line = fmt.Sprintf("Website (HTTPS)   : https://%s:%d", host, m.PublicPort)
+			}
+		default:
+			if enableTLS || m.Proto == "https" {
+				line = fmt.Sprintf("Port :%-5d -> :%-5d : https://%s:%d  (TCP/UDP: %s:%d)", m.PublicPort, m.TargetPort, host, m.PublicPort, host, m.PublicPort)
+			} else {
+				line = fmt.Sprintf("Port :%-5d -> :%-5d : http://%s:%d   (TCP/UDP: %s:%d)", m.PublicPort, m.TargetPort, host, m.PublicPort, host, m.PublicPort)
+			}
 		}
+		log.Printf("[standalone]   %s", line)
+		fmt.Fprintf(&summary, "  %s\n", line)
+	}
+	if ddns.Provider == "" && ddns.Webhook == "" {
+		log.Printf("[standalone]   Tip: pass '-duck myname:YOUR_DUCKDNS_TOKEN' once (saved automatically; next time just '-duck')")
 	}
 	log.Printf("[standalone] ==========================================================")
+
+	saveDir := strings.TrimSpace(certDir)
+	if saveDir == "" {
+		saveDir = ".driftless-certs"
+	}
+	_ = os.MkdirAll(saveDir, 0o700)
+	_ = writeFileAtomic0600(filepath.Join(saveDir, "standalone-info.txt"), []byte(summary.String()))
 }
 
 func isStandalonePortAllowed(allowed map[uint16]struct{}, port uint16) bool {
@@ -1975,15 +2021,18 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 		}
 	}
 
+	lastUPnPMapped := 0
+	var lastUPnPRefresh time.Time
 	if cfg.EnableUPnP {
 		if _, err := cleanupStaleUPnPState(); err != nil {
 			log.Printf("[standalone] ERROR: stale UPnP state cleanup could not persist remaining state: %v", err)
 		}
-		mapped := autoForwardRouterPorts(lanIP, allowedMappings, upnpVHostAddr, upnpHTTPSAddr)
-		if mapped == 0 {
-			log.Printf("[standalone] warning: router UPnP/NAT-PMP mapped 0 ports (verify UPnP is enabled on your active WAN/PPTP interface)")
+		lastUPnPMapped = autoForwardRouterPorts(lanIP, allowedMappings, upnpVHostAddr, upnpHTTPSAddr)
+		lastUPnPRefresh = time.Now()
+		if lastUPnPMapped == 0 {
+			log.Printf("[standalone] warning: router UPnP/NAT-PMP mapped 0 ports (will retry every 15s automatically)")
 		} else {
-			log.Printf("[standalone] router UPnP/NAT-PMP auto-forwarded %d port rules to %s", mapped, lanIP)
+			log.Printf("[standalone] router UPnP/NAT-PMP auto-forwarded %d port rules to %s", lastUPnPMapped, lanIP)
 		}
 		defer func() {
 			if _, err := cleanupActiveUPnPMappings(); err != nil {
@@ -1992,7 +2041,7 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 		}()
 	}
 
-	printStandaloneBanner(pubIP, cfg.DDNS, allowedMappings)
+	printStandaloneBanner(pubIP, cfg.DDNS, allowedMappings, cfg.EnableTLS, cfg.CertDir)
 	if defaultKnockController != nil {
 		hostForKnock := pubIP
 		if cfg.DDNS.Domain != "" {
@@ -2002,51 +2051,67 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 		defaultKnockController.PrintBanner("standalone", cfg.CertDir)
 	}
 
-	// 1-second STUN IP change detector + automatic DDNS retry + periodic UPnP lease renewal
+	// 1-second STUN IP change detector + automatic DDNS retry + fast router-reboot UPnP recovery
 	interval := cfg.STUNInterval
 	if interval < 250*time.Millisecond {
 		interval = time.Second
 	}
 	stunTicker := time.NewTicker(interval)
 	defer stunTicker.Stop()
-	upnpTicker := time.NewTicker(20 * time.Minute)
+	upnpTicker := time.NewTicker(15 * time.Second)
 	defer upnpTicker.Stop()
 
 	currentIP := pubIP
+	stunWasOffline := false
 	for {
 		select {
 		case <-ctx.Done():
 			log.Printf("[standalone] shutting down cleanly...")
 			return nil
 		case <-upnpTicker.C:
-			if cfg.EnableUPnP {
+			if cfg.EnableUPnP && (lastUPnPMapped == 0 || time.Since(lastUPnPRefresh) >= 2*time.Minute) {
 				lanIP = detectLocalLANIP()
-				autoForwardRouterPorts(lanIP, allowedMappings, upnpVHostAddr, upnpHTTPSAddr)
+				lastUPnPMapped = autoForwardRouterPorts(lanIP, allowedMappings, upnpVHostAddr, upnpHTTPSAddr)
+				lastUPnPRefresh = time.Now()
 			}
 		case <-stunTicker.C:
 			detected, err := querySTUNPublicIP(cfg.STUNServer, 400*time.Millisecond)
-			if err == nil && detected != "" && detected != currentIP {
-				log.Printf("[standalone] ISP public IP changed: %s -> %s (updating DDNS & UPnP immediately)", currentIP, detected)
-				currentIP = detected
-				if cfg.EnableUPnP {
-					lanIP = detectLocalLANIP()
-					autoForwardRouterPorts(lanIP, allowedMappings, upnpVHostAddr, upnpHTTPSAddr)
-				}
-				if autoSSLIPMode {
-					if autoDom := autoZeroConfigDomain(currentIP); autoDom != "" {
-						cfg.DDNS.Domain = autoDom
-						sniMgr.ensureDomainCertificate(cfg.DDNS.Domain)
-						printStandaloneBanner(currentIP, cfg.DDNS, allowedMappings)
+			if err != nil || detected == "" {
+				stunWasOffline = true
+			} else {
+				ipChanged := detected != currentIP
+				recoveredFromOutage := stunWasOffline
+				stunWasOffline = false
+				if ipChanged || recoveredFromOutage {
+					if ipChanged {
+						log.Printf("[standalone] ISP public IP changed: %s -> %s (updating DDNS & UPnP immediately)", currentIP, detected)
+						currentIP = detected
+					} else {
+						log.Printf("[standalone] WAN connectivity restored (%s); refreshing router UPnP/PCP port rules", currentIP)
+					}
+					if cfg.EnableUPnP {
+						lanIP = detectLocalLANIP()
+						lastUPnPMapped = autoForwardRouterPorts(lanIP, allowedMappings, upnpVHostAddr, upnpHTTPSAddr)
+						lastUPnPRefresh = time.Now()
+					}
+					if ipChanged {
+						if autoSSLIPMode {
+							if autoDom := autoZeroConfigDomain(currentIP); autoDom != "" {
+								cfg.DDNS.Domain = autoDom
+								sniMgr.ensureDomainCertificate(cfg.DDNS.Domain)
+								printStandaloneBanner(currentIP, cfg.DDNS, allowedMappings, cfg.EnableTLS, cfg.CertDir)
+							}
+						}
+						if defaultKnockController != nil {
+							hostForKnock := currentIP
+							if cfg.DDNS.Domain != "" {
+								hostForKnock = cfg.DDNS.Domain
+							}
+							defaultKnockController.SetPublicEndpoint(hostForKnock, cfg.EnableTLS, cfg.CertDir)
+						}
+						lastDDNSAttempt = time.Time{} // force immediate DDNS update on IP change
 					}
 				}
-				if defaultKnockController != nil {
-					hostForKnock := currentIP
-					if cfg.DDNS.Domain != "" {
-						hostForKnock = cfg.DDNS.Domain
-					}
-					defaultKnockController.SetPublicEndpoint(hostForKnock, cfg.EnableTLS, cfg.CertDir)
-				}
-				lastDDNSAttempt = time.Time{} // force immediate DDNS update on IP change
 			}
 			// Retry DDNS automatically if it hasn't synced currentIP yet (e.g. right after PPTP/PPP reconnect)
 			if hasDDNSProvider && ddnsSyncedIP != currentIP && time.Since(lastDDNSAttempt) >= 5*time.Second {
@@ -2285,6 +2350,10 @@ func startStandaloneUDP(ctx context.Context, targetHost string, m *PortMapping) 
 						_ = lc.SetReadDeadline(time.Now().Add(udpSessionTTL))
 						rn, err := lc.Read(rbuf)
 						if err != nil {
+							if isTransientUDPReadError(err) {
+								time.Sleep(15 * time.Millisecond)
+								continue
+							}
 							return
 						}
 						_, _ = pubConn.WriteToUDP(rbuf[:rn], cAddr)

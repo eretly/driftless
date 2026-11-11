@@ -944,6 +944,34 @@ func (gw *Gateway) flushPendingSessions(agent TunnelConn) {
 			gw.openStreamToAgent(agent, sess, cmdNewConn)
 		}
 	}
+	// If a WAN drop occurred while cmdNewConn was in flight, the Agent never received the session
+	// and therefore will not send cmdResume for it. Check after 120ms and re-open any still-streamless sessions.
+	go func(a TunnelConn) {
+		time.Sleep(120 * time.Millisecond)
+		gw.mu.RLock()
+		if gw.activeAgent != a {
+			gw.mu.RUnlock()
+			return
+		}
+		var orphaned []*Session
+		for _, s := range gw.sessions {
+			s.mu.Lock()
+			needRecovery := !s.closed && s.activeStream == nil
+			s.mu.Unlock()
+			if needRecovery {
+				orphaned = append(orphaned, s)
+			}
+		}
+		gw.mu.RUnlock()
+		for _, s := range orphaned {
+			s.mu.Lock()
+			stillNeed := !s.closed && s.activeStream == nil
+			s.mu.Unlock()
+			if stillNeed {
+				gw.openStreamToAgent(a, s, cmdNewConn)
+			}
+		}
+	}(agent)
 	for _, us := range udpList {
 		us.mu.Lock()
 		hasPending := len(us.pendingPkts) > 0
