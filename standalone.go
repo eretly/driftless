@@ -306,15 +306,24 @@ func parseLockFilePayload(raw []byte) (int, string, bool) {
 }
 
 func releaseUPnPStateFileLock(lockPath, expectedPayload string) {
-	raw, err := os.ReadFile(lockPath)
-	if err != nil {
-		return
+	for attempt := 0; attempt < 25; attempt++ {
+		raw, err := os.ReadFile(lockPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+		if string(raw) != expectedPayload {
+			// Lock does not belong to us; never remove another owner's lock.
+			return
+		}
+		if err := os.Remove(lockPath); err == nil || os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
-	if string(raw) != expectedPayload {
-		// Lock does not belong to us; never remove another owner's lock.
-		return
-	}
-	_ = os.Remove(lockPath)
 }
 
 // withUPnPStateFileLock acquires an exclusive cross-process lock file scoped to the current
@@ -351,8 +360,16 @@ func withUPnPStateFileLock(fn func() error) error {
 				}
 				return fmt.Errorf("close UPnP state lock %s: %w", lockPath, closeErr)
 			}
-			// Verify ownership in case of concurrent filesystem intervention
-			if verifyRaw, rErr := os.ReadFile(lockPath); rErr != nil || string(verifyRaw) != payload {
+			// Verify ownership in case of concurrent filesystem intervention (retry on transient Windows NTFS sharing lock)
+			verified := false
+			for vAttempt := 0; vAttempt < 10; vAttempt++ {
+				if verifyRaw, rErr := os.ReadFile(lockPath); rErr == nil {
+					verified = string(verifyRaw) == payload
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if !verified {
 				return fmt.Errorf("verify UPnP state lock ownership for %s failed", lockPath)
 			}
 			defer releaseUPnPStateFileLock(lockPath, payload)

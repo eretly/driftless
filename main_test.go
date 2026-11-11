@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -678,7 +679,7 @@ func TestHardeningMultiGatewayFailoverAndResourceLimits(t *testing.T) {
 	}
 	if fi, statErr := os.Stat(".driftless-certs/token.secret"); statErr != nil {
 		t.Fatalf("expected .driftless-certs/token.secret to exist: %v", statErr)
-	} else if perm := fi.Mode().Perm(); perm != 0o600 {
+	} else if perm := fi.Mode().Perm(); runtime.GOOS != "windows" && perm != 0o600 {
 		t.Fatalf("expected .driftless-certs/token.secret to have 0600 permissions, got %04o", perm)
 	}
 	tok2, err := loadOrGenerateToken(true, "", "")
