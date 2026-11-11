@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestPCPv2RandomNonceAndSpoofedResponseRejection(t *testing.T) {
@@ -433,3 +436,158 @@ func TestMultiRouterVendorSimulationAndStress(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestKnockPortalAndSinglePortMultiplexerAndBridge(t *testing.T) {
+	tmpDir := t.TempDir()
+	mappings := []PortMapping{
+		{PublicPort: 8096, TargetPort: 8096, Proto: "both"},
+		{PublicPort: 3389, TargetPort: 3389, Proto: "tcp"},
+		{PublicPort: 2222, TargetPort: 22, Proto: "tcp"},
+	}
+	kc, err := newKnockController(tmpDir, "testknocksecret123456", 1*time.Hour, mappings, nil, true, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prevKC := defaultKnockController
+	defaultKnockController = kc
+	defer func() {
+		defaultKnockController = prevKC
+	}()
+
+	// 1. Verify Single-Port Universal Protocol Auto-Routing (SSH & RDP over port 8096)
+	sshBanner := []byte("SSH-2.0-OpenSSH_9.6\r\n")
+	if got := detectUniversalSinglePortOverride(sshBanner, 8096, mappings); got != 22 {
+		t.Fatalf("expected SSH banner on port 8096 to auto-route to target port 22, got %d", got)
+	}
+	// RDP X.224 Connection Request TPKT header: 0x03 0x00 <len=19> <li=14> 0xE0 ...
+	rdpPkt := []byte{0x03, 0x00, 0x00, 0x13, 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x00}
+	if got := detectUniversalSinglePortOverride(rdpPkt, 8096, mappings); got != 3389 {
+		t.Fatalf("expected RDP X.224 packet on port 8096 to auto-route to target port 3389, got %d", got)
+	}
+
+	// 2. Verify Zero-Client Knock blocks unauthenticated non-loopback IP and unlocks via Magic Link
+	fakeClientAddr := &net.TCPAddr{IP: net.ParseIP("198.51.100.77"), Port: 54321}
+	if kc.IsAllowedAddr(fakeClientAddr) {
+		t.Fatalf("expected unauthenticated public IP 198.51.100.77 to be blocked before Knock")
+	}
+	// Wrong secret rate-limit & rejection check
+	if ok, _ := kc.VerifyKnockToken(fakeClientAddr, "wrongsecret"); ok {
+		t.Fatalf("expected wrong knock secret to be rejected")
+	}
+	if ok, _ := kc.VerifyKnockToken(fakeClientAddr, "testknocksecret123456"); !ok {
+		t.Fatalf("expected valid knock secret to unlock 198.51.100.77")
+	}
+	if !kc.IsAllowedAddr(fakeClientAddr) {
+		t.Fatalf("expected 198.51.100.77 to be allowed after valid Knock")
+	}
+
+	// 3. Verify plaintext HTTP Knock is rejected with 400 Bad Request and does NOT unlock IP
+	unauthIP := &net.TCPAddr{IP: net.ParseIP("203.0.113.99"), Port: 40000}
+	if kc.IsAllowedAddr(unauthIP) {
+		t.Fatalf("expected 203.0.113.99 to be locked initially")
+	}
+	plainC, plainS := net.Pipe()
+	plainDone := make(chan struct{})
+	go func() {
+		defer close(plainDone)
+		_, _, handled := inspectAndPrepareTCPConn(plainS, nil, false, 8096, mappings, nil)
+		if !handled {
+			t.Errorf("expected plaintext Knock request to be intercepted and rejected")
+		}
+	}()
+	_, _ = plainC.Write([]byte("GET /__driftless_knock/testknocksecret123456 HTTP/1.1\r\nHost: mypc.duckdns.org:8096\r\n\r\n"))
+	plainResp, _ := io.ReadAll(plainC)
+	_ = plainC.Close()
+	<-plainDone
+	if !strings.Contains(string(plainResp), "400 Bad Request") {
+		t.Fatalf("expected plaintext HTTP Knock to be rejected with 400 Bad Request, got:\n%s", string(plainResp))
+	}
+
+	// 4. Verify HTTPS/TLS Magic Knock Launchpad, .rdp generator, and https:// PAC URL over TLS
+	sniMgr, err := newSNICertManager(tmpDir, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c1, s1 := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, handled := inspectAndPrepareTCPConn(s1, sniMgr, true, 8096, mappings, nil)
+		if !handled {
+			t.Errorf("expected HTTPS Magic Knock request to be handled by Knock Launchpad")
+		}
+	}()
+	tlsClient1 := tls.Client(c1, &tls.Config{ServerName: "mypc.duckdns.org", InsecureSkipVerify: true})
+	_, _ = tlsClient1.Write([]byte("GET /__driftless_knock/testknocksecret123456/connect.rdp HTTP/1.1\r\nHost: mypc.duckdns.org:8096\r\n\r\n"))
+	respBytes, _ := io.ReadAll(tlsClient1)
+	_ = tlsClient1.Close()
+	<-done
+	if !strings.Contains(string(respBytes), "full address:s:mypc.duckdns.org:3389") {
+		t.Fatalf("expected downloadable .rdp profile with mypc.duckdns.org:3389 over HTTPS, got:\n%s", string(respBytes))
+	}
+
+	// Verify Auto-PAC endpoint over HTTPS and Launchpad HTML https:// links
+	c2, s2 := net.Pipe()
+	done2 := make(chan struct{})
+	go func() {
+		defer close(done2)
+		_, _, _ = inspectAndPrepareTCPConn(s2, sniMgr, true, 8096, mappings, nil)
+	}()
+	tlsClient2 := tls.Client(c2, &tls.Config{ServerName: "mypc.duckdns.org", InsecureSkipVerify: true})
+	_, _ = tlsClient2.Write([]byte("GET /__driftless_knock/testknocksecret123456 HTTP/1.1\r\nHost: mypc.duckdns.org:8096\r\n\r\n"))
+	launchpadBytes, _ := io.ReadAll(tlsClient2)
+	_ = tlsClient2.Close()
+	<-done2
+	if !strings.Contains(string(launchpadBytes), "https://mypc.duckdns.org:8096/__driftless_knock/testknocksecret123456/proxy.pac") {
+		t.Fatalf("expected Launchpad HTML to use https:// for proxy.pac URL, got:\n%s", string(launchpadBytes))
+	}
+	if strings.Contains(string(launchpadBytes), "http://mypc.duckdns.org:8096/__driftless_knock/") {
+		t.Fatalf("expected zero http:// knock links in Launchpad HTML, got:\n%s", string(launchpadBytes))
+	}
+
+	// 4. Verify Smart Ephemeral Port Bridging in Standalone Mode when TargetPort is already bound
+	backendLn, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendLn.Close()
+	occupiedPort := uint16(backendLn.Addr().(*net.TCPAddr).Port)
+	go func() {
+		for {
+			conn, err := backendLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = c.Write([]byte("BRIDGED-OK"))
+			}(conn)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bridgeMappings := []PortMapping{
+		{BindIP: "0.0.0.0", PublicPort: occupiedPort, TargetPort: occupiedPort, Proto: "tcp"},
+	}
+	if err := startStandaloneTCP(ctx, "127.0.0.1", &bridgeMappings[0], bridgeMappings, nil, false); err != nil {
+		t.Fatalf("expected startStandaloneTCP to succeed via ephemeral port bridging when port %d is occupied, got error: %v", occupiedPort, err)
+	}
+	bridgedPort := bridgeMappings[0].RouterTCPPort
+	if bridgedPort == 0 || bridgedPort == occupiedPort {
+		t.Fatalf("expected RouterTCPPort to be an ephemeral bridge port != %d, got %d", occupiedPort, bridgedPort)
+	}
+
+	dialConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", bridgedPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial ephemeral bridge port %d: %v", bridgedPort, err)
+	}
+	defer dialConn.Close()
+	_ = dialConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	gotBridge, err := io.ReadAll(dialConn)
+	if err != nil || string(gotBridge) != "BRIDGED-OK" {
+		t.Fatalf("expected BRIDGED-OK through standalone ephemeral bridge port %d -> %d, got %q (err=%v)", bridgedPort, occupiedPort, string(gotBridge), err)
+	}
+}
+

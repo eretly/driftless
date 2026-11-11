@@ -859,20 +859,26 @@ func (m *SNICertManager) tlsConfig() *tls.Config {
 
 // maybeTerminateTLS peeks at the first byte of conn; if it is a TLS ClientHello (0x16) and autoTLS is enabled, wraps in TLS server.
 func maybeTerminateTLS(c net.Conn, sniMgr *SNICertManager, enableTLS bool) net.Conn {
+	return maybeTerminateTLSWithTimeout(c, sniMgr, enableTLS, 3*time.Second)
+}
+
+func maybeTerminateTLSWithTimeout(c net.Conn, sniMgr *SNICertManager, enableTLS bool, peekTimeout time.Duration) net.Conn {
 	if !enableTLS || sniMgr == nil {
 		return c
 	}
-	br := bufio.NewReaderSize(c, 4096)
-	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if peekTimeout <= 0 {
+		peekTimeout = 3 * time.Second
+	}
+	pc, br := ensurePeekedConn(c)
+	_ = pc.Conn.SetReadDeadline(time.Now().Add(peekTimeout))
 	b, err := br.Peek(1)
-	_ = c.SetReadDeadline(time.Time{})
-	pc := &peekedConn{Conn: c, r: br}
+	_ = pc.Conn.SetReadDeadline(time.Time{})
 	if err == nil && len(b) == 1 && b[0] == 0x16 {
 		tlsConn := tls.Server(pc, sniMgr.tlsConfig())
 		_ = tlsConn.SetDeadline(time.Now().Add(15 * time.Second))
 		if err := tlsConn.Handshake(); err != nil {
 			_ = tlsConn.Close()
-			return pc
+			return tlsConn
 		}
 		_ = tlsConn.SetDeadline(time.Time{})
 		// RFC 8737 Section 4: Once the TLS-ALPN-01 handshake completes, close the connection immediately

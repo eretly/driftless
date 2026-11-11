@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	versionString = "v1.5.2"
+	versionString = "v1.5.3"
 	alpnProtocol  = "driftless-v1"
 	cmdAuth       = uint8(0)
 	cmdNewConn    = uint8(1)
@@ -568,17 +568,22 @@ func printSavedTokenAndCommand() error {
 	const (
 		defaultTokenPath = ".driftless-certs/token.secret"
 		defaultCmdPath   = ".driftless-certs/client-connect.cmd"
+		defaultKnockPath = ".driftless-certs/knock-url.txt"
 	)
 	tokBytes, tokErr := os.ReadFile(defaultTokenPath)
 	cmdBytes, cmdErr := os.ReadFile(defaultCmdPath)
-	if tokErr != nil && cmdErr != nil {
-		return fmt.Errorf("no saved token or command found in .driftless-certs/ (start './driftless server' first): %w", tokErr)
+	knockBytes, knockErr := os.ReadFile(defaultKnockPath)
+	if tokErr != nil && cmdErr != nil && knockErr != nil {
+		return fmt.Errorf("no saved token or command found in .driftless-certs/ (start './driftless server' or './driftless standalone -knock' first): %w", tokErr)
 	}
 	if tokErr == nil {
 		fmt.Fprintf(os.Stdout, "Token (%s):\n  %s\n", defaultTokenPath, strings.TrimSpace(string(tokBytes)))
 	}
 	if cmdErr == nil {
 		fmt.Fprintf(os.Stdout, "Ready-to-copy Home PC command (%s):\n  %s\n", defaultCmdPath, strings.TrimSpace(string(cmdBytes)))
+	}
+	if knockErr == nil {
+		fmt.Fprintf(os.Stdout, "Mobile Knock Magic Link (%s):\n  %s\n", defaultKnockPath, strings.TrimSpace(string(knockBytes)))
 	}
 	return nil
 }
@@ -633,6 +638,9 @@ func main() {
 	lanIP := flag.String("lan-ip", "", "override auto-detected agent LAN IP")
 	allowPorts := flag.String("allow-ports", "", "optional whitelist of local ports on agent/standalone (e.g. 80,8096,25565)")
 	allowIPs := flag.String("allow-ips", "", "optional IP/CIDR ACL whitelist for public listeners (e.g. 192.168.1.0/24,203.0.113.5)")
+	enableKnock := flag.Bool("knock", false, "enable Zero-Client Mobile Knock Gatekeeper & Universal Launchpad (.rdp, ssh://, SOCKS5/PAC proxy)")
+	knockToken := flag.String("knock-token", "", "optional custom secret for -knock Magic Link (auto-generated and persisted if omitted)")
+	knockTTL := flag.Duration("knock-ttl", 24*time.Hour, "how long a phone/device IP stays unlocked after opening the Magic Knock Link")
 	clientCA := flag.String("client-ca", "", "optional CA PEM file on server to require mTLS client certificates from agents")
 	clientCert := flag.String("client-cert", "", "optional mTLS client certificate PEM file on agent")
 	clientKey := flag.String("client-key", "", "optional mTLS client private key PEM file on agent")
@@ -696,6 +704,17 @@ func main() {
 			}
 			portsAllow[uint16(port)] = struct{}{}
 		}
+	}
+
+	if *enableKnock || strings.TrimSpace(*knockToken) != "" {
+		*enableTLS = true
+		parsedMappings, _ := parseMappingsWithDefault(*ports, *udpDefault)
+		isStandaloneMode := *mode == "standalone" || *mode == "direct" || *mode == "p2p"
+		kc, err := newKnockController(*certDir, *knockToken, *knockTTL, parsedMappings, portsAllow, isStandaloneMode, *host)
+		if err != nil {
+			log.Fatalf("[driftless] failed to initialize -knock controller: %v", err)
+		}
+		defaultKnockController = kc
 	}
 
 	if *mode == "standalone" || *mode == "direct" || *mode == "p2p" {

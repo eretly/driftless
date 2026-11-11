@@ -73,26 +73,52 @@ With `-duck`, `driftless` updates your domain the second your home IP changes an
 
 ---
 
-### How to connect from a phone (iPhone / Android)
+### How to connect from a phone or any device (WebSSH, AnyDesk, RDP, Jellyfin)
 
-You **do not** need to install `driftless`, VPN profiles, or private keys on your phone. `driftless` runs only on your PC (or VPS + PC) and opens standard TCP/UDP ports, so you connect using normal apps from the App Store or Google Play:
+`driftless` only needs to run on **one device** (your Home PC with a dynamic IP, or VPS + Home PC). You **do not** need to install `driftless` or any VPN on your iPhone or Android, and you do not need to use a browser if you connect through apps like **WebSSH**, **AnyDesk**, or **Windows App (RDP)**.
 
-1. **On your Home PC:**
-   - If you have a **dynamic public IP** (no VPS): run `.\driftless-windows-amd64.exe standalone -ports 8096,3389,25565 -duck mypc:YOUR_DUCKDNS_TOKEN`. Your permanent address is `mypc.duckdns.org`.
-   - If you have **CGNAT ("gray" IP)** and use a VPS: your permanent address is `YOUR_VPS_IP` (or your domain pointed to the VPS).
-2. **On your iPhone or Android (over LTE/5G or any Wi-Fi):** open the app you need and enter your address and port:
+#### 1. Direct connection via WebSSH, AnyDesk, or RDP (no browser needed)
 
-| What you want to open on your PC | App for iPhone / Android | What address to enter in the app |
+**Step 1 (on your Home PC):**
+Open the ports for the apps you use (`22` for WebSSH/SSH, `7070` for AnyDesk direct connection, `3389` for Windows Remote Desktop):
+```powershell
+.\driftless-windows-amd64.exe standalone -ports 22,7070,3389 -duck mypc:YOUR_DUCKDNS_TOKEN
+```
+*(If your ISP uses CGNAT / "gray" IP, run `./driftless server -ports 22,7070,3389` on a VPS and the printed `client` command on your PC. Your address will be `YOUR_VPS_IP` instead of `mypc.duckdns.org`.)*
+
+**Step 2 (in the app on your iPhone / Android):**
+
+- **In WebSSH / Termius / Blink (SSH & SFTP terminal):**
+  - **Host / IP:** `mypc.duckdns.org` (or the current IP shown in the `driftless` console)
+  - **Port:** `22`
+  - **User:** your Windows / Linux username on the PC
+  - **Password or Private Key:** your normal PC account password, or your standard SSH private key (`id_ed25519` / `id_rsa`) if you added your public key to `~/.ssh/authorized_keys` on the PC. (`driftless` itself does not require any special key on your phone).
+- **In AnyDesk (direct lag-free connection without relay servers):**
+  - On your PC, AnyDesk listens on TCP port `7070` for direct connections.
+  - In the AnyDesk app on your iPhone/Android, instead of the 9-digit ID, enter: `mypc.duckdns.org:7070` and enter your AnyDesk unattended password.
+- **In Windows App / Microsoft Remote Desktop (full Windows screen):**
+  - **PC Name:** `mypc.duckdns.org:3389`
+  - **User Account:** your Windows login and password.
+
+| What you want to open on your PC | App for iPhone / Android | What to enter in the app |
 | :--- | :--- | :--- |
-| **Websites, Web UI, OpenWebUI, Home Assistant** | Safari / Chrome | `https://mypc.duckdns.org:3000` (or `http://YOUR_VPS_IP:3000`) |
-| **Movies & media (Jellyfin / Plex)** | Jellyfin Mobile / Swiftfin / Plex | `http://mypc.duckdns.org:8096` |
-| **Remote Desktop (control Windows from phone)** | Windows App (Microsoft Remote Desktop) | `mypc.duckdns.org:3389` (uses your Windows login & password) |
-| **PC gaming from phone (Sunshine / Gamestream)** | Moonlight | `mypc.duckdns.org` (forward ports `47984,47989,48010`) |
-| **SSH terminal (Linux / WSL / PowerShell SSH)** | Termius / Blink Shell / JuiceSSH | Host: `mypc.duckdns.org`, Port: `22` (password or SSH key) |
-| **Files / Nextcloud / SFTP** | Documents by Readdle / FE File Explorer / Owlfiles | `mypc.duckdns.org:22` (SFTP) or web port |
-| **Minecraft (Java / Bedrock (`:19132`))** | Minecraft / PojavLauncher | Server Address: `mypc.duckdns.org`, Port: `19132` (or `25565`) |
+| **SSH / SFTP console & files** | **WebSSH** / Termius / JuiceSSH | Host: `mypc.duckdns.org`, Port: `22`, PC login & password (or SSH key) |
+| **AnyDesk (direct TCP mode)** | **AnyDesk** | Remote Address: `mypc.duckdns.org:7070` |
+| **Windows Remote Desktop (RDP)** | **Windows App** (Microsoft Remote Desktop) | PC Name: `mypc.duckdns.org:3389`, Windows login & password |
+| **PC gaming from phone (Sunshine)** | **Moonlight** | Host: `mypc.duckdns.org` (open ports `47984,47989,48010`) |
+| **Movies & media (Jellyfin / Plex)** | **Jellyfin Mobile** / Swiftfin / Infuse | `http://mypc.duckdns.org:8096` |
+| **Files / folders (SFTP)** | **WebSSH (SFTP)** / Owlfiles / Documents | Host: `mypc.duckdns.org`, Port: `22` |
+| **Minecraft (Bedrock `:19132` / Java `:25565`)** | **Minecraft** / PojavLauncher | Server Address: `mypc.duckdns.org`, Port: `19132` or `25565` |
 
-> **Tip for RDP (`3389`) or open web panels:** if you open a sensitive port to the internet, either use a strong Windows/Web password or restrict access with `-allow-ips` / HTTPS (`443:3000/https`).
+#### 2. Optional Stealth Mode (`-knock`)
+If you want ports `22`, `3389`, and `7070` to stay **completely invisible and closed** to bots and scanners until you unlock them from your phone, add `-knock`:
+```powershell
+.\driftless-windows-amd64.exe standalone -ports 8096,3389,22,7070 -duck -knock
+```
+What `-knock` does:
+1. **Mandatory HTTPS/TLS:** Enabling `-knock` automatically activates TLS on your ports and rejects unencrypted `http://` knock requests (`400 Bad Request`), so your knock secret is never sent in cleartext.
+2. **1-Tap Unlock for Native Apps:** On startup, `driftless` prints an `https://` Magic Link (`https://mypc.duckdns.org:8096/__driftless_knock/SECRET`). Tap that bookmark once on your phone to unlock your phone's IP for 24 hours, and then connect normally through **WebSSH**, **AnyDesk**, or **Windows App**.
+3. **Single-Port Universal Routing:** Even on restricted Wi-Fi where only one port (e.g. `8096`) is open, you can enter port `8096` directly inside **WebSSH** or **Windows App** and `driftless` automatically routes SSH (`SSH-2.0-`) to `:22` and RDP (`0x03 0x00`) to `:3389`.
 
 ---
 
@@ -102,6 +128,7 @@ You **do not** need to install `driftless`, VPN profiles, or private keys on you
 | :--- | :--- |
 | **Game server (Minecraft, CS2, Rust, Valheim, Palworld)** - TCP + UDP | `./driftless server -ports 25565,27015` |
 | **Jellyfin / Plex / Home Assistant** | `./driftless server -ports 8096,8123` |
+| **Remote Desktop + SSH from phone with Stealth Magic Link** | `./driftless standalone -ports 8096,3389,22 -duck -knock` |
 | **Website / API** (VPS port 80 -> Home PC port 3000) | `./driftless server -ports 80:3000` |
 | **Ollama / OpenWebUI** with HTTPS | `./driftless server -ports 443:11434/https,3000` |
 | **Multiple domains & URL paths** (with Let's Encrypt HTTPS) | `./driftless server -vhosts site.com:3000,site.com/api:4000,media.site.com:8096 -vhost-addr :80 -https :443` |
@@ -114,6 +141,8 @@ You **do not** need to install `driftless`, VPN profiles, or private keys on you
 - **QUIC + automatic TCP-Mux fallback (`-transport auto`):** Uses multiplexed QUIC (`UDP :4242`) by default and falls back to multiplexed TLS over TCP (`TCP :4242`) when UDP is blocked by firewalls or strict NATs.
 - **Multi-Gateway failover:** Pass multiple VPS addresses in `-quic vps1:4242,vps2:4242` for automatic failover.
 - **TCP + UDP by default:** Every port in `-ports` forwards both TCP and UDP automatically.
+- **Zero-Client Mobile Knock & Single-Port Protocol Router (`-knock`):** Keep all TCP/UDP ports stealthed until unlocked by a 1-tap bookmark on your phone, download auto-configured `.rdp` / `proxy.pac` profiles, and route SSH, RDP, HTTP, and SOCKS5 over a single open port.
+- **Smart Ephemeral Port Bridging (`standalone`):** If a local service (`3389`, `8096`, `25565`) is already listening on `0.0.0.0` on your Home PC, `standalone` mode automatically bridges router UPnP / NAT-PMP / PCP v2 external ports to an internal ephemeral listener so `-tls`, `-knock`, and `-allow-ips` work without port conflicts.
 - **Built-in HTTPS and ACME certificates:** Obtains Let's Encrypt certificates (on `:443` via TLS-ALPN-01, `:80` via HTTP-01, or via DuckDNS DNS-01), reuses existing certificates from disk without recreating them, and renews them in the background (< 30 days left).
 - **Direct LAN bypass on home Wi-Fi (`-direct :8888`):** When connecting from your phone or laptop on the same home Wi-Fi, traffic goes directly over your local network (`192.168.x.x`) at full LAN speed instead of hair-pinning through the VPS.
 - **Security & Observability:** Mutual HMAC authentication with TLS Certificate Channel Binding, zero-downtime token rotation (`-token new_pass,old_pass`), optional mTLS (`-client-ca`, `-client-cert`, `-client-key`), IP/CIDR ACL filtering (`-allow-ips`), local port whitelisting (`-allow-ports`), HAProxy PROXY protocol v1 (`-proxy-protocol`), and Prometheus/JSON metrics (`-metrics 127.0.0.1:9090`).
@@ -131,6 +160,9 @@ You **do not** need to install `driftless`, VPN profiles, or private keys on you
 | `-token` | auto | Shared password or comma-separated rotation list (`"new_tok,old_tok"`). |
 | `-fingerprint` | `""` | VPS certificate fingerprint (included in the generated client command). |
 | `-duck` | `""` | Optional domain + certificate flag (`-duck` or `-duck subdomain:token`). Off by default. |
+| `-knock` | `false` | Enable Zero-Client Mobile Knock stealth gatekeeper, `.rdp` launchpad, and SOCKS5/PAC proxy. |
+| `-knock-token` | auto | Optional custom secret for `-knock` Magic Link (auto-generated and saved if omitted). |
+| `-knock-ttl` | `24h` | How long a phone/device IP stays unlocked after opening the Magic Knock Link. |
 | `-tls` | `false` | Enable HTTPS on all ports in `-ports`. |
 | `-vhosts` | `""` | Route domains and paths to local ports: `"site.com:3000,site.com/api:4000,*.site.com:5000"`. |
 | `-vhost-addr` / `-https` | `":80"` / `""` | HTTP and HTTPS ports for `-vhosts`. |
@@ -142,7 +174,7 @@ You **do not** need to install `driftless`, VPN profiles, or private keys on you
 | `-client-ca` / `-client-cert` / `-client-key` | `""` | Optional mTLS client certificate verification between VPS and Home PC. |
 | `-proxy-protocol` | `false` | Prepend HAProxy PROXY protocol v1 header with the real client IP to local TCP services. |
 | `-metrics` | `""` | Optional observability server address for `/metrics` (Prometheus) and `/status` (JSON). |
-| `-upnp` | `true` | Auto-open ports on home router via UPnP / NAT-PMP (`standalone` mode). |
+| `-upnp` | `true` | Auto-open ports on home router via UPnP / NAT-PMP / PCP v2 (`standalone` mode). |
 | `-stun` | `"stun.cloudflare.com:3478"` | Custom STUN server or comma-separated list for external IP detection (`standalone` mode). |
 | `-stun-interval` | `1s` | External IP check interval via STUN (`standalone` mode). |
 | `-ddns-provider` | `""` | Other DDNS providers: `"cloudflare"` or `"noip"`. |
@@ -158,6 +190,7 @@ You **do not** need to install `driftless`, VPN profiles, or private keys on you
 | Streams & downloads survive IP change | Yes (16 MB RAM buffer) | No (drops) | No (drops) | Yes |
 | QUIC + automatic TCP-Mux fallback | Yes (`-transport auto`) | Separate config | Yes | UDP only |
 | Works without a VPS (`standalone`) | Yes (UPnP + STUN + DDNS) | No | No | No |
+| Zero-Client Mobile Knock & Single-Port Mux | Yes (`-knock`) | No | No | Needs client app on phone |
 | Built-in HTTPS & Let's Encrypt | Yes | Manual config | Yes | No (needs Nginx/Caddy) |
 | TCP + UDP open by default | Yes | Separate blocks | Paid / limited UDP | Manual `iptables` |
 | Direct home Wi-Fi bypass (full LAN speed) | Yes (`-direct :8888`) | No | No | Split-DNS required |
@@ -234,7 +267,7 @@ Windows:
 
 #### Вариант 2. Вообще без ВПС (если у провайдера динамический белый IP)
 
-Если провайдер дает динамический белый IP, покупать ВПС не нужно. Режим `standalone` сам откроет порты на домашнем роутере через UPnP / NAT-PMP и каждую секунду проверяет внешний IP по STUN:
+Если провайдер дает динамический белый IP, покупать ВПС не нужно. Режим `standalone` сам откроет порты на домашнем роутере через UPnP / NAT-PMP / PCP v2 и каждую секунду проверяет внешний IP по STUN:
 
 ```powershell
 .\driftless-windows-amd64.exe standalone -ports 8096,25565
@@ -249,31 +282,57 @@ Windows:
 
 ---
 
-### Как подключиться к домашнему ПК с телефона (iPhone / Android)
+### Как подключиться к ПК с айфона или андроида через WebSSH, AnyDesk или RDP (без браузера)
 
-На сам телефон **ничего ставить не нужно** - никаких консолей, приватных ключей туннеля или конфигов. `driftless` ставится только на ПК (или ВПС + ПК) и открывает обычные порты, поэтому с айфона или андроида ты заходишь через стандартные приложения из App Store / Google Play:
+Программа `driftless` ставится **только на одном устройстве** - на твоем домашнем ПК с динамическим IP (или на ВПС + ПК). На сам айфон или андроид **ничего ставить не нужно**, и браузер открывать не обязательно - ты подключаешься напрямую через свои привычные приложения (**WebSSH**, **AnyDesk**, **Windows App**).
 
-1. **Что запустить на домашнем ПК:**
-   - Если дома **динамический белый IP** (без ВПС): один раз зарегистрируй бесплатный поддомен на `duckdns.org` и запусти на ПК:
-     ```powershell
-     .\driftless-windows-amd64.exe standalone -ports 8096,3389,25565 -duck mypc:ТВОЙ_ТОКЕН_DUCKDNS
-     ```
-     Теперь у твоего ПК есть постоянный адрес `mypc.duckdns.org`. Даже когда провайдер сменит IP, адрес сам обновится за секунду.
-   - Если дома **серый IP (CGNAT)** и ты запускаешь через ВПС: твой постоянный адрес - это `IP_ТВОЕГО_ВПС` (или привязанный к нему домен).
-2. **Через какие программы заходить с телефона (по мобильному интернету LTE/5G или чужому Wi-Fi):**
+#### 1. Прямое подключение через WebSSH, AnyDesk или RDP
 
-| К чему на ПК подключаемся | Какое приложение скачать на iPhone / Android | Что вписать в адрес подключения |
+Зачем вообще нужен `driftless`, если есть WebSSH или AnyDesk?
+Когда на домашнем ПК динамический IP, роутер по умолчанию закрывает входящие порты (`22`, `7070`, `3389`), а провайдер периодически меняет сам IP-адрес, из-за чего старый IP в WebSSH перестает работать. `driftless` сам открывает нужные порты на роутере по UPnP / NAT-PMP / PCP v2 и каждую секунду обновляет твой постоянный адрес (например `mypc.duckdns.org`), удерживая активные сессии при смене IP.
+
+**Шаг 1 (на домашнем ПК):**
+Открой порты под свои программы (`22` - для WebSSH/SSH, `7070` - для прямого подключения AnyDesk, `3389` - для удаленного рабочего стола Windows):
+```powershell
+.\driftless-windows-amd64.exe standalone -ports 22,7070,3389 -duck mypc:ТВОЙ_ТОКЕН_DUCKDNS
+```
+*(Если не хочешь регистрировать DuckDNS, запусти просто `.\driftless-windows-amd64.exe standalone -ports 22,7070,3389` - программа напишет в консоли твой текущий внешний IP, который можно сразу вводить в WebSSH).*
+
+**Шаг 2 (что вводить в приложении на айфоне / андроиде):**
+
+- **Как подключиться через WebSSH (или Termius) на iPhone:**
+  Открой **WebSSH** -> нажми **«+» (Add Connection)** и заполни поля:
+  - **Host / IP:** `mypc.duckdns.org` (или внешний IP из консоли `driftless`, либо `IP_ВПС`, если работаешь через ВПС)
+  - **Port:** `22`
+  - **User (Имя пользователя):** имя твоей учетной записи на ПК (в Windows или Linux; важно: на самом ПК должен быть включен стандартный OpenSSH Server)
+  - **Password или Private Key (Секретный ключ):**
+    - Для самой программы `driftless` **никакой секретный ключ вводить не нужно**.
+    - В поле **Password** введи обычный пароль от своей учетки ПК.
+    - Поле **Private Key** в WebSSH нужно только в том случае, если ты сам настроил вход по SSH-ключу вместо пароля (тогда туда вставляется твой стандартный ключ `id_ed25519` / `id_rsa`).
+- **Как подключиться через AnyDesk напрямую без лагов:**
+  - По умолчанию AnyDesk гонит трафик через свои облачные ретрансляторы (по ID из 9 цифр), которые часто тормозят или режут скорость.
+  - Когда `driftless` открыл порт `7070`, в приложении **AnyDesk** на айфоне в поле адреса вместо цифр ID впиши: `mypc.duckdns.org:7070` и введи свой постоянный пароль AnyDesk. Соединение пойдет **напрямую** телефон <-> твой ПК с минимальным пингом.
+- **Как подключиться через Windows App (бывший Microsoft Remote Desktop):**
+  - Добавь ПК -> в поле **Имя ПК (PC Name)** впиши `mypc.duckdns.org:3389`, укажи логин и пароль от своей учетки Windows.
+
+| Через что подключаемся с телефона | Какой порт открыть в `-ports` на ПК | Что вводить в приложении на iPhone / Android |
 | :--- | :--- | :--- |
-| **Сайты, админки, нейронки (OpenWebUI), Home Assistant** | Обычный браузер (Safari / Chrome) | `https://mypc.duckdns.org:3000` (или `http://IP_ВПС:3000`) |
-| **Фильмы и сериалы с ПК (Jellyfin / Plex)** | Jellyfin Mobile / Swiftfin / Infuse / Plex | `http://mypc.duckdns.org:8096` |
-| **Удаленный рабочий стол Windows (управлять ПК с телефона)** | Windows App (бывший Microsoft Remote Desktop) | Компьютер: `mypc.duckdns.org:3389`, логин и пароль от твоей учетки Windows |
-| **Играть в ПК-игры с телефона (через Sunshine)** | Moonlight | Хост: `mypc.duckdns.org` (на ПК открой порты `47984,47989,48010`) |
-| **Терминал / консоль по SSH (Linux / WSL / Windows OpenSSH)** | Termius / JuiceSSH / Shelly | Хост: `mypc.duckdns.org`, порт `22` (вход по паролю ПК или SSH-ключу) |
-| **Файлы и папки с ПК (SFTP / WebDAV / Nextcloud)** | Documents / Owlfiles / FE File Explorer / CX Проводник | Хост: `mypc.duckdns.org`, порт `22` (SFTP) или веб-порт |
-| **Minecraft (Bedrock `:19132` / Java `:25565`)** | Minecraft / PojavLauncher | Адрес сервера: `mypc.duckdns.org`, порт `19132` или `25565` |
+| **WebSSH / Termius (терминал и SFTP-файлы)** | `22` | Host: `mypc.duckdns.org`, Port: `22`, логин и пароль от ПК (или свой SSH-ключ) |
+| **AnyDesk (прямое подключение без облака)** | `7070` | В строке адреса вместо ID: `mypc.duckdns.org:7070` |
+| **Windows App / RDP (рабочий стол Windows)** | `3389` | Компьютер: `mypc.duckdns.org:3389`, логин и пароль Windows |
+| **Moonlight (ПК-игры через Sunshine)** | `47984,47989,48010` | Хост: `mypc.duckdns.org` |
+| **Jellyfin / Plex / Infuse (фильмы с ПК)** | `8096` | Адрес сервера: `http://mypc.duckdns.org:8096` |
+| **Minecraft (Bedrock `:19132` / Java `:25565`)** | `19132` или `25565` | Сервер: `mypc.duckdns.org`, порт `19132` или `25565` |
 
-> **Нужен ли приватный ключ?**
-> Сама программа `driftless` шифрует туннель между ПК и ВПС автоматически (пароль и отпечаток сертификата создаются сами). А когда ты подключаешься к открытому порту с телефона, безопасность зависит от самой программы на ПК: например, в браузере, Jellyfin или рабочем столе Windows (RDP) ты просто вводишь логин и пароль от своего сервиса или Windows. Если открываешь порт `22` (SSH), можно заходить как по обычному паролю учетки ПК, так и по стандартному SSH-ключу в приложении Termius.
+#### 2. По желанию: Стелс-защита портов (`-knock`)
+Если не хочешь держать порты `22` (SSH) или `3389` (RDP) открытыми для всего интернета и ботов, добавь флаг `-knock`:
+```powershell
+.\driftless-windows-amd64.exe standalone -ports 8096,3389,22,7070 -duck -knock
+```
+Что дает `-knock`:
+1. **Обязательный HTTPS/TLS:** При включении `-knock` программа автоматически включает шифрование TLS и отклоняет незашифрованные `http://` запросы (`400 Bad Request`), поэтому секретный ключ в ссылке никогда не передается по сети открытым текстом.
+2. **Разблокировка для WebSSH и AnyDesk в 1 тап:** Для всего интернета порты `22`, `3389`, `7070` выглядят полностью закрытыми. При запуске `driftless` выводит `https://` ссылку (`https://mypc.duckdns.org:8096/__driftless_knock/СЕКРЕТ`). Один раз тапни по ней из закладок на айфоне - твой мобильный IP разблокируется на 24 часа, после чего ты спокойно заходишь через **WebSSH**, **AnyDesk** или **Windows App**.
+3. **Вход в WebSSH и RDP даже через один чужой порт:** Если ты в сети, где открыт только один порт (например `8096`), ты можешь в самом приложении **WebSSH** указать порт `8096` вместо `22` - `driftless` по первым байтам поймет, что это SSH, и сам перекинет соединение на `22` порт твоего ПК.
 
 ---
 
@@ -283,6 +342,7 @@ Windows:
 | :--- | :--- |
 | **Игровой сервер (Minecraft, CS2, Rust, Valheim, Palworld)** - TCP и UDP | `./driftless server -ports 25565,27015` |
 | **Медиасервер (Jellyfin / Plex / Home Assistant)** | `./driftless server -ports 8096,8123` |
+| **Рабочий стол Windows + SSH с телефона по секретной ссылке** | `./driftless standalone -ports 8096,3389,22 -duck -knock` |
 | **Свой сайт / API** (порт 80 на ВПС -> порт 3000 дома) | `./driftless server -ports 80:3000` |
 | **Нейронка (Ollama / OpenWebUI)** с HTTPS | `./driftless server -ports 443:11434/https,3000` |
 | **Несколько сайтов и путей на разных доменах** (авто-HTTPS Let's Encrypt) | `./driftless server -vhosts site.ru:3000,site.ru/api:4000,media.site.ru:8096 -vhost-addr :80 -https :443` |
@@ -295,6 +355,8 @@ Windows:
 - **Автовыбор транспорта QUIC / TCP-Mux (`-transport auto`):** По умолчанию работает по QUIC (`UDP :4242`), а если провайдер или корпоративный файрвол блокирует UDP, сам переключается на мультиплексирование потоков поверх одного TLS/TCP-соединения (`TCP :4242`).
 - **Резервирование ВПС (Multi-Gateway):** В `-quic` можно указать несколько серверов через запятую (`-quic vps1:4242,vps2:4242`) для авто-переключения при падении узла.
 - **TCP и UDP открываются сразу:** Игры и голосовой чат работают без ручного дописывания `/udp`.
+- **Стелс-доступ с телефона и мультиплексор одного порта (`-knock`):** Держит все порты закрытыми от ботов до перехода по секретной закладке с телефона, генерирует готовый `.rdp`-профиль и `proxy.pac`, а также умеет принимать HTTP, HTTPS, SSH, RDP и SOCKS5 на одном-единственном открытом порту.
+- **Умный мост занятых портов (`standalone`):** Если на домашнем ПК порт (например `3389`, `8096` или `25565`) уже занят самой локальной программой на `0.0.0.0`, режим `standalone` не падает с ошибкой `address already in use`, а сам поднимает локальный мост и пробрасывает внешний порт роутера (UPnP / NAT-PMP / PCP v2) через защиту `-knock`, `-tls` и `-allow-ips`.
 - **Сертификаты и HTTPS:** Авто-получение Let's Encrypt (через `:443` TLS-ALPN-01, `:80` HTTP-01 или DNS-01). Если сертификат уже лежит на диске, программа берет его без пересоздания и заранее продлевает в фоне (когда остается меньше 30 дней).
 - **Полная скорость дома по Wi-Fi (`-direct :8888`):** Когда заходишь на сервер с телефона или ноутбука из дома (в одной сети с ПК), трафик идет напрямую через домашний роутер (`192.168.x.x`) на скорости локальной сети в обход ВПС.
 - **Безопасность и метрики:** Взаимная аутентификация с привязкой к TLS-сертификату (Channel Binding), бесшовная ротация паролей (`-token новый,старый`), взаимный mTLS (`-client-ca`, `-client-cert`, `-client-key`), фильтрация по IP/подсетям (`-allow-ips`), белый список портов (`-allow-ports`), передача реального IP через HAProxy PROXY protocol v1 (`-proxy-protocol`) и мониторинг Prometheus/JSON (`-metrics 127.0.0.1:9090`).
@@ -312,6 +374,9 @@ Windows:
 | `-token` | создается сам | Общий пароль (или список паролей через запятую для ротации `"новый,старый"`). |
 | `-fingerprint` | `""` | Отпечаток сертификата ВПС (сам подставляется в готовую команду). |
 | `-duck` | `""` | Опция авто-домена и сертификата (`-duck` или `-duck домен:токен`). По умолчанию выключена. |
+| `-knock` | `false` | Включить стелс-защиту и вход с телефона по секретной ссылке (панель запуска `.rdp`, `ssh://`, SOCKS5/PAC). |
+| `-knock-token` | создается сам | Свой секретный ключ для ссылки `-knock` (если не указать, создается и сохраняется сам). |
+| `-knock-ttl` | `24h` | На сколько часов открывать доступ для IP телефона после перехода по секретной ссылке. |
 | `-tls` | `false` | Включить HTTPS сразу на всех открытых портах. |
 | `-vhosts` | `""` | Раздавать сайты по доменам и путям: `"site.ru:3000,site.ru/api:4000,*.site.ru:5000"`. |
 | `-vhost-addr` / `-https` | `":80"` / `""` | Порты HTTP и HTTPS для доменного режима (`-vhosts`). |
@@ -323,10 +388,10 @@ Windows:
 | `-client-ca` / `-client-cert` / `-client-key` | `""` | Опциональная проверка клиентских сертификатов mTLS между ВПС и домашним ПК. |
 | `-proxy-protocol` | `false` | Передавать реальный IP клиента локальному TCP-серверу через заголовок HAProxy PROXY protocol v1. |
 | `-metrics` | `""` | Адрес HTTP-сервера метрик `/metrics` (Prometheus) и `/status` (JSON), например `"127.0.0.1:9090"`. |
-| `-upnp` | `true` | Авто-открытие портов на домашнем роутере через UPnP / NAT-PMP (`standalone`). |
+| `-upnp` | `true` | Авто-открытие портов на домашнем роутере через UPnP / NAT-PMP / PCP v2 (`standalone`). |
 | `-stun` | `"stun.cloudflare.com:3478"` | Свой STUN-сервер или список через запятую для проверки внешнего IP (`standalone`). |
 | `-stun-interval` | `1s` | Частота проверки внешнего IP по STUN (`standalone`). |
-| `-ddns-provider` | `""` | Другие DDNS-сервисы: `"cloudflare"` or `"noip"`. |
+| `-ddns-provider` | `""` | Другие DDNS-сервисы: `"cloudflare"` или `"noip"`. |
 | `-max-buf` / `-max-mem` | `16 МБ` / `256 МБ` | Лимиты оперативной памяти на одно соединение и на всю программу. |
 | `-session-ttl` | `90s` | Сколько секунд удерживать соединение при переподключении интернета дома. |
 
@@ -339,6 +404,7 @@ Windows:
 | Стримы и загрузки не рвутся при смене IP | Да (буфер 16 МБ в памяти) | Нет (обрыв) | Нет (обрыв) | Да |
 | Автовыбор QUIC и fallback на TCP-Mux | Да (`-transport auto`) | Отдельные конфиги | Да | Только UDP |
 | Может работать вообще без ВПС (`standalone`) | Да (UPnP + STUN + DDNS) | Нет | Нет | Нет |
+| Стелс-доступ с телефона и все протоколы на 1 порту | Да (`-knock`) | Нет | Нет | Нужен VPN-клиент на телефоне |
 | Встроенный HTTPS и сертификаты | Да | Нужны конфиги | Да | Нет (нужен Nginx/Caddy) |
 | TCP + UDP открываются по умолчанию | Да | Отдельные блоки | Платно / урезанный UDP | Ручной `iptables` |
 | Прямое подключение дома по Wi-Fi в обход ВПС | Да (`-direct :8888`) | Нет | Нет | Нужен Split-DNS |

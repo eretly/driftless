@@ -26,10 +26,12 @@ import (
 )
 
 type PortMapping struct {
-	BindIP     string // default "0.0.0.0" (or "127.0.0.1" when using local reverse proxy)
-	PublicPort uint16
-	TargetPort uint16
-	Proto      string // "both", "tcp", "udp", "http", "https"
+	BindIP        string // default "0.0.0.0" (or "127.0.0.1" when using local reverse proxy)
+	PublicPort    uint16
+	TargetPort    uint16
+	Proto         string // "both", "tcp", "udp", "http", "https"
+	RouterTCPPort uint16 // optional local ephemeral bridge port in standalone mode when PublicPort is already bound
+	RouterUDPPort uint16
 }
 
 type authAttempt struct {
@@ -59,6 +61,7 @@ type Gateway struct {
 	sniMgr          *SNICertManager
 	enableTLS       bool
 	ipACL           *IPACL
+	mappings        []PortMapping
 }
 
 func parseTokensList(raw string) []string {
@@ -163,6 +166,10 @@ func runGateway(ctx context.Context, quicAddr, token, directHTTPAddr, vhostAddr,
 	if len(vhostMap) > 0 {
 		sniMgr.enableACME = true
 	}
+	if defaultKnockController != nil {
+		sniMgr.allowSelfSignedPublic = true
+		enableTLS = true
+	}
 	sniMgr.startRenewalScheduler(ctx)
 
 	tokList := parseTokensList(token)
@@ -196,6 +203,7 @@ func runGateway(ctx context.Context, quicAddr, token, directHTTPAddr, vhostAddr,
 		sniMgr:       sniMgr,
 		enableTLS:    enableTLS,
 		ipACL:        defaultIPACL,
+		mappings:     append([]PortMapping(nil), mappings...),
 	}
 	defer gw.closeAllSessions()
 
@@ -331,6 +339,10 @@ func runGateway(ctx context.Context, quicAddr, token, directHTTPAddr, vhostAddr,
 		log.Printf("[gateway] Client connection command saved to %s (run './driftless show-token' to view)", connectCmdPath)
 		log.Printf("[gateway]   ./driftless client -quic %s:%s -token [token=valid,hidden] -fingerprint %s", pubIP, quicPort, fp[:16])
 	}
+	if defaultKnockController != nil {
+		defaultKnockController.SetPublicEndpoint(pubIP, enableTLS, cmdDir)
+		defaultKnockController.PrintBanner("gateway", cmdDir)
+	}
 	log.Printf("[gateway] ==========================================================")
 
 	<-ctx.Done()
@@ -463,6 +475,18 @@ func (gw *Gateway) handleVHostClient(rawConn net.Conn, vhostMap map[string]uint1
 		}
 	}
 
+	if defaultKnockController != nil {
+		if strings.HasPrefix(req.URL.Path, knockPathPrefix) {
+			pc := &peekedConn{Conn: c, r: bufio.NewReader(io.MultiReader(bytes.NewReader(captured.Bytes()), br))}
+			defaultKnockController.handleKnockHTTPConn(pc, rawConn.RemoteAddr())
+			return
+		}
+		if !defaultKnockController.IsAllowedAddr(rawConn.RemoteAddr()) {
+			_ = c.Close()
+			return
+		}
+	}
+
 	host := strings.ToLower(strings.TrimSpace(req.Host))
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
@@ -510,7 +534,7 @@ func (gw *Gateway) listenPublicUDPPort(ctx context.Context, m PortMapping) error
 				}
 				continue
 			}
-			if n == 0 || !gw.ipACL.AllowedAddr(clientAddr) {
+			if n == 0 || !gw.ipACL.AllowedAddr(clientAddr) || (defaultKnockController != nil && !defaultKnockController.IsAllowedAddr(clientAddr)) {
 				continue
 			}
 			pkt := append([]byte(nil), buf[:n]...)
@@ -1042,11 +1066,22 @@ func (gw *Gateway) listenPublicPort(ctx context.Context, m PortMapping) error {
 				continue
 			}
 			go func(raw net.Conn) {
-				wrapped := maybeTerminateTLS(raw, gw.sniMgr, useTLS)
+				tuneTCPSocket(raw)
 				var initData []byte
 				if defaultProxyProtocol {
 					initData = formatProxyProtoV1(raw.RemoteAddr(), raw.LocalAddr())
 				}
+				if defaultKnockController != nil || len(gw.mappings) > 1 {
+					wrapped, resolvedTarget, handled := inspectAndPrepareTCPConn(raw, gw.sniMgr, useTLS, m.TargetPort, gw.mappings, func(proxyConn net.Conn, targetPort uint16, _ string) {
+						gw.startResumableSession(proxyConn, targetPort, initData)
+					})
+					if handled {
+						return
+					}
+					gw.startResumableSession(wrapped, resolvedTarget, initData)
+					return
+				}
+				wrapped := maybeTerminateTLS(raw, gw.sniMgr, useTLS)
 				gw.startResumableSession(wrapped, m.TargetPort, initData)
 			}(c)
 		}

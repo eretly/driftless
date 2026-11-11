@@ -238,15 +238,16 @@ type upnpEndpoint struct {
 }
 
 type trackedRouterMapping struct {
-	InstanceID  string `json:"instance_id,omitempty"`
-	Kind        string `json:"kind"` // "upnp", "natpmp", or "pcp"
-	CtrlURL     string `json:"ctrl_url,omitempty"`
-	ServiceType string `json:"service_type,omitempty"`
-	GatewayIP   string `json:"gateway_ip,omitempty"`
-	LANIP       string `json:"lan_ip,omitempty"`
-	Port        uint16 `json:"port"`
-	Proto       string `json:"proto"`
-	PCPNonce    string `json:"pcp_nonce,omitempty"`
+	InstanceID   string `json:"instance_id,omitempty"`
+	Kind         string `json:"kind"` // "upnp", "natpmp", or "pcp"
+	CtrlURL      string `json:"ctrl_url,omitempty"`
+	ServiceType  string `json:"service_type,omitempty"`
+	GatewayIP    string `json:"gateway_ip,omitempty"`
+	LANIP        string `json:"lan_ip,omitempty"`
+	Port         uint16 `json:"port"`
+	InternalPort uint16 `json:"internal_port,omitempty"`
+	Proto        string `json:"proto"`
+	PCPNonce     string `json:"pcp_nonce,omitempty"`
 }
 
 const upnpStateFile = ".driftless-upnp-state.json"
@@ -562,6 +563,10 @@ func rollbackOrRetainRouterMapping(m trackedRouterMapping) error {
 }
 
 func deleteSingleRouterMapping(m trackedRouterMapping) error {
+	intPort := m.InternalPort
+	if intPort == 0 {
+		intPort = m.Port
+	}
 	if m.Kind == "upnp" && m.CtrlURL != "" && m.ServiceType != "" {
 		return upnpDeletePortMapping(m.CtrlURL, m.ServiceType, m.Port, m.Proto)
 	}
@@ -570,11 +575,11 @@ func deleteSingleRouterMapping(m trackedRouterMapping) error {
 		if err != nil {
 			return err
 		}
-		_, err = pcpSetPortMapping(targetAddr, m.LANIP, m.Port, 0, m.Proto, 0, m.PCPNonce)
+		_, err = pcpSetPortMapping(targetAddr, m.LANIP, intPort, 0, m.Proto, 0, m.PCPNonce)
 		return err
 	}
 	if m.Kind == "natpmp" && m.GatewayIP != "" {
-		_, _, err := natPMPSetPortMappingWithNonce(m.GatewayIP, m.LANIP, m.Port, 0, m.Proto, 0, m.PCPNonce)
+		_, _, err := natPMPSetPortMappingWithNonce(m.GatewayIP, m.LANIP, intPort, 0, m.Proto, 0, m.PCPNonce)
 		return err
 	}
 	return nil
@@ -817,36 +822,48 @@ func autoForwardRouterPorts(lanIP string, mappings []PortMapping, vhostAddr, htt
 
 func autoForwardRouterPortsWithEndpoints(lanIP string, mappings []PortMapping, vhostAddr, httpsAddr string, endpoints []upnpEndpoint, gwIP string) int {
 	type portSpec struct {
-		port  uint16
-		proto string
+		extPort uint16
+		intPort uint16
+		proto   string
 	}
 	seen := make(map[string]struct{})
 	var specs []portSpec
-	addSpec := func(p uint16, proto string) {
-		if p == 0 {
+	addSpec := func(extP, intP uint16, proto string) {
+		if extP == 0 {
 			return
 		}
-		k := fmt.Sprintf("%s:%d", proto, p)
+		if intP == 0 {
+			intP = extP
+		}
+		k := fmt.Sprintf("%s:%d", proto, extP)
 		if _, ok := seen[k]; !ok {
 			seen[k] = struct{}{}
-			specs = append(specs, portSpec{port: p, proto: proto})
+			specs = append(specs, portSpec{extPort: extP, intPort: intP, proto: proto})
 		}
 	}
 	for _, m := range mappings {
+		tcpInt := m.RouterTCPPort
+		if tcpInt == 0 {
+			tcpInt = m.PublicPort
+		}
+		udpInt := m.RouterUDPPort
+		if udpInt == 0 {
+			udpInt = m.PublicPort
+		}
 		if m.Proto == "udp" {
-			addSpec(m.PublicPort, "UDP")
+			addSpec(m.PublicPort, udpInt, "UDP")
 		} else if m.Proto == "both" {
-			addSpec(m.PublicPort, "TCP")
-			addSpec(m.PublicPort, "UDP")
+			addSpec(m.PublicPort, tcpInt, "TCP")
+			addSpec(m.PublicPort, udpInt, "UDP")
 		} else {
-			addSpec(m.PublicPort, "TCP")
+			addSpec(m.PublicPort, tcpInt, "TCP")
 		}
 	}
 	for _, addr := range []string{vhostAddr, httpsAddr} {
 		if addr != "" {
 			if _, portStr, err := net.SplitHostPort(addr); err == nil {
 				if p, err := strconv.Atoi(portStr); err == nil && p > 0 && p <= 65535 {
-					addSpec(uint16(p), "TCP")
+					addSpec(uint16(p), uint16(p), "TCP")
 				}
 			}
 		}
@@ -865,15 +882,16 @@ func autoForwardRouterPortsWithEndpoints(lanIP string, mappings []PortMapping, v
 		ok := false
 		stateWriteFailed := false
 		for _, ep := range endpoints {
-			if err := upnpAddPortMapping(ep.ctrlURL, ep.serviceType, lanIP, sp.port, sp.proto); err == nil {
+			if err := upnpAddPortMappingExtInt(ep.ctrlURL, ep.serviceType, lanIP, sp.extPort, sp.intPort, sp.proto); err == nil {
 				rule := trackedRouterMapping{
-					InstanceID:  currentUPnPInstanceID(),
-					Kind:        "upnp",
-					CtrlURL:     ep.ctrlURL,
-					ServiceType: ep.serviceType,
-					LANIP:       lanIP,
-					Port:        sp.port,
-					Proto:       sp.proto,
+					InstanceID:   currentUPnPInstanceID(),
+					Kind:         "upnp",
+					CtrlURL:      ep.ctrlURL,
+					ServiceType:  ep.serviceType,
+					LANIP:        lanIP,
+					Port:         sp.extPort,
+					InternalPort: sp.intPort,
+					Proto:        sp.proto,
 				}
 				if err := recordTrackedRouterMapping(rule); err != nil {
 					stateWriteFailed = true
@@ -888,16 +906,17 @@ func autoForwardRouterPortsWithEndpoints(lanIP string, mappings []PortMapping, v
 		}
 		if !ok && !stateWriteFailed && len(gwCandidates) > 0 {
 			for _, candidateGW := range gwCandidates {
-				prevNonce := existingPCPNonceForGatewayPort(candidateGW, sp.port, sp.proto)
-				if kind, pcpNonce, err := natPMPSetPortMappingWithNonce(candidateGW, lanIP, sp.port, sp.port, sp.proto, 3600, prevNonce); err == nil {
+				prevNonce := existingPCPNonceForGatewayPort(candidateGW, sp.extPort, sp.proto)
+				if kind, pcpNonce, err := natPMPSetPortMappingWithNonce(candidateGW, lanIP, sp.intPort, sp.extPort, sp.proto, 3600, prevNonce); err == nil {
 					rule := trackedRouterMapping{
-						InstanceID: currentUPnPInstanceID(),
-						Kind:       kind,
-						GatewayIP:  candidateGW,
-						LANIP:      lanIP,
-						Port:       sp.port,
-						Proto:      sp.proto,
-						PCPNonce:   pcpNonce,
+						InstanceID:   currentUPnPInstanceID(),
+						Kind:         kind,
+						GatewayIP:    candidateGW,
+						LANIP:        lanIP,
+						Port:         sp.extPort,
+						InternalPort: sp.intPort,
+						Proto:        sp.proto,
+						PCPNonce:     pcpNonce,
 					}
 					if err := recordTrackedRouterMapping(rule); err != nil {
 						if rbErr := rollbackOrRetainRouterMapping(rule); rbErr != nil {
@@ -1154,39 +1173,46 @@ func isUPnPConflictError(err error) bool {
 }
 
 func upnpAddPortMapping(ctrlURL, serviceType, lanIP string, port uint16, proto string) error {
+	return upnpAddPortMappingExtInt(ctrlURL, serviceType, lanIP, port, port, proto)
+}
+
+func upnpAddPortMappingExtInt(ctrlURL, serviceType, lanIP string, extPort, intPort uint16, proto string) error {
+	if intPort == 0 {
+		intPort = extPort
+	}
 	// 1. Standard dynamic lease (3600s) required by OpenWrt/pfSense/OPNsense miniupnpd IGDv2
-	err := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, port, proto, 3600)
+	err := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, extPort, intPort, proto, 3600)
 	if err == nil {
 		return nil
 	}
 	// 2. If port already has a conflicting/stale mapping (ErrorCode 718 on Asuswrt/TP-Link/Netgear/miniupnpd), delete and retry 3600s
 	if isUPnPConflictError(err) {
-		_ = upnpDeletePortMapping(ctrlURL, serviceType, port, proto)
-		if retryErr := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, port, proto, 3600); retryErr == nil {
+		_ = upnpDeletePortMapping(ctrlURL, serviceType, extPort, proto)
+		if retryErr := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, extPort, intPort, proto, 3600); retryErr == nil {
 			return nil
 		}
 	}
 	// 3. Permanent lease fallback (NewLeaseDuration=0) required by MikroTik, Keenetic, D-Link, Fritz!Box, and PPTP routers (ErrorCode 725)
-	permErr := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, port, proto, 0)
+	permErr := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, extPort, intPort, proto, 0)
 	if permErr == nil {
 		return nil
 	}
 	if isUPnPConflictError(permErr) {
-		_ = upnpDeletePortMapping(ctrlURL, serviceType, port, proto)
-		if retryPermErr := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, port, proto, 0); retryPermErr == nil {
+		_ = upnpDeletePortMapping(ctrlURL, serviceType, extPort, proto)
+		if retryPermErr := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, extPort, intPort, proto, 0); retryPermErr == nil {
 			return nil
 		}
 	}
 	// 4. Strict IGDv2 fallback: AddAnyPortMapping (when AddPortMapping is disabled with 606 Action Not Authorized on WANIPConnection:2 / WANPPPConnection:2)
 	if strings.HasSuffix(strings.TrimSpace(serviceType), ":2") {
-		if anyErr := upnpAddAnyPortMappingIGDv2(ctrlURL, serviceType, lanIP, port, proto, 3600); anyErr == nil {
+		if anyErr := upnpAddAnyPortMappingIGDv2(ctrlURL, serviceType, lanIP, extPort, intPort, proto, 3600); anyErr == nil {
 			return nil
 		}
 	}
 	return permErr
 }
 
-func upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP string, port uint16, proto string, leaseSeconds int) error {
+func upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP string, extPort, intPort uint16, proto string, leaseSeconds int) error {
 	if !isSafeRouterURL(ctrlURL) {
 		return fmt.Errorf("unsafe router UPnP control URL %q", ctrlURL)
 	}
@@ -1205,7 +1231,7 @@ func upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP string, port uint16
 <NewLeaseDuration>%d</NewLeaseDuration>
 </u:AddPortMapping>
 </s:Body>
-</s:Envelope>`, serviceType, port, proto, port, lanIP, leaseSeconds)
+</s:Envelope>`, serviceType, extPort, proto, intPort, lanIP, leaseSeconds)
 
 	req, err := http.NewRequest("POST", ctrlURL, strings.NewReader(soapBody))
 	if err != nil {
@@ -1226,7 +1252,7 @@ func upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP string, port uint16
 	return fmt.Errorf("upnp status %d (%s)", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
 }
 
-func upnpAddAnyPortMappingIGDv2(ctrlURL, serviceType, lanIP string, port uint16, proto string, leaseSeconds int) error {
+func upnpAddAnyPortMappingIGDv2(ctrlURL, serviceType, lanIP string, extPort, intPort uint16, proto string, leaseSeconds int) error {
 	if !isSafeRouterURL(ctrlURL) {
 		return fmt.Errorf("unsafe router UPnP control URL %q", ctrlURL)
 	}
@@ -1245,7 +1271,7 @@ func upnpAddAnyPortMappingIGDv2(ctrlURL, serviceType, lanIP string, port uint16,
 <NewLeaseDuration>%d</NewLeaseDuration>
 </u:AddAnyPortMapping>
 </s:Body>
-</s:Envelope>`, serviceType, port, proto, port, lanIP, leaseSeconds)
+</s:Envelope>`, serviceType, extPort, proto, intPort, lanIP, leaseSeconds)
 
 	req, err := http.NewRequest("POST", ctrlURL, strings.NewReader(soapBody))
 	if err != nil {
@@ -1267,9 +1293,9 @@ func upnpAddAnyPortMappingIGDv2(ctrlURL, serviceType, lanIP string, port uint16,
 	if idx := strings.Index(bodyStr, "<NewReservedPort>"); idx >= 0 {
 		var reserved int
 		if _, err := fmt.Sscanf(bodyStr[idx:], "<NewReservedPort>%d</NewReservedPort>", &reserved); err == nil && reserved > 0 && reserved <= 65535 {
-			if uint16(reserved) != port {
+			if uint16(reserved) != extPort {
 				_ = upnpDeletePortMapping(ctrlURL, serviceType, uint16(reserved), proto)
-				return fmt.Errorf("router assigned mismatched external port %d instead of %d", reserved, port)
+				return fmt.Errorf("router assigned mismatched external port %d instead of %d", reserved, extPort)
 			}
 		}
 	}
@@ -1890,22 +1916,6 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 	}
 
 	log.Printf("[standalone] driftless %s Zero-VPS mode active (LAN=%s, Public IP=%s)", versionString, lanIP, pubIP)
-	if cfg.EnableUPnP {
-		if _, err := cleanupStaleUPnPState(); err != nil {
-			log.Printf("[standalone] ERROR: stale UPnP state cleanup could not persist remaining state: %v", err)
-		}
-		mapped := autoForwardRouterPorts(lanIP, allowedMappings, upnpVHostAddr, upnpHTTPSAddr)
-		if mapped == 0 {
-			log.Printf("[standalone] warning: router UPnP/NAT-PMP mapped 0 ports (verify UPnP is enabled on your active WAN/PPTP interface)")
-		} else {
-			log.Printf("[standalone] router UPnP/NAT-PMP auto-forwarded %d port rules to %s", mapped, lanIP)
-		}
-		defer func() {
-			if _, err := cleanupActiveUPnPMappings(); err != nil {
-				log.Printf("[standalone] CRITICAL: shutdown UPnP cleanup failed to persist remaining state: %v", err)
-			}
-		}()
-	}
 
 	hasDDNSProvider := cfg.DDNS.Provider != "" || cfg.DDNS.Webhook != ""
 	autoSSLIPMode := !hasDDNSProvider && strings.EqualFold(cfg.DDNS.Domain, "auto")
@@ -1927,21 +1937,28 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 			cfg.DDNS.Domain = pubIP
 		}
 	}
+	if defaultKnockController != nil {
+		sniMgr.allowSelfSignedPublic = true
+		cfg.EnableTLS = true
+	}
 	if cfg.DDNS.Domain != "" {
 		sniMgr.ensureDomainCertificate(cfg.DDNS.Domain)
 		cfg.EnableTLS = true
 	}
-	printStandaloneBanner(pubIP, cfg.DDNS, allowedMappings)
 
-	// Start local TCP/UDP/VHost listeners (already filtered by -allow-ports)
-	for _, m := range allowedMappings {
+	// Start local TCP/UDP/VHost listeners BEFORE UPnP/NAT-PMP/PCP mapping so if a local service
+	// (e.g. Jellyfin :8096, Windows RDP :3389, SSH :22) is already bound to 0.0.0.0:PublicPort,
+	// driftless can bind an ephemeral local bridge port (RouterTCPPort/RouterUDPPort) and map
+	// Router ExternalPort -> driftless EphemeralPort -> Local Service without any port conflict.
+	for i := range allowedMappings {
+		m := &allowedMappings[i]
 		if m.Proto == "udp" || m.Proto == "both" {
 			if err := startStandaloneUDP(ctx, cfg.TargetHost, m); err != nil && m.Proto == "udp" {
 				return err
 			}
 		}
 		if m.Proto != "udp" {
-			if err := startStandaloneTCP(ctx, cfg.TargetHost, m, sniMgr, cfg.EnableTLS || m.Proto == "https"); err != nil {
+			if err := startStandaloneTCP(ctx, cfg.TargetHost, m, allowedMappings, sniMgr, cfg.EnableTLS || m.Proto == "https"); err != nil {
 				return err
 			}
 		}
@@ -1956,6 +1973,33 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 		if err := startStandaloneVHost(ctx, cfg.HTTPSAddr, cfg.TargetHost, filteredVHosts, sniMgr); err != nil {
 			return err
 		}
+	}
+
+	if cfg.EnableUPnP {
+		if _, err := cleanupStaleUPnPState(); err != nil {
+			log.Printf("[standalone] ERROR: stale UPnP state cleanup could not persist remaining state: %v", err)
+		}
+		mapped := autoForwardRouterPorts(lanIP, allowedMappings, upnpVHostAddr, upnpHTTPSAddr)
+		if mapped == 0 {
+			log.Printf("[standalone] warning: router UPnP/NAT-PMP mapped 0 ports (verify UPnP is enabled on your active WAN/PPTP interface)")
+		} else {
+			log.Printf("[standalone] router UPnP/NAT-PMP auto-forwarded %d port rules to %s", mapped, lanIP)
+		}
+		defer func() {
+			if _, err := cleanupActiveUPnPMappings(); err != nil {
+				log.Printf("[standalone] CRITICAL: shutdown UPnP cleanup failed to persist remaining state: %v", err)
+			}
+		}()
+	}
+
+	printStandaloneBanner(pubIP, cfg.DDNS, allowedMappings)
+	if defaultKnockController != nil {
+		hostForKnock := pubIP
+		if cfg.DDNS.Domain != "" {
+			hostForKnock = cfg.DDNS.Domain
+		}
+		defaultKnockController.SetPublicEndpoint(hostForKnock, cfg.EnableTLS, cfg.CertDir)
+		defaultKnockController.PrintBanner("standalone", cfg.CertDir)
 	}
 
 	// 1-second STUN IP change detector + automatic DDNS retry + periodic UPnP lease renewal
@@ -1994,6 +2038,13 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 						sniMgr.ensureDomainCertificate(cfg.DDNS.Domain)
 						printStandaloneBanner(currentIP, cfg.DDNS, allowedMappings)
 					}
+				}
+				if defaultKnockController != nil {
+					hostForKnock := currentIP
+					if cfg.DDNS.Domain != "" {
+						hostForKnock = cfg.DDNS.Domain
+					}
+					defaultKnockController.SetPublicEndpoint(hostForKnock, cfg.EnableTLS, cfg.CertDir)
 				}
 				lastDDNSAttempt = time.Time{} // force immediate DDNS update on IP change
 			}
@@ -2043,20 +2094,40 @@ func pipeBidirectional(a, b net.Conn) {
 	wg.Wait()
 }
 
-func startStandaloneTCP(ctx context.Context, targetHost string, m PortMapping, sniMgr *SNICertManager, useTLS bool) error {
+func startStandaloneTCP(ctx context.Context, targetHost string, m *PortMapping, allMappings []PortMapping, sniMgr *SNICertManager, useTLS bool) error {
 	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", m.PublicPort))
 	if err != nil {
-		if m.PublicPort == m.TargetPort && !useTLS && isAddrInUseError(err) {
-			log.Printf("[standalone] TCP :%d already bound by local service (UPnP forwards directly to :%d)", m.PublicPort, m.TargetPort)
-			return nil
+		if m.PublicPort == m.TargetPort && isAddrInUseError(err) {
+			needsBridge := useTLS || defaultKnockController != nil || defaultIPACL != nil || defaultProxyProtocol
+			if needsBridge {
+				bridgeLn, bErr := net.Listen("tcp", "0.0.0.0:0")
+				if bErr == nil {
+					if tcpAddr, ok := bridgeLn.Addr().(*net.TCPAddr); ok && tcpAddr.Port > 0 {
+						m.RouterTCPPort = uint16(tcpAddr.Port)
+						l = bridgeLn
+						log.Printf("[standalone] TCP :%d is bound by local service; bridging router external port %d -> local proxy :%d -> %s:%d", m.PublicPort, m.PublicPort, m.RouterTCPPort, targetHost, m.TargetPort)
+					} else {
+						_ = bridgeLn.Close()
+					}
+				}
+			}
+			if l == nil {
+				log.Printf("[standalone] TCP :%d already bound by local service (UPnP forwards directly to :%d)", m.PublicPort, m.TargetPort)
+				return nil
+			}
+		} else {
+			return err
 		}
-		return err
+	} else {
+		m.RouterTCPPort = m.PublicPort
+		log.Printf("[standalone] TCP :%d -> %s:%d (auto-tls=%v)", m.PublicPort, targetHost, m.TargetPort, useTLS)
 	}
-	log.Printf("[standalone] TCP :%d -> %s:%d (auto-tls=%v)", m.PublicPort, targetHost, m.TargetPort, useTLS)
 	go func() {
 		<-ctx.Done()
 		_ = l.Close()
 	}()
+	pubPort := m.PublicPort
+	defTargetPort := m.TargetPort
 	go func() {
 		for {
 			c, err := l.Accept()
@@ -2072,31 +2143,47 @@ func startStandaloneTCP(ctx context.Context, targetHost string, m PortMapping, s
 			}
 			go func(inConn net.Conn) {
 				tuneTCPSocket(inConn)
-				wrapped := maybeTerminateTLS(inConn, sniMgr, useTLS)
-				defer wrapped.Close()
-				outConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", targetHost, m.TargetPort), 5*time.Second)
-				if err != nil {
-					return
-				}
-				if m.PublicPort == m.TargetPort && outConn.LocalAddr().String() == inConn.RemoteAddr().String() {
-					_ = outConn.Close()
-					return
-				}
-				tuneTCPSocket(outConn)
-				defer outConn.Close()
-				if defaultProxyProtocol {
-					if _, err := outConn.Write(formatProxyProtoV1(inConn.RemoteAddr(), inConn.LocalAddr())); err != nil {
+				dialLocalOrLAN := func(srcConn net.Conn, dstPort uint16, dstHost string) {
+					defer srcConn.Close()
+					if dstHost == "" {
+						dstHost = targetHost
+					}
+					outConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", dstHost, dstPort), 5*time.Second)
+					if err != nil {
 						return
 					}
+					if pubPort == dstPort && outConn.LocalAddr().String() == inConn.RemoteAddr().String() {
+						_ = outConn.Close()
+						return
+					}
+					tuneTCPSocket(outConn)
+					defer outConn.Close()
+					if defaultProxyProtocol {
+						if _, err := outConn.Write(formatProxyProtoV1(inConn.RemoteAddr(), inConn.LocalAddr())); err != nil {
+							return
+						}
+					}
+					pipeBidirectional(srcConn, outConn)
 				}
-				pipeBidirectional(wrapped, outConn)
+
+				if defaultKnockController != nil || len(allMappings) > 1 {
+					wrapped, resolvedPort, handled := inspectAndPrepareTCPConn(inConn, sniMgr, useTLS, defTargetPort, allMappings, dialLocalOrLAN)
+					if handled {
+						return
+					}
+					dialLocalOrLAN(wrapped, resolvedPort, targetHost)
+					return
+				}
+
+				wrapped := maybeTerminateTLS(inConn, sniMgr, useTLS)
+				dialLocalOrLAN(wrapped, defTargetPort, targetHost)
 			}(c)
 		}
 	}()
 	return nil
 }
 
-func startStandaloneUDP(ctx context.Context, targetHost string, m PortMapping) error {
+func startStandaloneUDP(ctx context.Context, targetHost string, m *PortMapping) error {
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("0.0.0.0:%d", m.PublicPort))
 	if err != nil {
 		return err
@@ -2104,12 +2191,29 @@ func startStandaloneUDP(ctx context.Context, targetHost string, m PortMapping) e
 	pubConn, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		if m.PublicPort == m.TargetPort && isAddrInUseError(err) {
-			log.Printf("[standalone] UDP :%d already bound by local service (UPnP forwards directly to :%d)", m.PublicPort, m.TargetPort)
-			return nil
+			if defaultKnockController != nil || defaultIPACL != nil {
+				bAddr, _ := net.ResolveUDPAddr("udp", "0.0.0.0:0")
+				if bridgeUDP, bErr := net.ListenUDP("udp", bAddr); bErr == nil {
+					if uAddr, ok := bridgeUDP.LocalAddr().(*net.UDPAddr); ok && uAddr.Port > 0 {
+						m.RouterUDPPort = uint16(uAddr.Port)
+						pubConn = bridgeUDP
+						log.Printf("[standalone] UDP :%d is bound by local service; bridging router external UDP port %d -> local proxy :%d -> %s:%d", m.PublicPort, m.PublicPort, m.RouterUDPPort, targetHost, m.TargetPort)
+					} else {
+						_ = bridgeUDP.Close()
+					}
+				}
+			}
+			if pubConn == nil {
+				log.Printf("[standalone] UDP :%d already bound by local service (UPnP forwards directly to :%d)", m.PublicPort, m.TargetPort)
+				return nil
+			}
+		} else {
+			return err
 		}
-		return err
+	} else {
+		m.RouterUDPPort = m.PublicPort
+		log.Printf("[standalone] UDP :%d -> %s:%d", m.PublicPort, targetHost, m.TargetPort)
 	}
-	log.Printf("[standalone] UDP :%d -> %s:%d", m.PublicPort, targetHost, m.TargetPort)
 	go func() {
 		<-ctx.Done()
 		_ = pubConn.Close()
@@ -2118,6 +2222,7 @@ func startStandaloneUDP(ctx context.Context, targetHost string, m PortMapping) e
 	var mu sync.Mutex
 	peers := make(map[string]*net.UDPConn)
 	perIPCount := make(map[string]int)
+	dstPort := m.TargetPort
 
 	go func() {
 		bufPtr := udpBufPool.Get().(*[]byte)
@@ -2131,7 +2236,7 @@ func startStandaloneUDP(ctx context.Context, targetHost string, m PortMapping) e
 				}
 				continue
 			}
-			if !defaultIPACL.AllowedAddr(clientAddr) {
+			if !defaultIPACL.AllowedAddr(clientAddr) || (defaultKnockController != nil && !defaultKnockController.IsAllowedAddr(clientAddr)) {
 				continue
 			}
 			key := clientAddr.String()
@@ -2146,7 +2251,7 @@ func startStandaloneUDP(ctx context.Context, targetHost string, m PortMapping) e
 					mu.Unlock()
 					continue
 				}
-				raddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", targetHost, m.TargetPort))
+				raddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", targetHost, dstPort))
 				if err != nil {
 					mu.Unlock()
 					continue
@@ -2235,6 +2340,16 @@ func startStandaloneVHost(ctx context.Context, listenAddr, targetHost string, vh
 					if keyAuth, ok := sniMgr.getHTTPChallenge(tok); ok {
 						resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(keyAuth), keyAuth)
 						_, _ = wrapped.Write([]byte(resp))
+						return
+					}
+				}
+				if defaultKnockController != nil {
+					if strings.HasPrefix(req.URL.Path, knockPathPrefix) {
+						pc := &peekedConn{Conn: wrapped, r: bufio.NewReader(io.MultiReader(bytes.NewReader(captured.Bytes()), br))}
+						defaultKnockController.handleKnockHTTPConn(pc, raw.RemoteAddr())
+						return
+					}
+					if !defaultKnockController.IsAllowedAddr(raw.RemoteAddr()) {
 						return
 					}
 				}
