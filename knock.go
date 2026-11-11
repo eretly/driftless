@@ -6,13 +6,11 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/tls"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -26,7 +24,7 @@ import (
 
 const (
 	knockPathPrefix     = "/__driftless_knock/"
-	defaultKnockTTL     = 24 * time.Hour
+	defaultKnockTTL     = 1 * time.Hour
 	knockSecretFileName = "knock.secret"
 	knockURLFileName    = "knock-url.txt"
 )
@@ -34,18 +32,20 @@ const (
 var defaultKnockController *KnockController
 
 type KnockController struct {
-	secret       string
-	ttl          time.Duration
-	mu           sync.RWMutex
-	allowed      map[string]time.Time
-	attempts     map[string]authAttempt
-	mappedPorts  []PortMapping
-	publicHost   string
-	primaryPort  uint16
-	useTLS       bool
-	isStandalone bool
-	targetHost   string
-	allowedPorts map[uint16]struct{}
+	secret        string
+	ttl           time.Duration
+	mu            sync.RWMutex
+	allowed       map[string]map[uint16]time.Time // IP key -> port (0 = all mapped ports) -> expiration
+	attempts      map[string]authAttempt
+	mappedPorts   []PortMapping
+	publicHost    string
+	primaryPort   uint16
+	useTLS        bool
+	isStandalone  bool
+	targetHost    string
+	allowedPorts  map[uint16]struct{}
+	caCertPEM     []byte
+	caFingerprint string
 }
 
 func loadOrGenerateKnockSecret(certDir, customSecret string) (string, error) {
@@ -106,7 +106,7 @@ func newKnockController(certDir, customSecret string, ttl time.Duration, mapping
 	return &KnockController{
 		secret:       secret,
 		ttl:          ttl,
-		allowed:      make(map[string]time.Time),
+		allowed:      make(map[string]map[uint16]time.Time),
 		attempts:     make(map[string]authAttempt),
 		mappedPorts:  append([]PortMapping(nil), mappings...),
 		primaryPort:  primaryPort,
@@ -115,6 +115,16 @@ func newKnockController(certDir, customSecret string, ttl time.Duration, mapping
 		targetHost:   targetHost,
 		allowedPorts: allowedPorts,
 	}, nil
+}
+
+func (kc *KnockController) SetRootCA(caPEM []byte, fingerprint string) {
+	if kc == nil {
+		return
+	}
+	kc.mu.Lock()
+	kc.caCertPEM = append([]byte(nil), caPEM...)
+	kc.caFingerprint = fingerprint
+	kc.mu.Unlock()
 }
 
 func (kc *KnockController) SetPublicEndpoint(host string, useTLS bool, certDir string) {
@@ -189,7 +199,7 @@ func tryPrintInteractiveKnockURL(prefix, magicURL string) bool {
 		return false
 	}
 	defer ttyFile.Close()
-	_, wErr := fmt.Fprintf(ttyFile, "[%s] Open once on your iPhone / Android / laptop to unlock all ports (bookmark it):\n  %s\n", prefix, magicURL)
+	_, wErr := fmt.Fprintf(ttyFile, "[%s] Open once on your iPhone / Android / laptop to unlock mapped ports (bookmark it):\n  %s\n", prefix, magicURL)
 	return wErr == nil
 }
 
@@ -205,6 +215,10 @@ func extractAddrHost(addr net.Addr) string {
 }
 
 func (kc *KnockController) IsAllowedAddr(addr net.Addr) bool {
+	return kc.IsAllowedPort(addr, 0)
+}
+
+func (kc *KnockController) IsAllowedPort(addr net.Addr, port uint16) bool {
 	if kc == nil {
 		return true
 	}
@@ -219,21 +233,35 @@ func (kc *KnockController) IsAllowedAddr(addr net.Addr) bool {
 	now := time.Now()
 
 	kc.mu.RLock()
-	exp, ok := kc.allowed[key]
-	kc.mu.RUnlock()
-	if !ok || !now.Before(exp) {
+	portsMap, ok := kc.allowed[key]
+	if !ok || len(portsMap) == 0 {
+		kc.mu.RUnlock()
 		return false
 	}
-	// Sliding window renewal if more than 1 minute has elapsed
-	if exp.Sub(now) < kc.ttl-time.Minute {
-		kc.mu.Lock()
-		kc.allowed[key] = now.Add(kc.ttl)
-		kc.mu.Unlock()
+	if expAll, hasAll := portsMap[0]; hasAll && now.Before(expAll) {
+		kc.mu.RUnlock()
+		return true
 	}
-	return true
+	if port == 0 {
+		for _, exp := range portsMap {
+			if now.Before(exp) {
+				kc.mu.RUnlock()
+				return true
+			}
+		}
+		kc.mu.RUnlock()
+		return false
+	}
+	expPort, hasPort := portsMap[port]
+	kc.mu.RUnlock()
+	return hasPort && now.Before(expPort)
 }
 
 func (kc *KnockController) AuthorizeAddr(addr net.Addr) time.Time {
+	return kc.AuthorizeAddrPort(addr, 0)
+}
+
+func (kc *KnockController) AuthorizeAddrPort(addr net.Addr, port uint16) time.Time {
 	host := extractAddrHost(addr)
 	key := normalizeAuthIPKey(host)
 	now := time.Now()
@@ -242,8 +270,16 @@ func (kc *KnockController) AuthorizeAddr(addr net.Addr) time.Time {
 	kc.mu.Lock()
 	defer kc.mu.Unlock()
 	if len(kc.allowed) >= maxAuthTrackedIPs {
-		for k, v := range kc.allowed {
-			if now.After(v) {
+		for k, portMap := range kc.allowed {
+			active := false
+			for p, v := range portMap {
+				if now.After(v) {
+					delete(portMap, p)
+				} else {
+					active = true
+				}
+			}
+			if !active {
 				delete(kc.allowed, k)
 			}
 		}
@@ -254,12 +290,51 @@ func (kc *KnockController) AuthorizeAddr(addr net.Addr) time.Time {
 			}
 		}
 	}
-	kc.allowed[key] = exp
+	portMap, ok := kc.allowed[key]
+	if !ok {
+		portMap = make(map[uint16]time.Time)
+		kc.allowed[key] = portMap
+	}
+	portMap[port] = exp
+	if port > 0 {
+		for _, m := range kc.mappedPorts {
+			if m.PublicPort == port || m.TargetPort == port {
+				portMap[m.PublicPort] = exp
+				portMap[m.TargetPort] = exp
+			}
+		}
+	}
 	delete(kc.attempts, key)
 	return exp
 }
 
+func (kc *KnockController) RevokeAddr(addr net.Addr) {
+	if kc == nil {
+		return
+	}
+	host := extractAddrHost(addr)
+	key := normalizeAuthIPKey(host)
+	kc.mu.Lock()
+	delete(kc.allowed, key)
+	kc.mu.Unlock()
+}
+
+func (kc *KnockController) RevokeAll() int {
+	if kc == nil {
+		return 0
+	}
+	kc.mu.Lock()
+	n := len(kc.allowed)
+	kc.allowed = make(map[string]map[uint16]time.Time)
+	kc.mu.Unlock()
+	return n
+}
+
 func (kc *KnockController) VerifyKnockToken(addr net.Addr, candidate string) (bool, time.Time) {
+	return kc.VerifyKnockTokenForPort(addr, candidate, 0)
+}
+
+func (kc *KnockController) VerifyKnockTokenForPort(addr net.Addr, candidate string, port uint16) (bool, time.Time) {
 	host := extractAddrHost(addr)
 	key := normalizeAuthIPKey(host)
 	now := time.Now()
@@ -274,7 +349,7 @@ func (kc *KnockController) VerifyKnockToken(addr net.Addr, candidate string) (bo
 
 	candClean := strings.TrimSpace(candidate)
 	if hmac.Equal([]byte(candClean), []byte(kc.secret)) {
-		exp := kc.AuthorizeAddr(addr)
+		exp := kc.AuthorizeAddrPort(addr, port)
 		return true, exp
 	}
 
@@ -324,17 +399,6 @@ func peekBytesWithTimeout(c net.Conn, n int, timeout time.Duration) ([]byte, *pe
 	return b, pc, err
 }
 
-func (kc *KnockController) hasMappedTargetPort(port uint16) (uint16, bool) {
-	if kc != nil {
-		for _, m := range kc.mappedPorts {
-			if m.TargetPort == port || m.PublicPort == port {
-				return m.TargetPort, true
-			}
-		}
-	}
-	return 0, false
-}
-
 // detectUniversalSinglePortOverride inspects initial bytes on a connection and allows SSH (SSH-2.0-)
 // or Microsoft Remote Desktop (X.224 TPKT 0x03 0x00) to be routed to mapped SSH (:22) or RDP (:3389)
 // targets even when the client connected through another mapped port (e.g. :8096 or :443).
@@ -363,30 +427,8 @@ func isKnockHTTPPrefix(hdr []byte) bool {
 		bytes.HasPrefix(hdr, []byte("POST "+knockPathPrefix))
 }
 
-func isHTTPConnectPrefix(hdr []byte) bool {
-	return bytes.HasPrefix(hdr, []byte("CONNECT "))
-}
-
-func isSOCKS5GreetingPrefix(hdr []byte) bool {
-	// RFC 1928: VER=0x05, NMETHODS in 1..16, followed by method 0x00 (No Auth) or 0x02
-	if len(hdr) < 3 || hdr[0] != 0x05 {
-		return false
-	}
-	nmethods := int(hdr[1])
-	if nmethods < 1 || nmethods > 16 || len(hdr) < 2+nmethods {
-		return false
-	}
-	for i := 0; i < nmethods; i++ {
-		if hdr[2+i] == 0x00 || hdr[2+i] == 0x02 {
-			return true
-		}
-	}
-	return false
-}
-
-// inspectAndPrepareTCPConn enforces -knock protection, serves the Magic Knock Launchpad (/.rdp/proxy.pac),
-// handles built-in Knock-authenticated SOCKS5 & HTTP CONNECT proxy requests, and performs Single-Port
-// protocol auto-routing (SSH/RDP/HTTP on a single port).
+// inspectAndPrepareTCPConn enforces -knock protection, serves the Magic Knock Launchpad (/.rdp/revoke/ca.crt),
+// and performs Single-Port protocol auto-routing (SSH/RDP/HTTP on a single port).
 // Returns (wrappedConn, resolvedTargetPort, handledOrClosed).
 func inspectAndPrepareTCPConn(
 	rawConn net.Conn,
@@ -394,13 +436,12 @@ func inspectAndPrepareTCPConn(
 	useTLS bool,
 	defaultTargetPort uint16,
 	mappings []PortMapping,
-	dialPortFn func(conn net.Conn, targetPort uint16, directHost string),
 ) (net.Conn, uint16, bool) {
 	kc := defaultKnockController
 	remoteAddr := rawConn.RemoteAddr()
 
 	if kc != nil && !kc.IsAllowedAddr(remoteAddr) {
-		// Unauthenticated IP: only allow a valid Magic Knock HTTP(S) request; drop everything else before touching backends.
+		// Unauthenticated IP: only allow a valid Magic Knock HTTPS request; drop everything else before touching backends.
 		wrapped := maybeTerminateTLSWithTimeout(rawConn, sniMgr, true, 1500*time.Millisecond)
 		hdr, pc, _ := peekBytesWithTimeout(wrapped, 32, 1500*time.Millisecond)
 		if !isKnockHTTPPrefix(hdr) {
@@ -423,18 +464,11 @@ func inspectAndPrepareTCPConn(
 		return nil, 0, true
 	}
 
-	if kc != nil && dialPortFn != nil {
-		if isHTTPConnectPrefix(hdr) {
-			kc.handleHTTPConnectProxy(pc, dialPortFn)
-			return nil, 0, true
-		}
-		if isSOCKS5GreetingPrefix(hdr) {
-			kc.handleSOCKS5Proxy(pc, dialPortFn)
-			return nil, 0, true
-		}
-	}
-
 	resolvedPort := detectUniversalSinglePortOverride(hdr, defaultTargetPort, mappings)
+	if kc != nil && !kc.IsAllowedPort(remoteAddr, resolvedPort) && !kc.IsAllowedPort(remoteAddr, defaultTargetPort) {
+		_ = pc.Close()
+		return nil, 0, true
+	}
 	return pc, resolvedPort, false
 }
 
@@ -477,7 +511,52 @@ func (kc *KnockController) handleKnockHTTPConn(pc *peekedConn, remoteAddr net.Ad
 		subPath = strings.ToLower(strings.TrimSpace(parts[1]))
 	}
 
-	ok, exp := kc.VerifyKnockToken(remoteAddr, candidateTok)
+	var requestedPort uint16
+	if qPort := strings.TrimSpace(req.URL.Query().Get("port")); qPort != "" {
+		if p, err := strconv.Atoi(qPort); err == nil && p > 0 && p <= 65535 {
+			requestedPort = uint16(p)
+		}
+	} else if strings.HasPrefix(subPath, "port/") {
+		pStr := strings.TrimPrefix(subPath, "port/")
+		if p, err := strconv.Atoi(pStr); err == nil && p > 0 && p <= 65535 {
+			requestedPort = uint16(p)
+			subPath = ""
+		}
+	}
+
+	clientIP := extractAddrHost(remoteAddr)
+
+	// Handle immediate IP revocation before re-authorizing
+	if subPath == "revoke" || req.URL.Query().Get("revoke") == "1" {
+		if !hmac.Equal([]byte(strings.TrimSpace(candidateTok)), []byte(kc.secret)) {
+			body := "404 Not Found\n"
+			resp := fmt.Sprintf("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+			_, _ = pc.Write([]byte(resp))
+			return
+		}
+		revokedAll := false
+		if req.URL.Query().Get("all") == "1" {
+			n := kc.RevokeAll()
+			revokedAll = true
+			log.Printf("[knock] revoked all unlocked IPs (%d entries) on request from %s", n, clientIP)
+		} else {
+			kc.RevokeAddr(remoteAddr)
+			log.Printf("[knock] revoked access for client IP %s", clientIP)
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"status":      "revoked",
+			"client_ip":   clientIP,
+			"revoked_all": revokedAll,
+		})
+		hdr := fmt.Sprintf(
+			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+			len(payload),
+		)
+		_, _ = pc.Write(append([]byte(hdr), payload...))
+		return
+	}
+
+	ok, exp := kc.VerifyKnockTokenForPort(remoteAddr, candidateTok, requestedPort)
 	if !ok {
 		body := "404 Not Found\n"
 		resp := fmt.Sprintf("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
@@ -485,8 +564,11 @@ func (kc *KnockController) handleKnockHTTPConn(pc *peekedConn, remoteAddr net.Ad
 		return
 	}
 
-	clientIP := extractAddrHost(remoteAddr)
-	log.Printf("[knock] unlocked client IP %s until %s", clientIP, exp.Format(time.RFC3339))
+	if requestedPort > 0 {
+		log.Printf("[knock] unlocked client IP %s for port %d until %s", clientIP, requestedPort, exp.Format(time.RFC3339))
+	} else {
+		log.Printf("[knock] unlocked client IP %s for all mapped ports until %s", clientIP, exp.Format(time.RFC3339))
+	}
 
 	reqHost := strings.TrimSpace(req.Host)
 	if h, _, err := net.SplitHostPort(reqHost); err == nil && h != "" {
@@ -521,22 +603,32 @@ func (kc *KnockController) handleKnockHTTPConn(pc *peekedConn, remoteAddr net.Ad
 		_, _ = pc.Write([]byte(hdr + rdpContent))
 		return
 
-	case "proxy.pac":
-		pacContent := kc.buildPACFile(reqHost)
+	case "ca.crt":
+		kc.mu.RLock()
+		caPEM := kc.caCertPEM
+		kc.mu.RUnlock()
+		if len(caPEM) == 0 {
+			body := "404 Not Found\n"
+			resp := fmt.Sprintf("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+			_, _ = pc.Write([]byte(resp))
+			return
+		}
 		hdr := fmt.Sprintf(
-			"HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nContent-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-			len(pacContent),
+			"HTTP/1.1 200 OK\r\nContent-Type: application/x-x509-ca-cert\r\nContent-Disposition: attachment; filename=\"driftless-root-ca.crt\"\r\nContent-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+			len(caPEM),
 		)
-		_, _ = pc.Write([]byte(hdr + pacContent))
+		_, _ = pc.Write(append([]byte(hdr), caPEM...))
 		return
 
 	case "status.json":
 		payload, _ := json.Marshal(map[string]any{
-			"status":      "unlocked",
-			"client_ip":   clientIP,
-			"expires_at":  exp.UTC().Format(time.RFC3339),
-			"ttl_seconds": int(time.Until(exp).Seconds()),
-			"host":        reqHost,
+			"status":         "unlocked",
+			"client_ip":      clientIP,
+			"unlocked_port":  requestedPort,
+			"expires_at":     exp.UTC().Format(time.RFC3339),
+			"ttl_seconds":    int(time.Until(exp).Seconds()),
+			"host":           reqHost,
+			"ca_fingerprint": kc.caFingerprint,
 		})
 		hdr := fmt.Sprintf(
 			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
@@ -546,7 +638,7 @@ func (kc *KnockController) handleKnockHTTPConn(pc *peekedConn, remoteAddr net.Ad
 		return
 	}
 
-	page := kc.buildLaunchpadHTML(reqHost, clientIP, exp)
+	page := kc.buildLaunchpadHTML(reqHost, clientIP, requestedPort, exp)
 	hdr := fmt.Sprintf(
 		"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
 		len(page),
@@ -554,48 +646,39 @@ func (kc *KnockController) handleKnockHTTPConn(pc *peekedConn, remoteAddr net.Ad
 	_, _ = pc.Write([]byte(hdr + page))
 }
 
-func (kc *KnockController) buildPACFile(host string) string {
-	return fmt.Sprintf(`function FindProxyForURL(url, host) {
-  if (dnsDomainIs(host, %q) ||
-      shExpMatch(host, "*.local") ||
-      shExpMatch(host, "*.lan") ||
-      shExpMatch(host, "*.home.arpa") ||
-      isInNet(host, "192.168.0.0", "255.255.0.0") ||
-      isInNet(host, "10.0.0.0", "255.0.0.0") ||
-      isInNet(host, "172.16.0.0", "255.240.0.0") ||
-      isInNet(host, "127.0.0.0", "255.0.0.0")) {
-    return "PROXY %s:%d; SOCKS5 %s:%d; DIRECT";
-  }
-  return "DIRECT";
-}
-`, host, host, kc.primaryPort, host, kc.primaryPort)
-}
-
-func (kc *KnockController) buildLaunchpadHTML(host, clientIP string, exp time.Time) string {
+func (kc *KnockController) buildLaunchpadHTML(host, clientIP string, unlockedPort uint16, exp time.Time) string {
 	safeHost := html.EscapeString(host)
 	safeIP := html.EscapeString(clientIP)
-	ttlHours := fmt.Sprintf("%.1f h", time.Until(exp).Hours())
-	scheme := "https"
-	if !kc.useTLS {
-		scheme = "http"
+	ttlMins := int(time.Until(exp).Minutes())
+	ttlLabel := fmt.Sprintf("%d min", ttlMins)
+	if ttlMins >= 120 {
+		ttlLabel = fmt.Sprintf("%.1f h", time.Until(exp).Hours())
 	}
-	pacURL := fmt.Sprintf("%s://%s:%d%s%s/proxy.pac", scheme, safeHost, kc.primaryPort, knockPathPrefix, kc.secret)
+	scheme := "https"
 	rdpFileURL := fmt.Sprintf("%s://%s:%d%s%s/connect.rdp", scheme, safeHost, kc.primaryPort, knockPathPrefix, kc.secret)
+	revokeURL := fmt.Sprintf("%s://%s:%d%s%s/revoke", scheme, safeHost, kc.primaryPort, knockPathPrefix, kc.secret)
+	caURL := fmt.Sprintf("%s://%s:%d%s%s/ca.crt", scheme, safeHost, kc.primaryPort, knockPathPrefix, kc.secret)
+
+	scopeBadge := fmt.Sprintf("Mapped TCP &amp; UDP Ports Unlocked (%s)", ttlLabel)
+	if unlockedPort > 0 {
+		scopeBadge = fmt.Sprintf("Port :%d Unlocked (%s)", unlockedPort, ttlLabel)
+	}
 
 	var cards strings.Builder
 	for _, m := range kc.mappedPorts {
 		pub := m.PublicPort
 		loc := m.TargetPort
+		portOnlyURL := fmt.Sprintf("%s://%s:%d%s%s?port=%d", scheme, safeHost, kc.primaryPort, knockPathPrefix, kc.secret, pub)
 		switch loc {
 		case 3389:
 			cards.WriteString(fmt.Sprintf(
-				`<div class="card"><div><strong>Windows Remote Desktop (RDP :%d)</strong><div class="sub">%s:%d (or single-port %s:%d)</div></div><div class="btns"><a class="btn" href="rdp://full%%20address=s:%s:%d">Open Windows App</a><a class="btn sec" href="%s">Download .rdp</a></div></div>`,
-				pub, safeHost, pub, safeHost, kc.primaryPort, safeHost, pub, rdpFileURL,
+				`<div class="card"><div><strong>Windows Remote Desktop (RDP :%d)</strong><div class="sub">%s:%d (or single-port %s:%d)</div></div><div class="btns"><a class="btn" href="rdp://full%%20address=s:%s:%d">Open Windows App</a><a class="btn sec" href="%s">Download .rdp</a><a class="btn sec" href="%s">Unlock :%d Only</a></div></div>`,
+				pub, safeHost, pub, safeHost, kc.primaryPort, safeHost, pub, rdpFileURL, portOnlyURL, pub,
 			))
 		case 22:
 			cards.WriteString(fmt.Sprintf(
-				`<div class="card"><div><strong>SSH / SFTP Terminal (:%d)</strong><div class="sub">%s:%d (WebSSH / Termius / SFTP)</div></div><div class="btns"><a class="btn" href="ssh://%s:%d">Open SSH</a><a class="btn sec" href="sftp://%s:%d">Open SFTP</a></div></div>`,
-				pub, safeHost, pub, safeHost, pub, safeHost, pub,
+				`<div class="card"><div><strong>SSH / SFTP Terminal (:%d)</strong><div class="sub">%s:%d (WebSSH / Termius / SFTP)</div></div><div class="btns"><a class="btn" href="ssh://%s:%d">Open SSH</a><a class="btn sec" href="sftp://%s:%d">Open SFTP</a><a class="btn sec" href="%s">Unlock :%d Only</a></div></div>`,
+				pub, safeHost, pub, safeHost, pub, safeHost, pub, portOnlyURL, pub,
 			))
 		default:
 			portScheme := scheme
@@ -603,10 +686,24 @@ func (kc *KnockController) buildLaunchpadHTML(host, clientIP string, exp time.Ti
 				portScheme = "https"
 			}
 			cards.WriteString(fmt.Sprintf(
-				`<div class="card"><div><strong>Port :%d (Local :%d · %s)</strong><div class="sub">%s://%s:%d</div></div><div class="btns"><a class="btn" href="%s://%s:%d">Open in Browser</a></div></div>`,
-				pub, loc, strings.ToUpper(m.Proto), portScheme, safeHost, pub, portScheme, safeHost, pub,
+				`<div class="card"><div><strong>Port :%d (Local :%d - %s)</strong><div class="sub">%s://%s:%d</div></div><div class="btns"><a class="btn" href="%s://%s:%d">Open in Browser</a><a class="btn sec" href="%s">Unlock :%d Only</a></div></div>`,
+				pub, loc, strings.ToUpper(m.Proto), portScheme, safeHost, pub, portScheme, safeHost, pub, portOnlyURL, pub,
 			))
 		}
+	}
+
+	caBox := ""
+	kc.mu.RLock()
+	caFP := kc.caFingerprint
+	hasCA := len(kc.caCertPEM) > 0
+	kc.mu.RUnlock()
+	if hasCA && caFP != "" {
+		caBox = fmt.Sprintf(`  <div class="box">
+    <div style="font-size:13px;font-weight:600;color:#cbd5e1">TLS Root CA Verification (No Public Domain / IP Mode)</div>
+    <p style="margin:4px 0 8px;font-size:12px;color:#94a3b8">For public domains (e.g. DuckDNS), driftless issues a real Let's Encrypt certificate automatically. If connecting via raw IP or .sslip.io, you can verify or install this server's persistent Root CA once to prevent MITM:</p>
+    <div class="sub">Root CA SHA-256: %s</div>
+    <div class="btns" style="margin-top:8px"><a class="btn sec" href="%s">Download Root CA (ca.crt)</a></div>
+  </div>`, html.EscapeString(caFP), caURL)
 	}
 
 	return fmt.Sprintf(`<!doctype html>
@@ -622,168 +719,30 @@ body{margin:0;padding:20px;font-family:-apple-system,BlinkMacSystemFont,"Segoe U
 .box{background:#111827;border:1px solid #1f2937;border-radius:10px;padding:16px}
 .card{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid #1f2937}
 .card:last-child{border-bottom:none}
-.sub{font-size:12px;color:#94a3b8;font-family:monospace;margin-top:3px}
+.sub{font-size:12px;color:#94a3b8;font-family:monospace;margin-top:3px;word-break:break-all}
 .btns{display:flex;gap:8px;flex-wrap:wrap}
 .btn{padding:8px 12px;border-radius:6px;background:#38bdf8;color:#090d16;text-decoration:none;font-weight:600;font-size:13px}
 .btn.sec{background:#1e293b;color:#e2e8f0;border:1px solid #334155}
-code{display:block;padding:10px;background:#030712;border:1px solid #1e293b;border-radius:6px;font-size:12px;color:#38bdf8;word-break:break-all;margin-top:6px}
+.btn.danger{background:#7f1d1d;color:#fecaca;border:1px solid #991b1b}
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="box">
-    <span class="badge">All TCP &amp; UDP Ports Unlocked (%s)</span>
+    <span class="badge">%s</span>
     <h2 style="margin:10px 0 4px;font-size:18px">Your IP (%s) is authorized</h2>
-    <p style="margin:0;font-size:13px;color:#94a3b8">You can now connect from any native app on this device (Windows App RDP, Termius SSH, Jellyfin, Moonlight, Minecraft). Save this page to your bookmarks to unlock again anytime your mobile IP changes.</p>
+    <p style="margin:0 0 12px;font-size:13px;color:#94a3b8">You can now connect from native apps on this device (WebSSH, Termius, Windows App RDP, Jellyfin, Moonlight). Save this page to your bookmarks to unlock again when your mobile IP changes.</p>
+    <div class="btns">
+      <a class="btn danger" href="%s">Revoke My IP Now</a>
+      <a class="btn sec" href="%s?all=1">Revoke All Unlocked IPs</a>
+    </div>
   </div>
   <div class="box">
-    <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:#cbd5e1">One-Tap App Launchers</div>
+    <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:#cbd5e1">One-Tap App Launchers &amp; Per-Port Knock</div>
     %s
   </div>
-  <div class="box">
-    <div style="font-size:13px;font-weight:600;color:#cbd5e1">Universal Proxy &amp; Auto-PAC (iOS / Android Wi-Fi Proxy -&gt; Automatic)</div>
-    <p style="margin:4px 0 0;font-size:12px;color:#94a3b8">Routes %s and local home LAN (192.168.x.x) through port %d without installing any VPN app:</p>
-    <code>%s</code>
-  </div>
+%s
 </div>
 </body>
-</html>`, ttlHours, safeIP, cards.String(), safeHost, kc.primaryPort, pacURL)
-}
-
-func (kc *KnockController) resolveProxyDestination(targetAddr string) (string, uint16, error) {
-	host, portStr, err := net.SplitHostPort(strings.TrimSpace(targetAddr))
-	if err != nil {
-		return "", 0, err
-	}
-	p, err := strconv.Atoi(portStr)
-	if err != nil || p <= 0 || p > 65535 {
-		return "", 0, errors.New("invalid proxy target port")
-	}
-	port := uint16(p)
-	if len(kc.allowedPorts) > 0 {
-		if _, ok := kc.allowedPorts[port]; !ok {
-			return "", 0, fmt.Errorf("port %d is not in -allow-ports", port)
-		}
-	}
-
-	hostLower := strings.ToLower(strings.TrimSpace(host))
-	kc.mu.RLock()
-	pubHost := strings.ToLower(kc.publicHost)
-	kc.mu.RUnlock()
-
-	// Map public domain, localhost, or 127.0.0.1 to the Home PC's local target
-	if hostLower == "localhost" || hostLower == "127.0.0.1" || (pubHost != "" && hostLower == pubHost) {
-		if mappedLoc, ok := kc.hasMappedTargetPort(port); ok {
-			port = mappedLoc
-		}
-		return kc.targetHost, port, nil
-	}
-
-	// In standalone mode on the Home PC, also allow unlocked devices to reach private RFC1918 LAN IPs (e.g. 192.168.1.1 router) while blocking 169.254.169.254 metadata
-	ip := net.ParseIP(hostLower)
-	if ip != nil {
-		v4 := ip.To4()
-		if v4 == nil || v4.IsLinkLocalUnicast() || v4[0] == 169 {
-			return "", 0, errors.New("blocked unsafe proxy target IP")
-		}
-		if v4.IsLoopback() {
-			return kc.targetHost, port, nil
-		}
-		if kc.isStandalone && v4.IsPrivate() {
-			return v4.String(), port, nil
-		}
-	}
-	return "", 0, errors.New("proxy only routes to home host and private LAN")
-}
-
-func (kc *KnockController) handleHTTPConnectProxy(pc *peekedConn, dialPortFn func(conn net.Conn, targetPort uint16, directHost string)) {
-	_ = pc.Conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	req, err := http.ReadRequest(pc.r)
-	_ = pc.Conn.SetReadDeadline(time.Time{})
-	if err != nil || req.Method != http.MethodConnect {
-		_ = pc.Close()
-		return
-	}
-	directHost, targetPort, err := kc.resolveProxyDestination(req.Host)
-	if err != nil {
-		_, _ = pc.Write([]byte("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"))
-		_ = pc.Close()
-		return
-	}
-	if _, err := pc.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
-		_ = pc.Close()
-		return
-	}
-	dialPortFn(pc, targetPort, directHost)
-}
-
-func (kc *KnockController) handleSOCKS5Proxy(pc *peekedConn, dialPortFn func(conn net.Conn, targetPort uint16, directHost string)) {
-	_ = pc.Conn.SetDeadline(time.Now().Add(5 * time.Second))
-	var hdr [2]byte
-	if _, err := io.ReadFull(pc, hdr[:]); err != nil || hdr[0] != 0x05 {
-		_ = pc.Close()
-		return
-	}
-	methods := make([]byte, int(hdr[1]))
-	if _, err := io.ReadFull(pc, methods); err != nil {
-		_ = pc.Close()
-		return
-	}
-	// Reply: SOCKS5 No Authentication Required (since caller IP is already verified via KnockController)
-	if _, err := pc.Write([]byte{0x05, 0x00}); err != nil {
-		_ = pc.Close()
-		return
-	}
-
-	var reqHdr [4]byte
-	if _, err := io.ReadFull(pc, reqHdr[:]); err != nil || reqHdr[0] != 0x05 || reqHdr[1] != 0x01 {
-		_, _ = pc.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		_ = pc.Close()
-		return
-	}
-	var host string
-	switch reqHdr[3] {
-	case 0x01: // IPv4
-		var ip4 [4]byte
-		if _, err := io.ReadFull(pc, ip4[:]); err != nil {
-			_ = pc.Close()
-			return
-		}
-		host = net.IPv4(ip4[0], ip4[1], ip4[2], ip4[3]).String()
-	case 0x03: // Domain name
-		var dlen [1]byte
-		if _, err := io.ReadFull(pc, dlen[:]); err != nil || dlen[0] == 0 {
-			_ = pc.Close()
-			return
-		}
-		dbuf := make([]byte, int(dlen[0]))
-		if _, err := io.ReadFull(pc, dbuf); err != nil {
-			_ = pc.Close()
-			return
-		}
-		host = string(dbuf)
-	default:
-		_, _ = pc.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		_ = pc.Close()
-		return
-	}
-	var portBuf [2]byte
-	if _, err := io.ReadFull(pc, portBuf[:]); err != nil {
-		_ = pc.Close()
-		return
-	}
-	port := binary.BigEndian.Uint16(portBuf[:])
-	_ = pc.Conn.SetDeadline(time.Time{})
-
-	directHost, targetPort, err := kc.resolveProxyDestination(fmt.Sprintf("%s:%d", host, port))
-	if err != nil {
-		_, _ = pc.Write([]byte{0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		_ = pc.Close()
-		return
-	}
-	if _, err := pc.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0}); err != nil {
-		_ = pc.Close()
-		return
-	}
-	dialPortFn(pc, targetPort, directHost)
+</html>`, scopeBadge, safeIP, revokeURL, revokeURL, cards.String(), caBox)
 }

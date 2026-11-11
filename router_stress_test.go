@@ -465,20 +465,35 @@ func TestKnockPortalAndSinglePortMultiplexerAndBridge(t *testing.T) {
 		t.Fatalf("expected RDP X.224 packet on port 8096 to auto-route to target port 3389, got %d", got)
 	}
 
-	// 2. Verify Zero-Client Knock blocks unauthenticated non-loopback IP and unlocks via Magic Link
+	// 2. Verify Per-Port Knock Authorization, Full Unlock, and Instant Revocation
 	fakeClientAddr := &net.TCPAddr{IP: net.ParseIP("198.51.100.77"), Port: 54321}
 	if kc.IsAllowedAddr(fakeClientAddr) {
 		t.Fatalf("expected unauthenticated public IP 198.51.100.77 to be blocked before Knock")
 	}
-	// Wrong secret rate-limit & rejection check
 	if ok, _ := kc.VerifyKnockToken(fakeClientAddr, "wrongsecret"); ok {
 		t.Fatalf("expected wrong knock secret to be rejected")
 	}
-	if ok, _ := kc.VerifyKnockToken(fakeClientAddr, "testknocksecret123456"); !ok {
-		t.Fatalf("expected valid knock secret to unlock 198.51.100.77")
+	// Unlock ONLY port 22 (SSH)
+	if ok, _ := kc.VerifyKnockTokenForPort(fakeClientAddr, "testknocksecret123456", 22); !ok {
+		t.Fatalf("expected valid knock secret to unlock port 22 for 198.51.100.77")
 	}
-	if !kc.IsAllowedAddr(fakeClientAddr) {
-		t.Fatalf("expected 198.51.100.77 to be allowed after valid Knock")
+	if !kc.IsAllowedPort(fakeClientAddr, 22) || !kc.IsAllowedPort(fakeClientAddr, 2222) {
+		t.Fatalf("expected port 22 and mapped public port 2222 to be allowed after per-port Knock")
+	}
+	if kc.IsAllowedPort(fakeClientAddr, 8096) || kc.IsAllowedPort(fakeClientAddr, 3389) {
+		t.Fatalf("expected ports 8096 and 3389 to remain locked when only port 22 was unlocked")
+	}
+	// Unlock all mapped ports
+	if ok, _ := kc.VerifyKnockToken(fakeClientAddr, "testknocksecret123456"); !ok {
+		t.Fatalf("expected valid knock secret to unlock all mapped ports for 198.51.100.77")
+	}
+	if !kc.IsAllowedPort(fakeClientAddr, 8096) || !kc.IsAllowedPort(fakeClientAddr, 3389) {
+		t.Fatalf("expected all mapped ports to be allowed after full Knock")
+	}
+	// Revoke IP immediately
+	kc.RevokeAddr(fakeClientAddr)
+	if kc.IsAllowedAddr(fakeClientAddr) || kc.IsAllowedPort(fakeClientAddr, 22) {
+		t.Fatalf("expected 198.51.100.77 to be immediately blocked after RevokeAddr")
 	}
 
 	// 3. Verify plaintext HTTP Knock is rejected with 400 Bad Request and does NOT unlock IP
@@ -490,7 +505,7 @@ func TestKnockPortalAndSinglePortMultiplexerAndBridge(t *testing.T) {
 	plainDone := make(chan struct{})
 	go func() {
 		defer close(plainDone)
-		_, _, handled := inspectAndPrepareTCPConn(plainS, nil, false, 8096, mappings, nil)
+		_, _, handled := inspectAndPrepareTCPConn(plainS, nil, false, 8096, mappings)
 		if !handled {
 			t.Errorf("expected plaintext Knock request to be intercepted and rejected")
 		}
@@ -503,17 +518,21 @@ func TestKnockPortalAndSinglePortMultiplexerAndBridge(t *testing.T) {
 		t.Fatalf("expected plaintext HTTP Knock to be rejected with 400 Bad Request, got:\n%s", string(plainResp))
 	}
 
-	// 4. Verify HTTPS/TLS Magic Knock Launchpad, .rdp generator, and https:// PAC URL over TLS
+	// 4. Verify HTTPS/TLS Magic Knock Launchpad, Root CA persistence, .rdp generator, and /revoke over TLS
 	sniMgr, err := newSNICertManager(tmpDir, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(sniMgr.caPEM) == 0 || len(sniMgr.caFingerprint) != 64 {
+		t.Fatalf("expected SNICertManager to persist Root CA PEM and 64-char SHA-256 fingerprint")
+	}
+	kc.SetRootCA(sniMgr.caPEM, sniMgr.caFingerprint)
 
 	c1, s1 := net.Pipe()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _, handled := inspectAndPrepareTCPConn(s1, sniMgr, true, 8096, mappings, nil)
+		_, _, handled := inspectAndPrepareTCPConn(s1, sniMgr, true, 8096, mappings)
 		if !handled {
 			t.Errorf("expected HTTPS Magic Knock request to be handled by Knock Launchpad")
 		}
@@ -527,26 +546,55 @@ func TestKnockPortalAndSinglePortMultiplexerAndBridge(t *testing.T) {
 		t.Fatalf("expected downloadable .rdp profile with mypc.duckdns.org:3389 over HTTPS, got:\n%s", string(respBytes))
 	}
 
-	// Verify Auto-PAC endpoint over HTTPS and Launchpad HTML https:// links
+	// Verify Launchpad HTML https:// links, Root CA fingerprint, and Revoke link (with no proxy.pac)
 	c2, s2 := net.Pipe()
 	done2 := make(chan struct{})
 	go func() {
 		defer close(done2)
-		_, _, _ = inspectAndPrepareTCPConn(s2, sniMgr, true, 8096, mappings, nil)
+		_, _, _ = inspectAndPrepareTCPConn(s2, sniMgr, true, 8096, mappings)
 	}()
 	tlsClient2 := tls.Client(c2, &tls.Config{ServerName: "mypc.duckdns.org", InsecureSkipVerify: true})
 	_, _ = tlsClient2.Write([]byte("GET /__driftless_knock/testknocksecret123456 HTTP/1.1\r\nHost: mypc.duckdns.org:8096\r\n\r\n"))
 	launchpadBytes, _ := io.ReadAll(tlsClient2)
 	_ = tlsClient2.Close()
 	<-done2
-	if !strings.Contains(string(launchpadBytes), "https://mypc.duckdns.org:8096/__driftless_knock/testknocksecret123456/proxy.pac") {
-		t.Fatalf("expected Launchpad HTML to use https:// for proxy.pac URL, got:\n%s", string(launchpadBytes))
+	if !strings.Contains(string(launchpadBytes), "https://mypc.duckdns.org:8096/__driftless_knock/testknocksecret123456/revoke") {
+		t.Fatalf("expected Launchpad HTML to include https:// revoke link, got:\n%s", string(launchpadBytes))
 	}
 	if strings.Contains(string(launchpadBytes), "http://mypc.duckdns.org:8096/__driftless_knock/") {
 		t.Fatalf("expected zero http:// knock links in Launchpad HTML, got:\n%s", string(launchpadBytes))
 	}
 
-	// 4. Verify Smart Ephemeral Port Bridging in Standalone Mode when TargetPort is already bound
+	// Verify /revoke endpoint over HTTPS
+	cRev, sRev := net.Pipe()
+	doneRev := make(chan struct{})
+	go func() {
+		defer close(doneRev)
+		_, _, _ = inspectAndPrepareTCPConn(sRev, sniMgr, true, 8096, mappings)
+	}()
+	tlsClientRev := tls.Client(cRev, &tls.Config{ServerName: "mypc.duckdns.org", InsecureSkipVerify: true})
+	_, _ = tlsClientRev.Write([]byte("GET /__driftless_knock/testknocksecret123456/revoke?all=1 HTTP/1.1\r\nHost: mypc.duckdns.org:8096\r\n\r\n"))
+	revBytes, _ := io.ReadAll(tlsClientRev)
+	_ = tlsClientRev.Close()
+	<-doneRev
+	if !strings.Contains(string(revBytes), `"status":"revoked"`) {
+		t.Fatalf("expected /revoke endpoint to return revoked status JSON, got:\n%s", string(revBytes))
+	}
+
+	// 5. Verify 2-second UDP replay freshness window drops stale UDP packets while replaying fresh ones
+	us := &gwUDPSession{id: 901, targetPort: 51820}
+	us.mu.Lock()
+	us.enqueuePacketLocked([]byte("stale-udp-pkt"))
+	us.pendingAt[0] = time.Now().Add(-3 * time.Second) // older than maxUDPReplayAge (2s)
+	us.enqueuePacketLocked([]byte("fresh-udp-pkt"))
+	det := us.detachPendingForReplayLocked()
+	us.mu.Unlock()
+	if len(det) != 1 || string(det[0]) != "fresh-udp-pkt" {
+		t.Fatalf("expected stale UDP packet (>2s) to be dropped and only fresh-udp-pkt retained, got %d packets", len(det))
+	}
+	globalUDPBufferedBytes.Add(-int64(len(det[0])))
+
+	// 6. Verify Smart Ephemeral Port Bridging in Standalone Mode when TargetPort is already bound
 	backendLn, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		t.Fatal(err)
@@ -590,4 +638,5 @@ func TestKnockPortalAndSinglePortMultiplexerAndBridge(t *testing.T) {
 		t.Fatalf("expected BRIDGED-OK through standalone ephemeral bridge port %d -> %d, got %q (err=%v)", bridgedPort, occupiedPort, string(gotBridge), err)
 	}
 }
+
 

@@ -478,6 +478,8 @@ func tryReserveGlobalUDPMemory(delta, maxGlobal int64) bool {
 	}
 }
 
+const maxUDPReplayAge = 2 * time.Second
+
 type gwUDPSession struct {
 	id          uint64
 	targetPort  uint16
@@ -486,9 +488,25 @@ type gwUDPSession struct {
 	mu          sync.Mutex
 	stream      TunnelStream
 	pendingPkts [][]byte
+	pendingAt   []time.Time
 	queuedBytes int64
 	lastActive  time.Time
 	dialing     atomic.Bool
+}
+
+func (us *gwUDPSession) dropOldestPendingLocked() {
+	if len(us.pendingPkts) == 0 {
+		return
+	}
+	droppedLen := int64(len(us.pendingPkts[0]))
+	us.pendingPkts[0] = nil
+	us.pendingPkts = us.pendingPkts[1:]
+	if len(us.pendingAt) > 0 {
+		us.pendingAt = us.pendingAt[1:]
+	}
+	us.queuedBytes -= droppedLen
+	globalUDPBufferedBytes.Add(-droppedLen)
+	metricUDPDroppedTotal.Add(1)
 }
 
 func (us *gwUDPSession) enqueuePacketLocked(pkt []byte) {
@@ -497,41 +515,53 @@ func (us *gwUDPSession) enqueuePacketLocked(pkt []byte) {
 		metricUDPDroppedTotal.Add(1)
 		return
 	}
+	now := time.Now()
+	for len(us.pendingPkts) > 0 && len(us.pendingAt) > 0 && now.Sub(us.pendingAt[0]) > maxUDPReplayAge {
+		us.dropOldestPendingLocked()
+	}
 	cp := append([]byte(nil), pkt...)
 	metricUDPQueuedTotal.Add(1)
 	for len(us.pendingPkts) > 0 && (len(us.pendingPkts) >= maxUDPBufferedPkts || us.queuedBytes+pktLen > maxPerSessionUDPBytes) {
-		droppedLen := int64(len(us.pendingPkts[0]))
-		us.pendingPkts[0] = nil
-		us.pendingPkts = us.pendingPkts[1:]
-		us.queuedBytes -= droppedLen
-		globalUDPBufferedBytes.Add(-droppedLen)
-		metricUDPDroppedTotal.Add(1)
+		us.dropOldestPendingLocked()
 	}
 	for !tryReserveGlobalUDPMemory(pktLen, maxGlobalUDPBufferBytes) {
 		if len(us.pendingPkts) == 0 {
 			metricUDPDroppedTotal.Add(1)
 			return
 		}
-		droppedLen := int64(len(us.pendingPkts[0]))
-		us.pendingPkts[0] = nil
-		us.pendingPkts = us.pendingPkts[1:]
-		us.queuedBytes -= droppedLen
-		globalUDPBufferedBytes.Add(-droppedLen)
-		metricUDPDroppedTotal.Add(1)
+		us.dropOldestPendingLocked()
 	}
 	us.pendingPkts = append(us.pendingPkts, cp)
+	us.pendingAt = append(us.pendingAt, now)
 	us.queuedBytes += pktLen
 }
 
-// detachPendingForReplayLocked detaches the queued packets for stream replay while keeping their
-// bytes reserved in globalUDPBufferedBytes until each packet is actually written or dropped.
+// detachPendingForReplayLocked detaches fresh queued packets (<= maxUDPReplayAge) for stream replay
+// while immediately releasing stale packets so outdated datagrams are never replayed after a long outage.
 func (us *gwUDPSession) detachPendingForReplayLocked() [][]byte {
 	if len(us.pendingPkts) == 0 {
 		return nil
 	}
-	out := us.pendingPkts
+	now := time.Now()
+	rawPkts := us.pendingPkts
+	rawAt := us.pendingAt
 	us.pendingPkts = nil
+	us.pendingAt = nil
 	us.queuedBytes = 0
+
+	out := make([][]byte, 0, len(rawPkts))
+	for i, pkt := range rawPkts {
+		rawPkts[i] = nil
+		if pkt == nil {
+			continue
+		}
+		if i < len(rawAt) && !rawAt[i].IsZero() && now.Sub(rawAt[i]) > maxUDPReplayAge {
+			globalUDPBufferedBytes.Add(-int64(len(pkt)))
+			metricUDPDroppedTotal.Add(1)
+			continue
+		}
+		out = append(out, pkt)
+	}
 	return out
 }
 
@@ -539,12 +569,15 @@ func (us *gwUDPSession) restoreUnsentReplayLocked(unsent [][]byte) {
 	if len(unsent) == 0 {
 		return
 	}
+	now := time.Now()
 	combined := make([][]byte, 0, len(unsent)+len(us.pendingPkts))
+	combinedAt := make([]time.Time, 0, len(unsent)+len(us.pendingPkts))
 	var addedBytes int64
 	for i, pkt := range unsent {
 		unsent[i] = nil
 		if pkt != nil {
 			combined = append(combined, pkt)
+			combinedAt = append(combinedAt, now)
 			addedBytes += int64(len(pkt))
 		}
 	}
@@ -552,17 +585,18 @@ func (us *gwUDPSession) restoreUnsentReplayLocked(unsent [][]byte) {
 		us.pendingPkts[i] = nil
 		if pkt != nil {
 			combined = append(combined, pkt)
+			if i < len(us.pendingAt) {
+				combinedAt = append(combinedAt, us.pendingAt[i])
+			} else {
+				combinedAt = append(combinedAt, now)
+			}
 		}
 	}
 	us.pendingPkts = combined
+	us.pendingAt = combinedAt
 	us.queuedBytes += addedBytes
 	for len(us.pendingPkts) > 0 && (len(us.pendingPkts) > maxUDPBufferedPkts || us.queuedBytes > maxPerSessionUDPBytes) {
-		droppedLen := int64(len(us.pendingPkts[0]))
-		us.pendingPkts[0] = nil
-		us.pendingPkts = us.pendingPkts[1:]
-		us.queuedBytes -= droppedLen
-		globalUDPBufferedBytes.Add(-droppedLen)
-		metricUDPDroppedTotal.Add(1)
+		us.dropOldestPendingLocked()
 	}
 }
 
@@ -602,6 +636,7 @@ func (us *gwUDPSession) releasePendingLocked() {
 		us.queuedBytes = 0
 	}
 	us.pendingPkts = nil
+	us.pendingAt = nil
 }
 
 // writeUDPPacket uses udpFramePool to combine the 2-byte length header and payload into a single
@@ -669,8 +704,24 @@ type agentUDPSession struct {
 	mu          sync.Mutex
 	stream      TunnelStream
 	pendingPkts [][]byte
+	pendingAt   []time.Time
 	queuedBytes int64
 	lastActive  time.Time
+}
+
+func (u *agentUDPSession) dropOldestPendingLocked() {
+	if len(u.pendingPkts) == 0 {
+		return
+	}
+	droppedLen := int64(len(u.pendingPkts[0]))
+	u.pendingPkts[0] = nil
+	u.pendingPkts = u.pendingPkts[1:]
+	if len(u.pendingAt) > 0 {
+		u.pendingAt = u.pendingAt[1:]
+	}
+	u.queuedBytes -= droppedLen
+	globalUDPBufferedBytes.Add(-droppedLen)
+	metricUDPDroppedTotal.Add(1)
 }
 
 func (u *agentUDPSession) enqueuePacketLocked(pkt []byte) {
@@ -679,29 +730,24 @@ func (u *agentUDPSession) enqueuePacketLocked(pkt []byte) {
 		metricUDPDroppedTotal.Add(1)
 		return
 	}
+	now := time.Now()
+	for len(u.pendingPkts) > 0 && len(u.pendingAt) > 0 && now.Sub(u.pendingAt[0]) > maxUDPReplayAge {
+		u.dropOldestPendingLocked()
+	}
 	cp := append([]byte(nil), pkt...)
 	metricUDPQueuedTotal.Add(1)
 	for len(u.pendingPkts) > 0 && (len(u.pendingPkts) >= maxUDPBufferedPkts || u.queuedBytes+pktLen > maxPerSessionUDPBytes) {
-		droppedLen := int64(len(u.pendingPkts[0]))
-		u.pendingPkts[0] = nil
-		u.pendingPkts = u.pendingPkts[1:]
-		u.queuedBytes -= droppedLen
-		globalUDPBufferedBytes.Add(-droppedLen)
-		metricUDPDroppedTotal.Add(1)
+		u.dropOldestPendingLocked()
 	}
 	for !tryReserveGlobalUDPMemory(pktLen, maxGlobalUDPBufferBytes) {
 		if len(u.pendingPkts) == 0 {
 			metricUDPDroppedTotal.Add(1)
 			return
 		}
-		droppedLen := int64(len(u.pendingPkts[0]))
-		u.pendingPkts[0] = nil
-		u.pendingPkts = u.pendingPkts[1:]
-		u.queuedBytes -= droppedLen
-		globalUDPBufferedBytes.Add(-droppedLen)
-		metricUDPDroppedTotal.Add(1)
+		u.dropOldestPendingLocked()
 	}
 	u.pendingPkts = append(u.pendingPkts, cp)
+	u.pendingAt = append(u.pendingAt, now)
 	u.queuedBytes += pktLen
 }
 
@@ -709,9 +755,26 @@ func (u *agentUDPSession) detachPendingForReplayLocked() [][]byte {
 	if len(u.pendingPkts) == 0 {
 		return nil
 	}
-	out := u.pendingPkts
+	now := time.Now()
+	rawPkts := u.pendingPkts
+	rawAt := u.pendingAt
 	u.pendingPkts = nil
+	u.pendingAt = nil
 	u.queuedBytes = 0
+
+	out := make([][]byte, 0, len(rawPkts))
+	for i, pkt := range rawPkts {
+		rawPkts[i] = nil
+		if pkt == nil {
+			continue
+		}
+		if i < len(rawAt) && !rawAt[i].IsZero() && now.Sub(rawAt[i]) > maxUDPReplayAge {
+			globalUDPBufferedBytes.Add(-int64(len(pkt)))
+			metricUDPDroppedTotal.Add(1)
+			continue
+		}
+		out = append(out, pkt)
+	}
 	return out
 }
 
@@ -719,12 +782,15 @@ func (u *agentUDPSession) restoreUnsentReplayLocked(unsent [][]byte) {
 	if len(unsent) == 0 {
 		return
 	}
+	now := time.Now()
 	combined := make([][]byte, 0, len(unsent)+len(u.pendingPkts))
+	combinedAt := make([]time.Time, 0, len(unsent)+len(u.pendingPkts))
 	var addedBytes int64
 	for i, pkt := range unsent {
 		unsent[i] = nil
 		if pkt != nil {
 			combined = append(combined, pkt)
+			combinedAt = append(combinedAt, now)
 			addedBytes += int64(len(pkt))
 		}
 	}
@@ -732,17 +798,18 @@ func (u *agentUDPSession) restoreUnsentReplayLocked(unsent [][]byte) {
 		u.pendingPkts[i] = nil
 		if pkt != nil {
 			combined = append(combined, pkt)
+			if i < len(u.pendingAt) {
+				combinedAt = append(combinedAt, u.pendingAt[i])
+			} else {
+				combinedAt = append(combinedAt, now)
+			}
 		}
 	}
 	u.pendingPkts = combined
+	u.pendingAt = combinedAt
 	u.queuedBytes += addedBytes
 	for len(u.pendingPkts) > 0 && (len(u.pendingPkts) > maxUDPBufferedPkts || u.queuedBytes > maxPerSessionUDPBytes) {
-		droppedLen := int64(len(u.pendingPkts[0]))
-		u.pendingPkts[0] = nil
-		u.pendingPkts = u.pendingPkts[1:]
-		u.queuedBytes -= droppedLen
-		globalUDPBufferedBytes.Add(-droppedLen)
-		metricUDPDroppedTotal.Add(1)
+		u.dropOldestPendingLocked()
 	}
 }
 
@@ -780,4 +847,5 @@ func (u *agentUDPSession) releasePendingLocked() {
 		u.queuedBytes = 0
 	}
 	u.pendingPkts = nil
+	u.pendingAt = nil
 }

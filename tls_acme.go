@@ -42,14 +42,16 @@ func (p *peekedConn) Read(b []byte) (int, error) {
 }
 
 type SNICertManager struct {
-	mu             sync.RWMutex
-	certDir        string
-	certFile       string
-	keyFile        string
-	caCert         *x509.Certificate
-	caKey          ed25519.PrivateKey
-	cache          map[string]*tls.Certificate
-	static         *tls.Certificate
+	mu                    sync.RWMutex
+	certDir               string
+	certFile              string
+	keyFile               string
+	caCert                *x509.Certificate
+	caKey                 ed25519.PrivateKey
+	caPEM                 []byte
+	caFingerprint         string
+	cache                 map[string]*tls.Certificate
+	static                *tls.Certificate
 	defaultDomain         string
 	enableACME            bool
 	allowSelfSignedPublic bool
@@ -86,6 +88,29 @@ func newSNICertManager(certDir, certFile, keyFile string) (*SNICertManager, erro
 		return m, nil
 	}
 
+	caCertPath := filepath.Join(certDir, "ca-root.crt")
+	caKeyPath := filepath.Join(certDir, "ca-root.key")
+	if certBytes, errC := os.ReadFile(caCertPath); errC == nil {
+		if keyBytes, errK := os.ReadFile(caKeyPath); errK == nil {
+			if cBlock, _ := pem.Decode(certBytes); cBlock != nil {
+				if kBlock, _ := pem.Decode(keyBytes); kBlock != nil {
+					if parsedCA, errP := x509.ParseCertificate(cBlock.Bytes); errP == nil && time.Now().Before(parsedCA.NotAfter) {
+						if parsedKey, errPK := x509.ParsePKCS8PrivateKey(kBlock.Bytes); errPK == nil {
+							if edKey, ok := parsedKey.(ed25519.PrivateKey); ok {
+								sum := sha256.Sum256(parsedCA.Raw)
+								m.caCert = parsedCA
+								m.caKey = edKey
+								m.caPEM = certBytes
+								m.caFingerprint = hex.EncodeToString(sum[:])
+								return m, nil
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
@@ -107,8 +132,18 @@ func newSNICertManager(certDir, certFile, keyFile string) (*SNICertManager, erro
 	if err != nil {
 		return nil, err
 	}
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	if privDER, errM := x509.MarshalPKCS8PrivateKey(priv); errM == nil {
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER})
+		_ = os.MkdirAll(certDir, 0o700)
+		_ = writeFileAtomic0600(caCertPath, caPEM)
+		_ = writeFileAtomic0600(caKeyPath, keyPEM)
+	}
+	sum := sha256.Sum256(caCert.Raw)
 	m.caCert = caCert
 	m.caKey = priv
+	m.caPEM = caPEM
+	m.caFingerprint = hex.EncodeToString(sum[:])
 	return m, nil
 }
 

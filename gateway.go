@@ -167,7 +167,7 @@ func runGateway(ctx context.Context, quicAddr, token, directHTTPAddr, vhostAddr,
 		sniMgr.enableACME = true
 	}
 	if defaultKnockController != nil {
-		sniMgr.allowSelfSignedPublic = true
+		defaultKnockController.SetRootCA(sniMgr.caPEM, sniMgr.caFingerprint)
 		enableTLS = true
 	}
 	sniMgr.startRenewalScheduler(ctx)
@@ -498,6 +498,10 @@ func (gw *Gateway) handleVHostClient(rawConn net.Conn, vhostMap map[string]uint1
 		_ = c.Close()
 		return
 	}
+	if defaultKnockController != nil && !defaultKnockController.IsAllowedPort(rawConn.RemoteAddr(), targetPort) {
+		_ = c.Close()
+		return
+	}
 
 	gw.startResumableSession(c, targetPort, captured.Bytes())
 }
@@ -534,7 +538,7 @@ func (gw *Gateway) listenPublicUDPPort(ctx context.Context, m PortMapping) error
 				}
 				continue
 			}
-			if n == 0 || !gw.ipACL.AllowedAddr(clientAddr) || (defaultKnockController != nil && !defaultKnockController.IsAllowedAddr(clientAddr)) {
+			if n == 0 || !gw.ipACL.AllowedAddr(clientAddr) || (defaultKnockController != nil && !defaultKnockController.IsAllowedPort(clientAddr, m.TargetPort) && !defaultKnockController.IsAllowedPort(clientAddr, m.PublicPort)) {
 				continue
 			}
 			pkt := append([]byte(nil), buf[:n]...)
@@ -1072,9 +1076,7 @@ func (gw *Gateway) listenPublicPort(ctx context.Context, m PortMapping) error {
 					initData = formatProxyProtoV1(raw.RemoteAddr(), raw.LocalAddr())
 				}
 				if defaultKnockController != nil || len(gw.mappings) > 1 {
-					wrapped, resolvedTarget, handled := inspectAndPrepareTCPConn(raw, gw.sniMgr, useTLS, m.TargetPort, gw.mappings, func(proxyConn net.Conn, targetPort uint16, _ string) {
-						gw.startResumableSession(proxyConn, targetPort, initData)
-					})
+					wrapped, resolvedTarget, handled := inspectAndPrepareTCPConn(raw, gw.sniMgr, useTLS, m.TargetPort, gw.mappings)
 					if handled {
 						return
 					}

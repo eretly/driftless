@@ -1938,7 +1938,7 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 		}
 	}
 	if defaultKnockController != nil {
-		sniMgr.allowSelfSignedPublic = true
+		defaultKnockController.SetRootCA(sniMgr.caPEM, sniMgr.caFingerprint)
 		cfg.EnableTLS = true
 	}
 	if cfg.DDNS.Domain != "" {
@@ -2167,7 +2167,7 @@ func startStandaloneTCP(ctx context.Context, targetHost string, m *PortMapping, 
 				}
 
 				if defaultKnockController != nil || len(allMappings) > 1 {
-					wrapped, resolvedPort, handled := inspectAndPrepareTCPConn(inConn, sniMgr, useTLS, defTargetPort, allMappings, dialLocalOrLAN)
+					wrapped, resolvedPort, handled := inspectAndPrepareTCPConn(inConn, sniMgr, useTLS, defTargetPort, allMappings)
 					if handled {
 						return
 					}
@@ -2236,7 +2236,7 @@ func startStandaloneUDP(ctx context.Context, targetHost string, m *PortMapping) 
 				}
 				continue
 			}
-			if !defaultIPACL.AllowedAddr(clientAddr) || (defaultKnockController != nil && !defaultKnockController.IsAllowedAddr(clientAddr)) {
+			if !defaultIPACL.AllowedAddr(clientAddr) || (defaultKnockController != nil && !defaultKnockController.IsAllowedPort(clientAddr, dstPort) && !defaultKnockController.IsAllowedPort(clientAddr, m.PublicPort)) {
 				continue
 			}
 			key := clientAddr.String()
@@ -2360,6 +2360,9 @@ func startStandaloneVHost(ctx context.Context, listenAddr, targetHost string, vh
 				targetPort, ok := matchVHostTarget(vhostMap, host, req.URL.Path)
 				if !ok {
 					_, _ = wrapped.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Length: 21\r\nConnection: close\r\n\r\ndriftless: unknown host"))
+					return
+				}
+				if defaultKnockController != nil && !defaultKnockController.IsAllowedPort(raw.RemoteAddr(), targetPort) {
 					return
 				}
 				outConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", targetHost, targetPort), 5*time.Second)

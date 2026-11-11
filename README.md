@@ -17,7 +17,7 @@ When you run a game server, media server, local LLM, or website on your Home PC,
 
 `driftless` fixes both:
 - When your home IP changes, active TCP connections are held in a 16 MB RAM ring buffer and resume from the exact byte offset without dropping.
-- Active UDP game and voice sessions keep their port mapping and buffer up to 1024 datagrams while the link reconnects, so players do not get kicked from the server.
+- Active UDP game and voice sessions keep their port mapping and buffer brief link blips (up to 1024 datagrams within a strict 2-second freshness window so stale packets are never replayed after a long outage).
 
 ---
 
@@ -113,12 +113,12 @@ Open the ports for the apps you use (`22` for WebSSH/SSH, `7070` for AnyDesk dir
 #### 2. Optional Stealth Mode (`-knock`)
 If you want ports `22`, `3389`, and `7070` to stay **completely invisible and closed** to bots and scanners until you unlock them from your phone, add `-knock`:
 ```powershell
-.\driftless-windows-amd64.exe standalone -ports 8096,3389,22,7070 -duck -knock
+.\driftless-windows-amd64.exe standalone -ports 8096,3389,22,7070 -duck mypc:YOUR_TOKEN -knock
 ```
 What `-knock` does:
-1. **Mandatory HTTPS/TLS:** Enabling `-knock` automatically activates TLS on your ports and rejects unencrypted `http://` knock requests (`400 Bad Request`), so your knock secret is never sent in cleartext.
-2. **1-Tap Unlock for Native Apps:** On startup, `driftless` prints an `https://` Magic Link (`https://mypc.duckdns.org:8096/__driftless_knock/SECRET`). Tap that bookmark once on your phone to unlock your phone's IP for 24 hours, and then connect normally through **WebSSH**, **AnyDesk**, or **Windows App**.
-3. **Single-Port Universal Routing:** Even on restricted Wi-Fi where only one port (e.g. `8096`) is open, you can enter port `8096` directly inside **WebSSH** or **Windows App** and `driftless` automatically routes SSH (`SSH-2.0-`) to `:22` and RDP (`0x03 0x00`) to `:3389`.
+1. **Mandatory HTTPS/TLS & Let's Encrypt:** Enabling `-knock` automatically activates TLS and rejects unencrypted `http://` knock requests (`400 Bad Request`). On a public domain (such as `mypc.duckdns.org`), `driftless` obtains a real Let's Encrypt certificate (via DNS-01 or TLS-ALPN-01) and never silently downgrades to an untrusted self-signed certificate. For raw IP mode without a domain, `driftless` persists a local Root CA (`.driftless-certs/ca-root.crt`) and provides a 1-tap `/ca.crt` download + SHA-256 fingerprint so you can install/verify the CA once and prevent MITM.
+2. **Short 1-Hour TTL, Per-Port Scope & Instant Revocation:** Opening the `https://` Magic Link unlocks your phone's IP for 1 hour by default (`-knock-ttl 1h`), scoped strictly to your mapped ports (no LAN pivoting or open proxy). You can unlock a single port only by adding `?port=22` (`/__driftless_knock/SECRET?port=22`), or revoke access immediately at any time with 1 tap (`/__driftless_knock/SECRET/revoke` or `/revoke?all=1`).
+3. **Single-Port Universal Routing:** Even on restricted Wi-Fi where only one port (e.g. `8096`) is open, you can enter port `8096` directly inside **WebSSH** or **Windows App** and `driftless` automatically routes SSH (`SSH-2.0-`) to `:22` and RDP (`0x03 0x00`) to `:3389` (when that port is unlocked for your IP).
 
 ---
 
@@ -141,7 +141,7 @@ What `-knock` does:
 - **QUIC + automatic TCP-Mux fallback (`-transport auto`):** Uses multiplexed QUIC (`UDP :4242`) by default and falls back to multiplexed TLS over TCP (`TCP :4242`) when UDP is blocked by firewalls or strict NATs.
 - **Multi-Gateway failover:** Pass multiple VPS addresses in `-quic vps1:4242,vps2:4242` for automatic failover.
 - **TCP + UDP by default:** Every port in `-ports` forwards both TCP and UDP automatically.
-- **Zero-Client Mobile Knock & Single-Port Protocol Router (`-knock`):** Keep all TCP/UDP ports stealthed until unlocked by a 1-tap bookmark on your phone, download auto-configured `.rdp` / `proxy.pac` profiles, and route SSH, RDP, HTTP, and SOCKS5 over a single open port.
+- **Zero-Client Mobile Knock & Single-Port Protocol Router (`-knock`):** Keep all TCP/UDP ports stealthed until unlocked by an HTTPS bookmark on your phone (1h default TTL, per-port `?port=22` support, and 1-tap `/revoke`), download auto-configured `.rdp` profiles, and route SSH, RDP, and HTTP over a single open port.
 - **Smart Ephemeral Port Bridging (`standalone`):** If a local service (`3389`, `8096`, `25565`) is already listening on `0.0.0.0` on your Home PC, `standalone` mode automatically bridges router UPnP / NAT-PMP / PCP v2 external ports to an internal ephemeral listener so `-tls`, `-knock`, and `-allow-ips` work without port conflicts.
 - **Built-in HTTPS and ACME certificates:** Obtains Let's Encrypt certificates (on `:443` via TLS-ALPN-01, `:80` via HTTP-01, or via DuckDNS DNS-01), reuses existing certificates from disk without recreating them, and renews them in the background (< 30 days left).
 - **Direct LAN bypass on home Wi-Fi (`-direct :8888`):** When connecting from your phone or laptop on the same home Wi-Fi, traffic goes directly over your local network (`192.168.x.x`) at full LAN speed instead of hair-pinning through the VPS.
@@ -160,9 +160,9 @@ What `-knock` does:
 | `-token` | auto | Shared password or comma-separated rotation list (`"new_tok,old_tok"`). |
 | `-fingerprint` | `""` | VPS certificate fingerprint (included in the generated client command). |
 | `-duck` | `""` | Optional domain + certificate flag (`-duck` or `-duck subdomain:token`). Off by default. |
-| `-knock` | `false` | Enable Zero-Client Mobile Knock stealth gatekeeper, `.rdp` launchpad, and SOCKS5/PAC proxy. |
+| `-knock` | `false` | Enable HTTPS Mobile Knock stealth gatekeeper (per-port unlock, instant IP revoke, `.rdp` / `ssh://` launchpad). |
 | `-knock-token` | auto | Optional custom secret for `-knock` Magic Link (auto-generated and saved if omitted). |
-| `-knock-ttl` | `24h` | How long a phone/device IP stays unlocked after opening the Magic Knock Link. |
+| `-knock-ttl` | `1h` | How long a phone/device IP stays unlocked after opening the Magic Knock Link (default `1h`). |
 | `-tls` | `false` | Enable HTTPS on all ports in `-ports`. |
 | `-vhosts` | `""` | Route domains and paths to local ports: `"site.com:3000,site.com/api:4000,*.site.com:5000"`. |
 | `-vhost-addr` / `-https` | `":80"` / `""` | HTTP and HTTPS ports for `-vhosts`. |
@@ -207,7 +207,7 @@ Run `./driftless server -ports 25565,8096` on any cheap VPS and run the printed 
 Standard tunnels tie each public TCP stream directly to the underlying tunnel socket. When your ISP rotates your IP or PPPoE reconnects, the socket closes and every active download, video stream, or SSH session gets a `connection reset`. `driftless` decouples public sessions from the tunnel link using a 16 MB per-session ring buffer (`Session-Resume`) and replays unacknowledged bytes as soon as the agent reconnects from the new IP.
 
 **Can I forward UDP game servers (CS2, Rust, Valheim, Minecraft Bedrock)?**
-Yes. Unlike HTTP-only tunnels (`Cloudflare Tunnel`, free `ngrok`), `driftless` forwards both TCP and UDP on every port by default and preserves per-client UDP port mappings across brief reconnects.
+Yes. Unlike HTTP-only tunnels (`Cloudflare Tunnel`, free `ngrok`), `driftless` forwards both TCP and UDP on every port by default, preserves per-client UDP port mappings across brief link blips, and enforces a 2-second packet freshness window so stale UDP datagrams are discarded rather than replayed after a longer disconnect (note that UDP itself does not guarantee packet delivery or order, so surviving multi-second outages depends on the game server's own client timeout).
 
 ---
 
@@ -226,7 +226,7 @@ Yes. Unlike HTTP-only tunnels (`Cloudflare Tunnel`, free `ngrok`), `driftless` f
 
 Как это решает `driftless`:
 - При смене IP активные TCP-соединения (стримы, загрузки, сайты, SSH) удерживаются в кольцевом буфере памяти (16 МБ) и продолжают передачу с точного байта без разрыва.
-- Для UDP (игры, голосовой чат) сохраняется привязка порта и буферизуются пакеты (до 1024 датаграмм на поток) на время короткого переподключения, чтобы игроков не выкидывало с сервера.
+- Для UDP (игры, голосовой чат) сохраняется привязка порта и буферизуются свежие пакеты (до 1024 датаграмм в окне свежести до 2 секунд) на время короткого переключения связи, при этом устаревшие пакеты старше 2 секунд автоматически отбрасываются.
 
 ---
 
@@ -327,12 +327,12 @@ Windows:
 #### 2. По желанию: Стелс-защита портов (`-knock`)
 Если не хочешь держать порты `22` (SSH) или `3389` (RDP) открытыми для всего интернета и ботов, добавь флаг `-knock`:
 ```powershell
-.\driftless-windows-amd64.exe standalone -ports 8096,3389,22,7070 -duck -knock
+.\driftless-windows-amd64.exe standalone -ports 8096,3389,22,7070 -duck mypc:ТВОЙ_ТОКЕН -knock
 ```
 Что дает `-knock`:
-1. **Обязательный HTTPS/TLS:** При включении `-knock` программа автоматически включает шифрование TLS и отклоняет незашифрованные `http://` запросы (`400 Bad Request`), поэтому секретный ключ в ссылке никогда не передается по сети открытым текстом.
-2. **Разблокировка для WebSSH и AnyDesk в 1 тап:** Для всего интернета порты `22`, `3389`, `7070` выглядят полностью закрытыми. При запуске `driftless` выводит `https://` ссылку (`https://mypc.duckdns.org:8096/__driftless_knock/СЕКРЕТ`). Один раз тапни по ней из закладок на айфоне - твой мобильный IP разблокируется на 24 часа, после чего ты спокойно заходишь через **WebSSH**, **AnyDesk** или **Windows App**.
-3. **Вход в WebSSH и RDP даже через один чужой порт:** Если ты в сети, где открыт только один порт (например `8096`), ты можешь в самом приложении **WebSSH** указать порт `8096` вместо `22` - `driftless` по первым байтам поймет, что это SSH, и сам перекинет соединение на `22` порт твоего ПК.
+1. **Обязательный HTTPS/TLS и защита от MITM:** При включении `-knock` программа автоматически включает шифрование TLS и отклоняет незашифрованные `http://` запросы (`400 Bad Request`). Для публичного домена (например `mypc.duckdns.org`) выпускается настоящий доверенный сертификат Let's Encrypt (через DNS-01 или TLS-ALPN-01) без тихого отката на самоподписанный сертификат. Если же подключаешься по IP без домена, программа сохраняет постоянный корневой сертификат (`.driftless-certs/ca-root.crt`) и показывает его SHA-256 отпечаток + кнопку скачивания `/ca.crt`, чтобы его можно было один раз установить на телефон.
+2. **Короткий TTL (1 час), отдельные разрешения по портам и мгновенный отзыв IP:** Переход по `https://` ссылке открывает доступ для твоего мобильного IP по умолчанию на 1 час (`-knock-ttl 1h`) и только к указанным портам (без прокси в домашнюю локалку `192.168.x.x` и роутер). Можно разблокировать только один конкретный порт через `?port=22` (`/__driftless_knock/СЕКРЕТ?port=22`), а после работы мгновенно закрыть доступ одной кнопкой (`/__driftless_knock/СЕКРЕТ/revoke` или `/revoke?all=1`).
+3. **Вход в WebSSH и RDP даже через один чужой порт:** Если ты в сети, где открыт только один порт (например `8096`), ты можешь в самом приложении **WebSSH** указать порт `8096` вместо `22` - `driftless` по первым байтам поймет, что это SSH, и сам перекинет соединение на `22` порт твоего ПК (если порт `22` разблокирован для твоего IP).
 
 ---
 
@@ -342,7 +342,7 @@ Windows:
 | :--- | :--- |
 | **Игровой сервер (Minecraft, CS2, Rust, Valheim, Palworld)** - TCP и UDP | `./driftless server -ports 25565,27015` |
 | **Медиасервер (Jellyfin / Plex / Home Assistant)** | `./driftless server -ports 8096,8123` |
-| **Рабочий стол Windows + SSH с телефона по секретной ссылке** | `./driftless standalone -ports 8096,3389,22 -duck -knock` |
+| **Рабочий стол Windows + SSH с телефона по секретной ссылке** | `./driftless standalone -ports 8096,3389,22 -duck mypc:ТОКЕН -knock` |
 | **Свой сайт / API** (порт 80 на ВПС -> порт 3000 дома) | `./driftless server -ports 80:3000` |
 | **Нейронка (Ollama / OpenWebUI)** с HTTPS | `./driftless server -ports 443:11434/https,3000` |
 | **Несколько сайтов и путей на разных доменах** (авто-HTTPS Let's Encrypt) | `./driftless server -vhosts site.ru:3000,site.ru/api:4000,media.site.ru:8096 -vhost-addr :80 -https :443` |
@@ -355,7 +355,7 @@ Windows:
 - **Автовыбор транспорта QUIC / TCP-Mux (`-transport auto`):** По умолчанию работает по QUIC (`UDP :4242`), а если провайдер или корпоративный файрвол блокирует UDP, сам переключается на мультиплексирование потоков поверх одного TLS/TCP-соединения (`TCP :4242`).
 - **Резервирование ВПС (Multi-Gateway):** В `-quic` можно указать несколько серверов через запятую (`-quic vps1:4242,vps2:4242`) для авто-переключения при падении узла.
 - **TCP и UDP открываются сразу:** Игры и голосовой чат работают без ручного дописывания `/udp`.
-- **Стелс-доступ с телефона и мультиплексор одного порта (`-knock`):** Держит все порты закрытыми от ботов до перехода по секретной закладке с телефона, генерирует готовый `.rdp`-профиль и `proxy.pac`, а также умеет принимать HTTP, HTTPS, SSH, RDP и SOCKS5 на одном-единственном открытом порту.
+- **Стелс-доступ с телефона и мультиплексор одного порта (`-knock`):** Держит все порты закрытыми от ботов до перехода по секретной HTTPS-закладке с телефона (TTL 1 час по умолчанию, разблокировка отдельных портов `?port=22` и мгновенный отзыв `/revoke`), генерирует готовый `.rdp`-профиль и умеет принимать HTTP, HTTPS, SSH и RDP на одном открытом порту.
 - **Умный мост занятых портов (`standalone`):** Если на домашнем ПК порт (например `3389`, `8096` или `25565`) уже занят самой локальной программой на `0.0.0.0`, режим `standalone` не падает с ошибкой `address already in use`, а сам поднимает локальный мост и пробрасывает внешний порт роутера (UPnP / NAT-PMP / PCP v2) через защиту `-knock`, `-tls` и `-allow-ips`.
 - **Сертификаты и HTTPS:** Авто-получение Let's Encrypt (через `:443` TLS-ALPN-01, `:80` HTTP-01 или DNS-01). Если сертификат уже лежит на диске, программа берет его без пересоздания и заранее продлевает в фоне (когда остается меньше 30 дней).
 - **Полная скорость дома по Wi-Fi (`-direct :8888`):** Когда заходишь на сервер с телефона или ноутбука из дома (в одной сети с ПК), трафик идет напрямую через домашний роутер (`192.168.x.x`) на скорости локальной сети в обход ВПС.
@@ -374,9 +374,9 @@ Windows:
 | `-token` | создается сам | Общий пароль (или список паролей через запятую для ротации `"новый,старый"`). |
 | `-fingerprint` | `""` | Отпечаток сертификата ВПС (сам подставляется в готовую команду). |
 | `-duck` | `""` | Опция авто-домена и сертификата (`-duck` или `-duck домен:токен`). По умолчанию выключена. |
-| `-knock` | `false` | Включить стелс-защиту и вход с телефона по секретной ссылке (панель запуска `.rdp`, `ssh://`, SOCKS5/PAC). |
+| `-knock` | `false` | Включить HTTPS стелс-защиту портов по секретной ссылке (разблокировка отдельных портов `?port=22`, кнопка отзыва `/revoke`, `.rdp` и `ssh://`). |
 | `-knock-token` | создается сам | Свой секретный ключ для ссылки `-knock` (если не указать, создается и сохраняется сам). |
-| `-knock-ttl` | `24h` | На сколько часов открывать доступ для IP телефона после перехода по секретной ссылке. |
+| `-knock-ttl` | `1h` | На сколько времени открывать доступ для IP телефона после перехода по секретной ссылке (по умолчанию `1h`). |
 | `-tls` | `false` | Включить HTTPS сразу на всех открытых портах. |
 | `-vhosts` | `""` | Раздавать сайты по доменам и путям: `"site.ru:3000,site.ru/api:4000,*.site.ru:5000"`. |
 | `-vhost-addr` / `-https` | `":80"` / `""` | Порты HTTP и HTTPS для доменного режима (`-vhosts`). |
