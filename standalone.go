@@ -239,13 +239,14 @@ type upnpEndpoint struct {
 
 type trackedRouterMapping struct {
 	InstanceID  string `json:"instance_id,omitempty"`
-	Kind        string `json:"kind"` // "upnp" or "natpmp"
+	Kind        string `json:"kind"` // "upnp", "natpmp", or "pcp"
 	CtrlURL     string `json:"ctrl_url,omitempty"`
 	ServiceType string `json:"service_type,omitempty"`
 	GatewayIP   string `json:"gateway_ip,omitempty"`
 	LANIP       string `json:"lan_ip,omitempty"`
 	Port        uint16 `json:"port"`
 	Proto       string `json:"proto"`
+	PCPNonce    string `json:"pcp_nonce,omitempty"`
 }
 
 const upnpStateFile = ".driftless-upnp-state.json"
@@ -497,8 +498,11 @@ func recordTrackedRouterMapping(m trackedRouterMapping) error {
 	if m.InstanceID == "" {
 		m.InstanceID = currentUPnPInstanceID()
 	}
-	for _, ex := range activeUPnPMappings {
+	for i, ex := range activeUPnPMappings {
 		if sameTrackedRouterMapping(ex, m) {
+			if m.PCPNonce != "" {
+				activeUPnPMappings[i].PCPNonce = m.PCPNonce
+			}
 			return saveTrackedRouterMappingsLocked()
 		}
 	}
@@ -508,6 +512,17 @@ func recordTrackedRouterMapping(m trackedRouterMapping) error {
 		return err
 	}
 	return nil
+}
+
+func existingPCPNonceForGatewayPort(gatewayIP string, port uint16, proto string) string {
+	upnpStateMu.Lock()
+	defer upnpStateMu.Unlock()
+	for _, ex := range activeUPnPMappings {
+		if ex.GatewayIP == gatewayIP && ex.Port == port && strings.EqualFold(ex.Proto, proto) && ex.PCPNonce != "" {
+			return ex.PCPNonce
+		}
+	}
+	return ""
 }
 
 // rollbackOrRetainRouterMapping attempts to immediately delete a newly created UPnP/NAT-PMP rule
@@ -550,8 +565,17 @@ func deleteSingleRouterMapping(m trackedRouterMapping) error {
 	if m.Kind == "upnp" && m.CtrlURL != "" && m.ServiceType != "" {
 		return upnpDeletePortMapping(m.CtrlURL, m.ServiceType, m.Port, m.Proto)
 	}
-	if (m.Kind == "natpmp" || m.Kind == "pcp") && m.GatewayIP != "" {
-		return natPMPDeletePortMappingWithLAN(m.GatewayIP, m.LANIP, m.Port, m.Proto)
+	if m.Kind == "pcp" && m.GatewayIP != "" {
+		targetAddr, err := normalizeGatewayUDPAddr(m.GatewayIP)
+		if err != nil {
+			return err
+		}
+		_, err = pcpSetPortMapping(targetAddr, m.LANIP, m.Port, 0, m.Proto, 0, m.PCPNonce)
+		return err
+	}
+	if m.Kind == "natpmp" && m.GatewayIP != "" {
+		_, _, err := natPMPSetPortMappingWithNonce(m.GatewayIP, m.LANIP, m.Port, 0, m.Proto, 0, m.PCPNonce)
+		return err
 	}
 	return nil
 }
@@ -864,18 +888,20 @@ func autoForwardRouterPortsWithEndpoints(lanIP string, mappings []PortMapping, v
 		}
 		if !ok && !stateWriteFailed && len(gwCandidates) > 0 {
 			for _, candidateGW := range gwCandidates {
-				if err := natPMPAddPortMappingWithLAN(candidateGW, lanIP, sp.port, sp.proto); err == nil {
+				prevNonce := existingPCPNonceForGatewayPort(candidateGW, sp.port, sp.proto)
+				if kind, pcpNonce, err := natPMPSetPortMappingWithNonce(candidateGW, lanIP, sp.port, sp.port, sp.proto, 3600, prevNonce); err == nil {
 					rule := trackedRouterMapping{
 						InstanceID: currentUPnPInstanceID(),
-						Kind:       "natpmp",
+						Kind:       kind,
 						GatewayIP:  candidateGW,
 						LANIP:      lanIP,
 						Port:       sp.port,
 						Proto:      sp.proto,
+						PCPNonce:   pcpNonce,
 					}
 					if err := recordTrackedRouterMapping(rule); err != nil {
 						if rbErr := rollbackOrRetainRouterMapping(rule); rbErr != nil {
-							log.Printf("[standalone] CRITICAL: aborting remaining NAT-PMP port mappings due to unrecoverable state & rollback failure: %v", rbErr)
+							log.Printf("[standalone] CRITICAL: aborting remaining NAT-PMP/PCP port mappings due to unrecoverable state & rollback failure: %v", rbErr)
 							return mappedCount
 						}
 					} else {
@@ -1379,13 +1405,21 @@ func normalizeGatewayUDPAddr(gatewayIP string) (string, error) {
 // natPMPSetPortMappingWithLAN attempts RFC 6886 NAT-PMP (v0) first and automatically falls back
 // to RFC 6887 PCP (Port Control Protocol v2) if the router requires version 2 on UDP port 5351.
 func natPMPSetPortMappingWithLAN(gatewayIP, lanIP string, intPort, extPort uint16, proto string, lifetime uint32) error {
+	_, _, err := natPMPSetPortMappingWithNonce(gatewayIP, lanIP, intPort, extPort, proto, lifetime, "")
+	return err
+}
+
+// natPMPSetPortMappingWithNonce attempts RFC 6886 NAT-PMP (v0) first and automatically falls back
+// to RFC 6887 PCP (Port Control Protocol v2) if the router requires version 2 on UDP port 5351.
+// Returns the mapping kind ("natpmp" or "pcp") and the hex-encoded 96-bit PCP Mapping Nonce (if PCP was used).
+func natPMPSetPortMappingWithNonce(gatewayIP, lanIP string, intPort, extPort uint16, proto string, lifetime uint32, pcpNonceHex string) (string, string, error) {
 	targetAddr, err := normalizeGatewayUDPAddr(gatewayIP)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	conn, err := net.DialTimeout("udp4", targetAddr, 500*time.Millisecond)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
@@ -1401,39 +1435,44 @@ func natPMPSetPortMappingWithLAN(gatewayIP, lanIP string, intPort, extPort uint1
 	binary.BigEndian.PutUint16(pkt[6:8], extPort)
 	binary.BigEndian.PutUint32(pkt[8:12], lifetime)
 	if _, err := conn.Write(pkt[:]); err != nil {
-		return err
+		return "", "", err
 	}
 	var resp [64]byte
 	n, err := conn.Read(resp[:])
 	if err != nil || n < 4 {
-		return errors.New("no nat-pmp reply")
+		return "", "", errors.New("no nat-pmp reply")
 	}
 	resultCode := binary.BigEndian.Uint16(resp[2:4])
 	// If router replies with PCP version 2 or NAT-PMP ResultCode 1 (Unsupported Version), fall back to RFC 6887 PCP v2
 	if resp[0] == 2 || resultCode == 1 {
-		return pcpSetPortMapping(targetAddr, lanIP, intPort, extPort, proto, lifetime)
+		usedNonce, pcpErr := pcpSetPortMapping(targetAddr, lanIP, intPort, extPort, proto, lifetime, pcpNonceHex)
+		if pcpErr != nil {
+			return "", "", pcpErr
+		}
+		return "pcp", usedNonce, nil
 	}
 	if n < 16 || resp[0] != 0 || resp[1] != 128+pkt[1] {
-		return fmt.Errorf("invalid nat-pmp response header")
+		return "", "", fmt.Errorf("invalid nat-pmp response header")
 	}
 	if resultCode != 0 {
-		return fmt.Errorf("nat-pmp error %d", resultCode)
+		return "", "", fmt.Errorf("nat-pmp error %d", resultCode)
 	}
 	if lifetime > 0 {
 		assignedPort := binary.BigEndian.Uint16(resp[10:12])
 		if assignedPort != extPort {
-			return fmt.Errorf("nat-pmp assigned mismatched port %d instead of %d", assignedPort, extPort)
+			return "", "", fmt.Errorf("nat-pmp assigned mismatched port %d instead of %d", assignedPort, extPort)
 		}
 	}
-	return nil
+	return "natpmp", "", nil
 }
 
 // pcpSetPortMapping implements RFC 6887 Port Control Protocol (PCP v2) MAP requests (60 bytes)
-// for modern routers (pfSense, OPNsense, OpenWrt miniupnpd, MikroTik v7, Ubiquiti, ISP CPEs).
-func pcpSetPortMapping(targetAddr, lanIP string, intPort, extPort uint16, proto string, lifetime uint32) error {
+// using a cryptographically random 96-bit Mapping Nonce (or existing persisted nonceHex for renewals/deletions)
+// and verifies that the server's response echoes the exact 96-bit Mapping Nonce, protocol, and internal port.
+func pcpSetPortMapping(targetAddr, lanIP string, intPort, extPort uint16, proto string, lifetime uint32, nonceHex string) (string, error) {
 	conn, err := net.DialTimeout("udp4", targetAddr, 500*time.Millisecond)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
@@ -1448,6 +1487,16 @@ func pcpSetPortMapping(targetAddr, lanIP string, intPort, extPort uint16, proto 
 		clientIP = net.IPv4(127, 0, 0, 1)
 	}
 
+	var nonce [12]byte
+	if decoded, err := hex.DecodeString(strings.TrimSpace(nonceHex)); err == nil && len(decoded) == 12 {
+		copy(nonce[:], decoded)
+	} else {
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return "", fmt.Errorf("failed to generate random PCP mapping nonce: %w", err)
+		}
+	}
+	usedNonceHex := hex.EncodeToString(nonce[:])
+
 	var pkt [60]byte
 	pkt[0] = 2 // PCP Version 2
 	pkt[1] = 1 // R=0 (Request), Opcode=1 (MAP)
@@ -1457,9 +1506,8 @@ func pcpSetPortMapping(targetAddr, lanIP string, intPort, extPort uint16, proto 
 	pkt[19] = 0xff
 	copy(pkt[20:24], clientIP)
 
-	// Deterministic 96-bit Mapping Nonce (bytes 24..35) so renewals and crash-recovery deletions match
-	nonceSeed := sha256.Sum256([]byte(fmt.Sprintf("driftless-pcp|%s|%s|%s|%d", currentUPnPInstanceID(), clientIP.String(), strings.ToUpper(proto), intPort)))
-	copy(pkt[24:36], nonceSeed[:12])
+	// 96-bit cryptographically random Mapping Nonce in bytes 24..35 (RFC 6887 Section 11.1)
+	copy(pkt[24:36], nonce[:])
 
 	if strings.EqualFold(strings.TrimSpace(proto), "UDP") {
 		pkt[36] = 17 // IANA UDP protocol number
@@ -1473,26 +1521,33 @@ func pcpSetPortMapping(targetAddr, lanIP string, intPort, extPort uint16, proto 
 	pkt[55] = 0xff
 
 	if _, err := conn.Write(pkt[:]); err != nil {
-		return err
+		return "", err
 	}
 	var resp [60]byte
 	n, err := conn.Read(resp[:])
 	if err != nil || n < 60 {
-		return errors.New("no pcp v2 reply")
+		return "", errors.New("no pcp v2 reply")
 	}
 	if resp[0] != 2 || resp[1] != 0x81 {
-		return fmt.Errorf("invalid pcp v2 response header")
+		return "", fmt.Errorf("invalid pcp v2 response header")
+	}
+	if !bytes.Equal(resp[24:36], nonce[:]) {
+		return "", errors.New("pcp v2 response mapping nonce mismatch")
+	}
+	if resp[36] != pkt[36] || binary.BigEndian.Uint16(resp[40:42]) != intPort {
+		return "", errors.New("pcp v2 response protocol or internal port mismatch")
 	}
 	if resp[3] != 0 {
-		return fmt.Errorf("pcp v2 error %d", resp[3])
+		return "", fmt.Errorf("pcp v2 error %d", resp[3])
 	}
 	if lifetime > 0 {
 		assignedPort := binary.BigEndian.Uint16(resp[42:44])
 		if assignedPort != extPort {
-			return fmt.Errorf("pcp v2 assigned mismatched port %d instead of %d", assignedPort, extPort)
+			_, _ = pcpSetPortMapping(targetAddr, lanIP, intPort, 0, proto, 0, usedNonceHex)
+			return "", fmt.Errorf("pcp v2 assigned mismatched port %d instead of %d", assignedPort, extPort)
 		}
 	}
-	return nil
+	return usedNonceHex, nil
 }
 
 // updateDDNS pushes the newly detected public IP to DuckDNS, Cloudflare, No-IP, or a custom webhook.

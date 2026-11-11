@@ -73,6 +73,29 @@ With `-duck`, `driftless` updates your domain the second your home IP changes an
 
 ---
 
+### How to connect from a phone (iPhone / Android)
+
+You **do not** need to install `driftless`, VPN profiles, or private keys on your phone. `driftless` runs only on your PC (or VPS + PC) and opens standard TCP/UDP ports, so you connect using normal apps from the App Store or Google Play:
+
+1. **On your Home PC:**
+   - If you have a **dynamic public IP** (no VPS): run `.\driftless-windows-amd64.exe standalone -ports 8096,3389,25565 -duck mypc:YOUR_DUCKDNS_TOKEN`. Your permanent address is `mypc.duckdns.org`.
+   - If you have **CGNAT ("gray" IP)** and use a VPS: your permanent address is `YOUR_VPS_IP` (or your domain pointed to the VPS).
+2. **On your iPhone or Android (over LTE/5G or any Wi-Fi):** open the app you need and enter your address and port:
+
+| What you want to open on your PC | App for iPhone / Android | What address to enter in the app |
+| :--- | :--- | :--- |
+| **Websites, Web UI, OpenWebUI, Home Assistant** | Safari / Chrome | `https://mypc.duckdns.org:3000` (or `http://YOUR_VPS_IP:3000`) |
+| **Movies & media (Jellyfin / Plex)** | Jellyfin Mobile / Swiftfin / Plex | `http://mypc.duckdns.org:8096` |
+| **Remote Desktop (control Windows from phone)** | Windows App (Microsoft Remote Desktop) | `mypc.duckdns.org:3389` (uses your Windows login & password) |
+| **PC gaming from phone (Sunshine / Gamestream)** | Moonlight | `mypc.duckdns.org` (forward ports `47984,47989,48010`) |
+| **SSH terminal (Linux / WSL / PowerShell SSH)** | Termius / Blink Shell / JuiceSSH | Host: `mypc.duckdns.org`, Port: `22` (password or SSH key) |
+| **Files / Nextcloud / SFTP** | Documents by Readdle / FE File Explorer / Owlfiles | `mypc.duckdns.org:22` (SFTP) or web port |
+| **Minecraft (Java / Bedrock (`:19132`))** | Minecraft / PojavLauncher | Server Address: `mypc.duckdns.org`, Port: `19132` (or `25565`) |
+
+> **Tip for RDP (`3389`) or open web panels:** if you open a sensitive port to the internet, either use a strong Windows/Web password or restrict access with `-allow-ips` / HTTPS (`443:3000/https`).
+
+---
+
 ### Common Tasks
 
 | Task | Command |
@@ -223,6 +246,34 @@ Windows:
 .\driftless-windows-amd64.exe standalone -ports 8096,25565 -duck
 ```
 *(Если есть бесплатный аккаунт на DuckDNS, один раз запусти `-duck mypc:ТВОЙ_ТОКЕН`. Программа сохранит его в `.driftless-ddns.json`, и дальше можно писать просто `-duck`, подключаясь с телефона по адресу `mypc.duckdns.org:8096`.)*
+
+---
+
+### Как подключиться к домашнему ПК с телефона (iPhone / Android)
+
+На сам телефон **ничего ставить не нужно** - никаких консолей, приватных ключей туннеля или конфигов. `driftless` ставится только на ПК (или ВПС + ПК) и открывает обычные порты, поэтому с айфона или андроида ты заходишь через стандартные приложения из App Store / Google Play:
+
+1. **Что запустить на домашнем ПК:**
+   - Если дома **динамический белый IP** (без ВПС): один раз зарегистрируй бесплатный поддомен на `duckdns.org` и запусти на ПК:
+     ```powershell
+     .\driftless-windows-amd64.exe standalone -ports 8096,3389,25565 -duck mypc:ТВОЙ_ТОКЕН_DUCKDNS
+     ```
+     Теперь у твоего ПК есть постоянный адрес `mypc.duckdns.org`. Даже когда провайдер сменит IP, адрес сам обновится за секунду.
+   - Если дома **серый IP (CGNAT)** и ты запускаешь через ВПС: твой постоянный адрес - это `IP_ТВОЕГО_ВПС` (или привязанный к нему домен).
+2. **Через какие программы заходить с телефона (по мобильному интернету LTE/5G или чужому Wi-Fi):**
+
+| К чему на ПК подключаемся | Какое приложение скачать на iPhone / Android | Что вписать в адрес подключения |
+| :--- | :--- | :--- |
+| **Сайты, админки, нейронки (OpenWebUI), Home Assistant** | Обычный браузер (Safari / Chrome) | `https://mypc.duckdns.org:3000` (или `http://IP_ВПС:3000`) |
+| **Фильмы и сериалы с ПК (Jellyfin / Plex)** | Jellyfin Mobile / Swiftfin / Infuse / Plex | `http://mypc.duckdns.org:8096` |
+| **Удаленный рабочий стол Windows (управлять ПК с телефона)** | Windows App (бывший Microsoft Remote Desktop) | Компьютер: `mypc.duckdns.org:3389`, логин и пароль от твоей учетки Windows |
+| **Играть в ПК-игры с телефона (через Sunshine)** | Moonlight | Хост: `mypc.duckdns.org` (на ПК открой порты `47984,47989,48010`) |
+| **Терминал / консоль по SSH (Linux / WSL / Windows OpenSSH)** | Termius / JuiceSSH / Shelly | Хост: `mypc.duckdns.org`, порт `22` (вход по паролю ПК или SSH-ключу) |
+| **Файлы и папки с ПК (SFTP / WebDAV / Nextcloud)** | Documents / Owlfiles / FE File Explorer / CX Проводник | Хост: `mypc.duckdns.org`, порт `22` (SFTP) или веб-порт |
+| **Minecraft (Bedrock `:19132` / Java `:25565`)** | Minecraft / PojavLauncher | Адрес сервера: `mypc.duckdns.org`, порт `19132` или `25565` |
+
+> **Нужен ли приватный ключ?**
+> Сама программа `driftless` шифрует туннель между ПК и ВПС автоматически (пароль и отпечаток сертификата создаются сами). А когда ты подключаешься к открытому порту с телефона, безопасность зависит от самой программы на ПК: например, в браузере, Jellyfin или рабочем столе Windows (RDP) ты просто вводишь логин и пароль от своего сервиса или Windows. Если открываешь порт `22` (SSH), можно заходить как по обычному паролю учетки ПК, так и по стандартному SSH-ключу в приложении Termius.
 
 ---
 
