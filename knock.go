@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -132,7 +133,6 @@ func (kc *KnockController) SetPublicEndpoint(host string, useTLS bool, certDir s
 	}
 	kc.mu.Lock()
 	kc.publicHost = strings.TrimSpace(host)
-	// Magic Knock always requires HTTPS/TLS so the secret in the URL is never transmitted in cleartext
 	kc.useTLS = true
 	_ = useTLS
 	urlStr := kc.magicURLocked()
@@ -173,11 +173,11 @@ func (kc *KnockController) PrintBanner(prefix, certDir string) {
 		certDir = ".driftless-certs"
 	}
 	urlPath := filepath.Join(certDir, knockURLFileName)
-	log.Printf("[%s] Zero-Client Phone Knock protection active (TTL=%v; all TCP/UDP ports hidden from scanners until unlocked)", prefix, kc.ttl)
+	log.Printf("[%s] Stealth IP Knock active (TTL=%v; ports hidden until unlocked)", prefix, kc.ttl)
 	if tryPrintInteractiveKnockURL(prefix, magicURL) {
-		log.Printf("[%s] Phone Magic Knock URL displayed on terminal (saved in %s; run './driftless show-token' anytime to view)", prefix, urlPath)
+		log.Printf("[%s] Knock URL displayed on terminal (saved in %s; run './driftless show-token' anytime to view)", prefix, urlPath)
 	} else {
-		log.Printf("[%s] Phone Magic Knock URL saved to %s (run './driftless show-token' to view): %s", prefix, urlPath, magicURL)
+		log.Printf("[%s] Knock URL saved to %s (run './driftless show-token' to view): %s", prefix, urlPath, magicURL)
 	}
 }
 
@@ -198,7 +198,7 @@ func tryPrintInteractiveKnockURL(prefix, magicURL string) bool {
 		return false
 	}
 	defer ttyFile.Close()
-	_, wErr := fmt.Fprintf(ttyFile, "[%s] Open once on your iPhone / Android / laptop to unlock mapped ports (bookmark it):\n  %s\n", prefix, magicURL)
+	_, wErr := fmt.Fprintf(ttyFile, "[%s] Stealth Knock URL (open once to unlock your IP):\n  %s\n", prefix, magicURL)
 	return wErr == nil
 }
 
@@ -399,14 +399,17 @@ func peekBytesWithTimeout(c net.Conn, n int, timeout time.Duration) ([]byte, *pe
 }
 
 // detectUniversalSinglePortOverride inspects initial bytes on a connection and allows SSH (SSH-2.0-)
-// or Microsoft Remote Desktop (X.224 TPKT 0x03 0x00) to be routed to mapped SSH (:22) or RDP (:3389)
-// targets even when the client connected through another mapped port (e.g. :8096 or :443).
+// or Microsoft Remote Desktop (X.224 TPKT 0x03 0x00) to be routed to SSH (:22) or RDP (:3389)
+// targets even when the client connected through another mapped port (e.g. :80 or :8096).
 func detectUniversalSinglePortOverride(hdr []byte, defaultTarget uint16, mappings []PortMapping) uint16 {
 	if len(hdr) >= 4 && bytes.HasPrefix(hdr, []byte("SSH-")) {
 		for _, m := range mappings {
 			if m.TargetPort == 22 || m.PublicPort == 22 {
 				return m.TargetPort
 			}
+		}
+		if defaultUserPassAuth != nil {
+			return 22
 		}
 	}
 	// Microsoft RDP X.224 Connection Request PDU: TPKT version 3 (0x03, 0x00), length >= 11, X.224 CR code 0xE0 in byte 5
@@ -426,8 +429,26 @@ func isKnockHTTPPrefix(hdr []byte) bool {
 		bytes.HasPrefix(hdr, []byte("POST "+knockPathPrefix))
 }
 
-// inspectAndPrepareTCPConn enforces -knock protection, serves the Magic Knock Launchpad (/.rdp/revoke/ca.crt),
-// and performs Single-Port protocol auto-routing (SSH/RDP/HTTP on a single port).
+func isHTTPMethodPrefix(hdr []byte) bool {
+	for _, m := range [][]byte{
+		[]byte("GET "),
+		[]byte("POST "),
+		[]byte("HEAD "),
+		[]byte("PUT "),
+		[]byte("DELETE "),
+		[]byte("OPTIONS "),
+		[]byte("PATCH "),
+	} {
+		if bytes.HasPrefix(hdr, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// inspectAndPrepareTCPConn performs core Single-Port protocol auto-routing (SSH/RDP/HTTP on any port),
+// handles the built-in SSH server (-user/-pass) and optional HTTP Basic Auth (-http-auth),
+// and enforces optional -knock IP authorization when enabled.
 // Returns (wrappedConn, resolvedTargetPort, handledOrClosed).
 func inspectAndPrepareTCPConn(
 	rawConn net.Conn,
@@ -440,7 +461,6 @@ func inspectAndPrepareTCPConn(
 	remoteAddr := rawConn.RemoteAddr()
 
 	if kc != nil && !kc.IsAllowedAddr(remoteAddr) {
-		// Unauthenticated IP: only allow a valid Magic Knock HTTPS request; drop everything else before touching backends.
 		wrapped := maybeTerminateTLSWithTimeout(rawConn, sniMgr, true, 1500*time.Millisecond)
 		hdr, pc, _ := peekBytesWithTimeout(wrapped, 32, 1500*time.Millisecond)
 		if !isKnockHTTPPrefix(hdr) {
@@ -451,9 +471,15 @@ func inspectAndPrepareTCPConn(
 		return nil, 0, true
 	}
 
-	peekWait := 250 * time.Millisecond
-	if defaultTargetPort == 22 || defaultTargetPort == 3389 {
-		peekWait = 120 * time.Millisecond
+	// Fast path for direct SSH port 22 when built-in SSH server is active and no TLS/Knock is wrapping it
+	if defaultTargetPort == 22 && defaultUserPassAuth != nil && kc == nil && !useTLS {
+		defaultUserPassAuth.ServeConn(rawConn)
+		return nil, 0, true
+	}
+
+	peekWait := 80 * time.Millisecond
+	if kc != nil || useTLS {
+		peekWait = 200 * time.Millisecond
 	}
 	wrapped := maybeTerminateTLSWithTimeout(rawConn, sniMgr, useTLS, peekWait)
 	hdr, pc, _ := peekBytesWithTimeout(wrapped, 32, peekWait)
@@ -468,7 +494,46 @@ func inspectAndPrepareTCPConn(
 		_ = pc.Close()
 		return nil, 0, true
 	}
+
+	// Built-in SSHv2 server (when -user/-pass is configured or port 22 has no external local sshd)
+	if defaultUserPassAuth != nil && (resolvedPort == 22 || bytes.HasPrefix(hdr, []byte("SSH-"))) {
+		defaultUserPassAuth.ServeConn(pc)
+		return nil, 0, true
+	}
+
+	// Optional HTTP Basic Auth protection (-http-auth with -user/-pass)
+	if defaultUserPassAuth != nil && defaultUserPassAuth.RequireHTTP && isHTTPMethodPrefix(hdr) {
+		okConn, allowed := verifyHTTPStreamBasicAuth(pc, remoteAddr)
+		if !allowed {
+			_ = pc.Close()
+			return nil, 0, true
+		}
+		return okConn, resolvedPort, false
+	}
+
 	return pc, resolvedPort, false
+}
+
+func verifyHTTPStreamBasicAuth(pc *peekedConn, remoteAddr net.Addr) (net.Conn, bool) {
+	_ = pc.Conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var captured bytes.Buffer
+	limited := io.LimitReader(pc, maxVHostHeaderBytes)
+	tee := io.TeeReader(limited, &captured)
+	br := bufio.NewReaderSize(tee, 4096)
+	req, err := http.ReadRequest(br)
+	_ = pc.Conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		return nil, false
+	}
+	if !defaultUserPassAuth.CheckHTTPBasicAuth(req, remoteAddr) {
+		writeHTTPBasicAuthChallenge(pc.Conn)
+		return nil, false
+	}
+	rebuilt := &peekedConn{
+		Conn: pc.Conn,
+		r:    bufio.NewReader(io.MultiReader(bytes.NewReader(captured.Bytes()), br)),
+	}
+	return rebuilt, true
 }
 
 func isTLSBackedConn(c net.Conn) bool {
@@ -525,7 +590,6 @@ func (kc *KnockController) handleKnockHTTPConn(pc *peekedConn, remoteAddr net.Ad
 
 	clientIP := extractAddrHost(remoteAddr)
 
-	// Handle immediate IP revocation before re-authorizing
 	if subPath == "revoke" || req.URL.Query().Get("revoke") == "1" {
 		if !hmac.Equal([]byte(strings.TrimSpace(candidateTok)), []byte(kc.secret)) {
 			body := "404 Not Found\n"
@@ -637,52 +701,11 @@ func (kc *KnockController) handleKnockHTTPConn(pc *peekedConn, remoteAddr net.Ad
 		return
 	}
 
-	textBody := kc.buildKnockTextResponse(reqHost, clientIP, requestedPort, exp)
+	revokeURL := fmt.Sprintf("https://%s:%d%s%s/revoke", reqHost, kc.primaryPort, knockPathPrefix, kc.secret)
+	body := fmt.Sprintf("OK: IP %s unlocked until %s\nRevoke anytime: %s\n", clientIP, exp.Format(time.RFC3339), revokeURL)
 	hdr := fmt.Sprintf(
 		"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-		len(textBody),
+		len(body),
 	)
-	_, _ = pc.Write([]byte(hdr + textBody))
+	_, _ = pc.Write([]byte(hdr + body))
 }
-
-func (kc *KnockController) buildKnockTextResponse(host, clientIP string, unlockedPort uint16, exp time.Time) string {
-	ttlMins := int(time.Until(exp).Minutes())
-	ttlLabel := fmt.Sprintf("%dm", ttlMins)
-	if ttlMins >= 120 {
-		ttlLabel = fmt.Sprintf("%.1fh", time.Until(exp).Hours())
-	}
-	scheme := "https"
-	revokeURL := fmt.Sprintf("%s://%s:%d%s%s/revoke", scheme, host, kc.primaryPort, knockPathPrefix, kc.secret)
-	revokeAllURL := fmt.Sprintf("%s?all=1", revokeURL)
-	rdpFileURL := fmt.Sprintf("%s://%s:%d%s%s/connect.rdp", scheme, host, kc.primaryPort, knockPathPrefix, kc.secret)
-	caURL := fmt.Sprintf("%s://%s:%d%s%s/ca.crt", scheme, host, kc.primaryPort, knockPathPrefix, kc.secret)
-
-	scope := "all mapped ports"
-	if unlockedPort > 0 {
-		scope = fmt.Sprintf("port %d", unlockedPort)
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "OK - driftless knock unlocked\n")
-	fmt.Fprintf(&b, "client_ip: %s\n", clientIP)
-	fmt.Fprintf(&b, "unlocked: %s (ttl %s, expires %s)\n", scope, ttlLabel, exp.UTC().Format(time.RFC3339))
-	fmt.Fprintf(&b, "host: %s\n", host)
-	for _, m := range kc.mappedPorts {
-		fmt.Fprintf(&b, "port %d -> :%d (%s) | unlock only :%d: %s://%s:%d%s%s?port=%d\n",
-			m.PublicPort, m.TargetPort, m.Proto, m.PublicPort, scheme, host, kc.primaryPort, knockPathPrefix, kc.secret, m.PublicPort)
-	}
-	fmt.Fprintf(&b, "rdp_profile: %s\n", rdpFileURL)
-	fmt.Fprintf(&b, "revoke_ip: %s\n", revokeURL)
-	fmt.Fprintf(&b, "revoke_all: %s\n", revokeAllURL)
-
-	kc.mu.RLock()
-	caFP := kc.caFingerprint
-	hasCA := len(kc.caCertPEM) > 0
-	kc.mu.RUnlock()
-	if hasCA && caFP != "" {
-		fmt.Fprintf(&b, "ca_sha256: %s\n", caFP)
-		fmt.Fprintf(&b, "ca_cert: %s\n", caURL)
-	}
-	return b.String()
-}
-

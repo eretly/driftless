@@ -560,7 +560,7 @@ func TestKnockPortalAndSinglePortMultiplexerAndBridge(t *testing.T) {
 	knockRespBytes, _ := io.ReadAll(tlsClient2)
 	_ = tlsClient2.Close()
 	<-done2
-	if !strings.Contains(string(knockRespBytes), "OK - driftless knock unlocked") ||
+	if !strings.Contains(string(knockRespBytes), "OK: IP") ||
 		!strings.Contains(string(knockRespBytes), "https://mypc.duckdns.org:8096/__driftless_knock/testknocksecret123456/revoke") {
 		t.Fatalf("expected plain-text Knock response to include https:// revoke link, got:\n%s", string(knockRespBytes))
 	}

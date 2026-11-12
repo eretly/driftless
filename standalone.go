@@ -1858,6 +1858,7 @@ func printStandaloneBanner(pubIP string, ddns DDNSConfig, mappings []PortMapping
 		host = ddns.Domain
 	}
 	var summary strings.Builder
+	var sshPublicPort uint16
 	log.Printf("[standalone] ==========================================================")
 	if ddns.Domain != "" {
 		log.Printf("[standalone] Ready-to-use connections (Domain: %s | IP: %s):", ddns.Domain, pubIP)
@@ -1870,26 +1871,33 @@ func printStandaloneBanner(pubIP string, ddns DDNSConfig, mappings []PortMapping
 		var line string
 		switch m.TargetPort {
 		case 22:
-			if m.PublicPort == 22 {
-				line = fmt.Sprintf("SSH Terminal      : ssh user@%s", host)
-			} else {
-				line = fmt.Sprintf("SSH Terminal      : ssh user@%s -p %d", host, m.PublicPort)
+			sshPublicPort = m.PublicPort
+			sshUser := "user"
+			if defaultUserPassAuth != nil && defaultUserPassAuth.User != "" {
+				sshUser = defaultUserPassAuth.User
 			}
+			if m.PublicPort == 22 {
+				line = fmt.Sprintf("SSH (WebSSH/Phone)  : Host: %s | Port: 22 | User: %s  (CLI: ssh %s@%s)", host, sshUser, sshUser, host)
+			} else {
+				line = fmt.Sprintf("SSH (WebSSH/Phone)  : Host: %s | Port: %d | User: %s  (CLI: ssh %s@%s -p %d)", host, m.PublicPort, sshUser, sshUser, host, m.PublicPort)
+			}
+		case 7070:
+			line = fmt.Sprintf("AnyDesk Direct TCP  : %s:%d (enter in AnyDesk app + your AnyDesk password)", host, m.PublicPort)
 		case 3389:
-			line = fmt.Sprintf("Remote Desktop    : %s:%d (Windows App / mstsc)", host, m.PublicPort)
+			line = fmt.Sprintf("Remote Desktop      : %s:%d (Windows App / Microsoft Remote Desktop / mstsc)", host, m.PublicPort)
 		case 80:
 			if enableTLS {
-				line = fmt.Sprintf("Website (HTTPS)   : https://%s:%d (or http://%s:%d)", host, m.PublicPort, host, m.PublicPort)
+				line = fmt.Sprintf("Website (24/7 HTTPS): https://%s:%d (or http://%s:%d)", host, m.PublicPort, host, m.PublicPort)
 			} else if m.PublicPort == 80 {
-				line = fmt.Sprintf("Website (HTTP)    : http://%s", host)
+				line = fmt.Sprintf("Website (24/7 HTTP) : http://%s", host)
 			} else {
-				line = fmt.Sprintf("Website (HTTP)    : http://%s:%d", host, m.PublicPort)
+				line = fmt.Sprintf("Website (24/7 HTTP) : http://%s:%d", host, m.PublicPort)
 			}
 		case 443:
 			if m.PublicPort == 443 {
-				line = fmt.Sprintf("Website (HTTPS)   : https://%s", host)
+				line = fmt.Sprintf("Website (24/7 HTTPS): https://%s", host)
 			} else {
-				line = fmt.Sprintf("Website (HTTPS)   : https://%s:%d", host, m.PublicPort)
+				line = fmt.Sprintf("Website (24/7 HTTPS): https://%s:%d", host, m.PublicPort)
 			}
 		default:
 			if enableTLS || m.Proto == "https" {
@@ -1900,6 +1908,13 @@ func printStandaloneBanner(pubIP string, ddns DDNSConfig, mappings []PortMapping
 		}
 		log.Printf("[standalone]   %s", line)
 		fmt.Fprintf(&summary, "  %s\n", line)
+	}
+	if defaultUserPassAuth != nil {
+		if sshPublicPort == 0 && len(mappings) > 0 {
+			sshPublicPort = mappings[0].PublicPort
+		}
+		defaultUserPassAuth.PrintBanner("standalone", host, sshPublicPort)
+		fmt.Fprintf(&summary, "  Login Credentials   : User: %s | Password: %s\n", defaultUserPassAuth.User, defaultUserPassAuth.Pass)
 	}
 	if ddns.Provider == "" && ddns.Webhook == "" {
 		log.Printf("[standalone]   Tip: pass '-duck myname:YOUR_DUCKDNS_TOKEN' once (saved automatically; next time just '-duck')")
@@ -2005,7 +2020,6 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 		cfg.EnableTLS = true
 	}
 	if cfg.DDNS.Domain != "" {
-		sniMgr.ensureDomainCertificate(cfg.DDNS.Domain)
 		cfg.EnableTLS = true
 	}
 
@@ -2058,6 +2072,10 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 		}()
 	}
 
+	if cfg.DDNS.Domain != "" {
+		go sniMgr.ensureDomainCertificate(cfg.DDNS.Domain)
+	}
+
 	printStandaloneBanner(pubIP, cfg.DDNS, allowedMappings, cfg.EnableTLS, cfg.CertDir)
 	if defaultKnockController != nil {
 		hostForKnock := pubIP
@@ -2086,7 +2104,7 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 			log.Printf("[standalone] shutting down cleanly...")
 			return nil
 		case <-upnpTicker.C:
-			if cfg.EnableUPnP && (lastUPnPMapped == 0 || time.Since(lastUPnPRefresh) >= 2*time.Minute) {
+			if cfg.EnableUPnP && (lastUPnPMapped == 0 || time.Since(lastUPnPRefresh) >= time.Minute) {
 				lanIP = detectLocalLANIP()
 				lastUPnPMapped = autoForwardRouterPorts(lanIP, allowedMappings, upnpVHostAddr, upnpHTTPSAddr)
 				lastUPnPRefresh = time.Now()
@@ -2115,7 +2133,7 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 						if autoSSLIPMode {
 							if autoDom := autoZeroConfigDomain(currentIP); autoDom != "" {
 								cfg.DDNS.Domain = autoDom
-								sniMgr.ensureDomainCertificate(cfg.DDNS.Domain)
+								go sniMgr.ensureDomainCertificate(cfg.DDNS.Domain)
 								printStandaloneBanner(currentIP, cfg.DDNS, allowedMappings, cfg.EnableTLS, cfg.CertDir)
 							}
 						}
@@ -2160,17 +2178,42 @@ func closeWriteSide(c net.Conn) {
 	}
 }
 
+const standaloneIdleConnTimeout = 5 * time.Minute
+
+func copyWithIdleTimeout(dst, src net.Conn, idleTimeout time.Duration) {
+	bufPtr := chunkBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:maxChunkSize]
+	defer chunkBufPool.Put(bufPtr)
+	for {
+		if idleTimeout > 0 {
+			_ = src.SetReadDeadline(time.Now().Add(idleTimeout))
+		}
+		n, rErr := src.Read(buf)
+		if n > 0 {
+			if idleTimeout > 0 {
+				_ = dst.SetWriteDeadline(time.Now().Add(idleTimeout))
+			}
+			if _, wErr := dst.Write(buf[:n]); wErr != nil {
+				return
+			}
+		}
+		if rErr != nil {
+			return
+		}
+	}
+}
+
 func pipeBidirectional(a, b net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(b, a)
+		copyWithIdleTimeout(b, a, standaloneIdleConnTimeout)
 		closeWriteSide(b)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(a, b)
+		copyWithIdleTimeout(a, b, standaloneIdleConnTimeout)
 		closeWriteSide(a)
 	}()
 	wg.Wait()
@@ -2180,17 +2223,14 @@ func startStandaloneTCP(ctx context.Context, targetHost string, m *PortMapping, 
 	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", m.PublicPort))
 	if err != nil {
 		if m.PublicPort == m.TargetPort && isAddrInUseError(err) {
-			needsBridge := useTLS || defaultKnockController != nil || defaultIPACL != nil || defaultProxyProtocol
-			if needsBridge {
-				bridgeLn, bErr := net.Listen("tcp", "0.0.0.0:0")
-				if bErr == nil {
-					if tcpAddr, ok := bridgeLn.Addr().(*net.TCPAddr); ok && tcpAddr.Port > 0 {
-						m.RouterTCPPort = uint16(tcpAddr.Port)
-						l = bridgeLn
-						log.Printf("[standalone] TCP :%d is bound by local service; bridging router external port %d -> local proxy :%d -> %s:%d", m.PublicPort, m.PublicPort, m.RouterTCPPort, targetHost, m.TargetPort)
-					} else {
-						_ = bridgeLn.Close()
-					}
+			bridgeLn, bErr := net.Listen("tcp", "0.0.0.0:0")
+			if bErr == nil {
+				if tcpAddr, ok := bridgeLn.Addr().(*net.TCPAddr); ok && tcpAddr.Port > 0 {
+					m.RouterTCPPort = uint16(tcpAddr.Port)
+					l = bridgeLn
+					log.Printf("[standalone] TCP :%d is bound by local service; bridging router external port %d -> local proxy :%d -> %s:%d", m.PublicPort, m.PublicPort, m.RouterTCPPort, targetHost, m.TargetPort)
+				} else {
+					_ = bridgeLn.Close()
 				}
 			}
 			if l == nil {
@@ -2248,17 +2288,11 @@ func startStandaloneTCP(ctx context.Context, targetHost string, m *PortMapping, 
 					pipeBidirectional(srcConn, outConn)
 				}
 
-				if defaultKnockController != nil || len(allMappings) > 1 {
-					wrapped, resolvedPort, handled := inspectAndPrepareTCPConn(inConn, sniMgr, useTLS, defTargetPort, allMappings)
-					if handled {
-						return
-					}
-					dialLocalOrLAN(wrapped, resolvedPort, targetHost)
+				wrapped, resolvedPort, handled := inspectAndPrepareTCPConn(inConn, sniMgr, useTLS, defTargetPort, allMappings)
+				if handled {
 					return
 				}
-
-				wrapped := maybeTerminateTLS(inConn, sniMgr, useTLS)
-				dialLocalOrLAN(wrapped, defTargetPort, targetHost)
+				dialLocalOrLAN(wrapped, resolvedPort, targetHost)
 			}(c)
 		}
 	}()
@@ -2438,6 +2472,10 @@ func startStandaloneVHost(ctx context.Context, listenAddr, targetHost string, vh
 					if !defaultKnockController.IsAllowedAddr(raw.RemoteAddr()) {
 						return
 					}
+				}
+				if defaultUserPassAuth != nil && !defaultUserPassAuth.CheckHTTPBasicAuth(req, raw.RemoteAddr()) {
+					writeHTTPBasicAuthChallenge(wrapped)
+					return
 				}
 				host := strings.ToLower(strings.TrimSpace(req.Host))
 				if h, _, err := net.SplitHostPort(host); err == nil {

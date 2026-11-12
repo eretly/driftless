@@ -570,12 +570,14 @@ func printSavedTokenAndCommand() error {
 		defaultCmdPath            = ".driftless-certs/client-connect.cmd"
 		defaultKnockPath          = ".driftless-certs/knock-url.txt"
 		defaultStandaloneInfoPath = ".driftless-certs/standalone-info.txt"
+		defaultSSHAuthPath        = ".driftless-certs/ssh-auth.txt"
 	)
 	tokBytes, tokErr := os.ReadFile(defaultTokenPath)
 	cmdBytes, cmdErr := os.ReadFile(defaultCmdPath)
 	knockBytes, knockErr := os.ReadFile(defaultKnockPath)
 	infoBytes, infoErr := os.ReadFile(defaultStandaloneInfoPath)
-	if tokErr != nil && cmdErr != nil && knockErr != nil && infoErr != nil {
+	authBytes, authErr := os.ReadFile(defaultSSHAuthPath)
+	if tokErr != nil && cmdErr != nil && knockErr != nil && infoErr != nil && authErr != nil {
 		return fmt.Errorf("no saved token or connection info found in .driftless-certs/ (start './driftless server' or './driftless standalone' first): %w", tokErr)
 	}
 	if tokErr == nil {
@@ -586,6 +588,9 @@ func printSavedTokenAndCommand() error {
 	}
 	if infoErr == nil {
 		fmt.Fprintf(os.Stdout, "Standalone Connection Summary (%s):\n%s\n", defaultStandaloneInfoPath, strings.TrimSpace(string(infoBytes)))
+	}
+	if authErr == nil {
+		fmt.Fprintf(os.Stdout, "Login Credentials user:password (%s):\n  %s\n", defaultSSHAuthPath, strings.TrimSpace(string(authBytes)))
 	}
 	if knockErr == nil {
 		fmt.Fprintf(os.Stdout, "Magic Knock URL (%s):\n  %s\n", defaultKnockPath, strings.TrimSpace(string(knockBytes)))
@@ -643,6 +648,10 @@ func main() {
 	lanIP := flag.String("lan-ip", "", "override auto-detected agent LAN IP")
 	allowPorts := flag.String("allow-ports", "", "optional whitelist of local ports on agent/standalone (e.g. 80,8096,25565)")
 	allowIPs := flag.String("allow-ips", "", "optional IP/CIDR ACL whitelist for public listeners (e.g. 192.168.1.0/24,203.0.113.5)")
+	userFlag := flag.String("user", "", "username for built-in SSH server (WebSSH/Termius) and optional HTTP Basic Auth")
+	passFlag := flag.String("pass", "", "password for built-in SSH server (WebSSH/Termius) and optional HTTP Basic Auth")
+	authFlag := flag.String("auth", "", "shorthand 'user:password' for built-in SSH and optional HTTP Basic Auth")
+	httpAuth := flag.Bool("http-auth", false, "require HTTP Basic Auth (-user/-pass) on forwarded HTTP/VHost web ports")
 	enableKnock := flag.Bool("knock", false, "enable HTTPS Magic Knock IP gatekeeper (per-port unlock, 1h TTL, instant IP revoke)")
 	knockToken := flag.String("knock-token", "", "optional custom secret for -knock Magic Link (auto-generated and persisted if omitted)")
 	knockTTL := flag.Duration("knock-ttl", 1*time.Hour, "how long a device IP stays unlocked after opening the Magic Knock Link (default 1h)")
@@ -709,6 +718,20 @@ func main() {
 			}
 			portsAllow[uint16(port)] = struct{}{}
 		}
+	}
+
+	parsedMappingsForAuth, _ := parseMappingsWithDefault(*ports, *udpDefault)
+	hasPort22 := false
+	for _, m := range parsedMappingsForAuth {
+		if m.TargetPort == 22 || m.PublicPort == 22 {
+			hasPort22 = true
+			break
+		}
+	}
+	if upAuth, err := initUserPassAuth(*certDir, *userFlag, *passFlag, *authFlag, *httpAuth, hasPort22); err != nil {
+		log.Fatalf("[driftless] failed to initialize user/password authentication: %v", err)
+	} else if upAuth != nil {
+		defaultUserPassAuth = upAuth
 	}
 
 	if *enableKnock || strings.TrimSpace(*knockToken) != "" {

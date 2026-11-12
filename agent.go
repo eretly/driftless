@@ -435,8 +435,22 @@ func (ag *Agent) acceptGatewayStreams(ctx context.Context, conn TunnelConn) {
 			sess, exists := ag.sessions[sessID]
 			ag.mu.Unlock()
 			if !exists && (cmd == cmdNewConn || cmd == cmdResume) {
-				c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ag.targetHost, targetPort), 5*time.Second)
-				if err != nil {
+				var c net.Conn
+				var err error
+				if defaultUserPassAuth != nil && targetPort == 22 {
+					c1, c2 := net.Pipe()
+					go defaultUserPassAuth.ServeConn(c2)
+					c = c1
+				} else {
+					c, err = net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ag.targetHost, targetPort), 5*time.Second)
+					if err != nil && targetPort == 22 && defaultUserPassAuth != nil {
+						c1, c2 := net.Pipe()
+						go defaultUserPassAuth.ServeConn(c2)
+						c = c1
+						err = nil
+					}
+				}
+				if err != nil || c == nil {
 					_ = s.Close()
 					return
 				}

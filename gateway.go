@@ -486,6 +486,11 @@ func (gw *Gateway) handleVHostClient(rawConn net.Conn, vhostMap map[string]uint1
 			return
 		}
 	}
+	if defaultUserPassAuth != nil && !defaultUserPassAuth.CheckHTTPBasicAuth(req, rawConn.RemoteAddr()) {
+		writeHTTPBasicAuthChallenge(c)
+		_ = c.Close()
+		return
+	}
 
 	host := strings.ToLower(strings.TrimSpace(req.Host))
 	if h, _, err := net.SplitHostPort(host); err == nil {
@@ -1103,16 +1108,11 @@ func (gw *Gateway) listenPublicPort(ctx context.Context, m PortMapping) error {
 				if defaultProxyProtocol {
 					initData = formatProxyProtoV1(raw.RemoteAddr(), raw.LocalAddr())
 				}
-				if defaultKnockController != nil || len(gw.mappings) > 1 {
-					wrapped, resolvedTarget, handled := inspectAndPrepareTCPConn(raw, gw.sniMgr, useTLS, m.TargetPort, gw.mappings)
-					if handled {
-						return
-					}
-					gw.startResumableSession(wrapped, resolvedTarget, initData)
+				wrapped, resolvedTarget, handled := inspectAndPrepareTCPConn(raw, gw.sniMgr, useTLS, m.TargetPort, gw.mappings)
+				if handled {
 					return
 				}
-				wrapped := maybeTerminateTLS(raw, gw.sniMgr, useTLS)
-				gw.startResumableSession(wrapped, m.TargetPort, initData)
+				gw.startResumableSession(wrapped, resolvedTarget, initData)
 			}(c)
 		}
 	}()
