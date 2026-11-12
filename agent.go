@@ -393,6 +393,21 @@ func (ag *Agent) sendAuth(ctx context.Context, conn TunnelConn) error {
 	if !hmac.Equal(serverMAC[:], expectedServerMAC) {
 		return errors.New("gateway mutual authentication or TLS channel binding failed (possible MITM)")
 	}
+	// Read optional 2-byte length + conflict warning message if Gateway detected port/vhost conflicts
+	_ = st.SetDeadline(time.Now().Add(150 * time.Millisecond))
+	var cLenBuf [2]byte
+	if _, err := io.ReadFull(st, cLenBuf[:]); err == nil {
+		cLen := int(binary.BigEndian.Uint16(cLenBuf[:]))
+		if cLen > 0 && cLen <= 65000 {
+			cMsg := make([]byte, cLen)
+			if _, err := io.ReadFull(st, cMsg); err == nil {
+				conflictStr := string(cMsg)
+				lastAgentAuthConflict.Store(conflictStr)
+				log.Printf("[agent] CONFLICT reported by gateway for node %q: %s", nodeLabel(ag.nodeID), conflictStr)
+			}
+		}
+	}
+	_ = st.SetDeadline(time.Time{})
 	return nil
 }
 

@@ -28,30 +28,35 @@ import (
 )
 
 type DDNSConfig struct {
-	Provider string
-	Domain   string
-	Token    string
-	User     string
-	ZoneID   string
-	Webhook  string
+	Provider   string `json:"provider,omitempty"`
+	Domain     string `json:"domain,omitempty"`
+	Token      string `json:"token,omitempty"`
+	User       string `json:"user,omitempty"`
+	ZoneID     string `json:"zone_id,omitempty"`
+	Webhook    string `json:"webhook,omitempty"`
+	DomainKind string `json:"domain_kind,omitempty"`
 }
 
 type StandaloneConfig struct {
-	TargetHost   string
-	Mappings     []PortMapping
-	VHostAddr    string
-	HTTPSAddr    string
-	DirectAddr   string
-	VHostMap     map[string]uint16
-	AllowedPorts map[uint16]struct{}
-	EnableUPnP   bool
-	EnableTLS    bool
-	STUNServer   string
-	STUNInterval time.Duration
-	DDNS         DDNSConfig
-	CertDir      string
-	TLSCertFile  string
-	TLSKeyFile   string
+	TargetHost          string
+	Mappings            []PortMapping
+	VHostAddr           string
+	HTTPSAddr           string
+	DirectAddr          string
+	VHostMap            map[string]uint16
+	AllowedPorts        map[uint16]struct{}
+	EnableUPnP          bool
+	EnableTLS           bool
+	STUNServer          string
+	STUNInterval        time.Duration
+	UPnPRefreshInterval time.Duration
+	ProbeURL            string
+	MockUPnPEndpoints   []upnpEndpoint
+	MockGatewayIP       string
+	DDNS                DDNSConfig
+	CertDir             string
+	TLSCertFile         string
+	TLSKeyFile          string
 }
 
 type cachedUDPAddr struct {
@@ -1595,19 +1600,29 @@ func pcpSetPortMapping(targetAddr, lanIP string, intPort, extPort uint16, proto 
 
 // updateDDNS pushes the newly detected public IP to DuckDNS, Cloudflare, No-IP, or a custom webhook.
 func updateDDNS(cfg DDNSConfig, newIP string) error {
+	newIP = strings.TrimSpace(newIP)
+	if net.ParseIP(newIP) == nil {
+		return fmt.Errorf("invalid public IP for DDNS update: %q", newIP)
+	}
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	if cfg.Webhook != "" {
 		targetURL := strings.ReplaceAll(cfg.Webhook, "{ip}", url.QueryEscape(newIP))
+		targetURL = strings.ReplaceAll(targetURL, "{domain}", url.QueryEscape(cfg.Domain))
 		resp, err := client.Get(targetURL)
 		if err != nil {
 			return err
 		}
-		_ = resp.Body.Close()
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			return nil
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 128))
+		bodyStr := strings.TrimSpace(string(b))
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("webhook status %d: %s", resp.StatusCode, bodyStr)
 		}
-		return fmt.Errorf("webhook status %d", resp.StatusCode)
+		if strings.EqualFold(bodyStr, "KO") || strings.HasPrefix(strings.ToLower(bodyStr), "badauth") || strings.HasPrefix(strings.ToLower(bodyStr), "nohost") {
+			return fmt.Errorf("webhook rejected update: %s", bodyStr)
+		}
+		return nil
 	}
 
 	provider := strings.ToLower(strings.TrimSpace(cfg.Provider))
@@ -1618,6 +1633,9 @@ func updateDDNS(cfg DDNSConfig, newIP string) error {
 	switch provider {
 	case "duckdns":
 		domain := strings.TrimSuffix(strings.TrimSpace(cfg.Domain), ".duckdns.org")
+		if domain == "" || strings.TrimSpace(cfg.Token) == "" {
+			return errors.New("duckdns requires both domain and token")
+		}
 		u := fmt.Sprintf("https://www.duckdns.org/update?domains=%s&token=%s&ip=%s",
 			url.QueryEscape(domain), url.QueryEscape(cfg.Token), url.QueryEscape(newIP))
 		resp, err := client.Get(u)
@@ -1626,12 +1644,19 @@ func updateDDNS(cfg DDNSConfig, newIP string) error {
 		}
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
-		if !strings.HasPrefix(strings.TrimSpace(string(b)), "OK") {
-			return fmt.Errorf("duckdns response: %s", strings.TrimSpace(string(b)))
+		bodyStr := strings.TrimSpace(string(b))
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("duckdns status %d: %s", resp.StatusCode, bodyStr)
+		}
+		if !strings.HasPrefix(bodyStr, "OK") {
+			return fmt.Errorf("duckdns response: %s", bodyStr)
 		}
 		return nil
 
 	case "noip", "dyndns":
+		if strings.TrimSpace(cfg.Domain) == "" || strings.TrimSpace(cfg.Token) == "" {
+			return errors.New("no-ip DDNS requires domain and password/token")
+		}
 		u := fmt.Sprintf("https://dynupdate.no-ip.com/nic/update?hostname=%s&myip=%s",
 			url.QueryEscape(cfg.Domain), url.QueryEscape(newIP))
 		req, err := http.NewRequest("GET", u, nil)
@@ -1645,10 +1670,16 @@ func updateDDNS(cfg DDNSConfig, newIP string) error {
 			return err
 		}
 		defer resp.Body.Close()
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			return nil
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 128))
+		bodyStr := strings.TrimSpace(string(b))
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("no-ip status %d: %s", resp.StatusCode, bodyStr)
 		}
-		return fmt.Errorf("no-ip status %d", resp.StatusCode)
+		lowerBody := strings.ToLower(bodyStr)
+		if bodyStr != "" && !strings.HasPrefix(lowerBody, "good") && !strings.HasPrefix(lowerBody, "nochg") && !strings.HasPrefix(lowerBody, "ok") {
+			return fmt.Errorf("no-ip error response: %s", bodyStr)
+		}
+		return nil
 
 	case "cloudflare":
 		if cfg.ZoneID == "" || cfg.Token == "" || cfg.Domain == "" {
@@ -1666,13 +1697,20 @@ func updateDDNS(cfg DDNSConfig, newIP string) error {
 			return err
 		}
 		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("cloudflare list records status %d", resp.StatusCode)
+		}
 		var listRes struct {
-			Result []struct {
+			Success bool `json:"success"`
+			Result  []struct {
 				ID string `json:"id"`
 			} `json:"result"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&listRes); err != nil {
 			return err
+		}
+		if !listRes.Success && len(listRes.Result) == 0 {
+			return errors.New("cloudflare API returned success=false on DNS record lookup")
 		}
 		bodyMap := map[string]interface{}{
 			"type":    "A",
@@ -1700,10 +1738,17 @@ func updateDDNS(cfg DDNSConfig, newIP string) error {
 			return err
 		}
 		defer upResp.Body.Close()
-		if upResp.StatusCode >= 200 && upResp.StatusCode < 300 {
+		var upRes struct {
+			Success bool `json:"success"`
+		}
+		_ = json.NewDecoder(upResp.Body).Decode(&upRes)
+		if upResp.StatusCode >= 200 && upResp.StatusCode < 300 && upRes.Success {
 			return nil
 		}
-		return fmt.Errorf("cloudflare status %d", upResp.StatusCode)
+		if upResp.StatusCode < 200 || upResp.StatusCode >= 300 {
+			return fmt.Errorf("cloudflare status %d", upResp.StatusCode)
+		}
+		return errors.New("cloudflare API update returned success=false")
 	}
 	return fmt.Errorf("unsupported -ddns-provider %q", cfg.Provider)
 }
@@ -1752,11 +1797,41 @@ func formatDuckDomain(d string) string {
 	return d + ".duckdns.org"
 }
 
+func classifyDomainKind(cfg DDNSConfig) string {
+	dom := strings.ToLower(strings.TrimSpace(cfg.Domain))
+	if dom == "" {
+		return "none"
+	}
+	if dom == "auto" || strings.HasSuffix(dom, ".sslip.io") || strings.HasSuffix(dom, ".nip.io") {
+		return "ip-based (sslip.io)"
+	}
+	if cfg.Provider != "" {
+		return "ddns (" + strings.ToLower(strings.TrimSpace(cfg.Provider)) + ")"
+	}
+	if cfg.Webhook != "" {
+		return "ddns (webhook)"
+	}
+	if net.ParseIP(dom) != nil {
+		return "raw-ip"
+	}
+	return "custom-domain"
+}
+
 func resolveAndPersistDDNS(cfg DDNSConfig, duckFlag string) DDNSConfig {
 	duckFlag = strings.TrimSpace(duckFlag)
 	explicitlyProvided := cfg.Provider != "" || cfg.Domain != "" || cfg.Token != "" || cfg.Webhook != "" || duckFlag != ""
-	// Opt-in only: do nothing by default unless -duck (or -ddns-*) flag was explicitly passed
 	if !explicitlyProvided {
+		// Automatically restore previously saved persistent DDNS configuration across restarts if present
+		if b, err := os.ReadFile(ddnsCacheFile); err == nil {
+			var saved DDNSConfig
+			if json.Unmarshal(b, &saved) == nil && (saved.Provider != "" || saved.Webhook != "" || (saved.Domain != "" && !strings.EqualFold(saved.Domain, "auto") && !strings.HasSuffix(strings.ToLower(saved.Domain), ".sslip.io"))) {
+				if saved.Token != "" {
+					registerSecretForLogRedaction(saved.Token)
+				}
+				saved.DomainKind = classifyDomainKind(saved)
+				return saved
+			}
+		}
 		return DDNSConfig{}
 	}
 
@@ -1765,6 +1840,16 @@ func resolveAndPersistDDNS(cfg DDNSConfig, duckFlag string) DDNSConfig {
 			cfg.Provider = "duckdns"
 			cfg.Domain = dom
 			cfg.Token = tok
+		} else if !strings.Contains(duckFlag, ":") && !strings.Contains(duckFlag, "/") {
+			// Passed -duck=subdomain without a token: check if saved token exists in .driftless-ddns.json
+			cfg.Domain = formatDuckDomain(duckFlag)
+			if b, err := os.ReadFile(ddnsCacheFile); err == nil {
+				var saved DDNSConfig
+				if json.Unmarshal(b, &saved) == nil && saved.Token != "" && strings.EqualFold(saved.Provider, "duckdns") {
+					cfg.Provider = "duckdns"
+					cfg.Token = saved.Token
+				}
+			}
 		}
 	}
 
@@ -1831,15 +1916,19 @@ func resolveAndPersistDDNS(cfg DDNSConfig, duckFlag string) DDNSConfig {
 	if cfg.Token != "" {
 		registerSecretForLogRedaction(cfg.Token)
 	}
-	if cfg.Provider != "" || cfg.Webhook != "" {
+	if cfg.Provider != "" || cfg.Webhook != "" || (cfg.Domain != "" && !strings.EqualFold(cfg.Domain, "auto") && !strings.HasSuffix(strings.ToLower(cfg.Domain), ".sslip.io")) {
+		cfg.DomainKind = classifyDomainKind(cfg)
 		if b, err := json.MarshalIndent(cfg, "", "  "); err == nil {
 			if wErr := writeFileAtomic0600(ddnsCacheFile, b); wErr != nil {
 				log.Printf("[duckdns] WARNING: failed to persist DDNS configuration to %s: %v", ddnsCacheFile, wErr)
 			}
 		}
 	} else if strings.EqualFold(duckFlag, "auto") && cfg.Domain == "" {
-		// Bare -duck passed with no saved DuckDNS token: mark Domain="auto" so we generate an automatic domain + cert
+		// Bare -duck passed with no saved DuckDNS token: mark Domain="auto" for temporary IP-based sslip.io hostname (never persisted as a permanent user domain)
 		cfg.Domain = "auto"
+		cfg.DomainKind = "ip-based (sslip.io)"
+	} else {
+		cfg.DomainKind = classifyDomainKind(cfg)
 	}
 	return cfg
 }
@@ -1867,26 +1956,204 @@ func isCGNATOrPrivateIP(ipStr string) bool {
 	return false
 }
 
+const (
+	udpProbeMagicPrefix = "DRIFTLESS-UDP-PROBE:"
+	udpProbeRespPrefix  = "DRIFTLESS-UDP-PONG:"
+)
+
+type ExternalProbeResponse struct {
+	Proto     string `json:"proto"`
+	Target    string `json:"target"`
+	Reachable bool   `json:"reachable"`
+	Confirmed bool   `json:"confirmed"`
+	Error     string `json:"error,omitempty"`
+}
+
+// handleExternalProbeHTTP serves GET /probe?proto=tcp|udp&host=IP&port=PORT on a remote VPS Gateway
+// so standalone nodes or `driftless check -probe-url` can perform a true external reachability test
+// from outside the home LAN instead of relying on local NAT hairpinning.
+func handleExternalProbeHTTP(w http.ResponseWriter, r *http.Request) {
+	proto := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("proto")))
+	if proto == "" {
+		proto = "tcp"
+	}
+	host := strings.TrimSpace(r.URL.Query().Get("host"))
+	if host == "" {
+		host, _, _ = net.SplitHostPort(r.RemoteAddr)
+	}
+	portStr := strings.TrimSpace(r.URL.Query().Get("port"))
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 || host == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(ExternalProbeResponse{
+			Proto:     proto,
+			Target:    fmt.Sprintf("%s:%s", host, portStr),
+			Reachable: false,
+			Error:     "invalid host or port",
+		})
+		return
+	}
+	timeout := 1500 * time.Millisecond
+	if tMs, err := strconv.Atoi(r.URL.Query().Get("timeout_ms")); err == nil && tMs >= 100 && tMs <= 5000 {
+		timeout = time.Duration(tMs) * time.Millisecond
+	}
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+	w.Header().Set("Content-Type", "application/json")
+
+	if proto == "udp" {
+		ok, err := probeUDPWithConfirmation(target, timeout)
+		resp := ExternalProbeResponse{
+			Proto:     "udp",
+			Target:    target,
+			Reachable: ok,
+			Confirmed: ok,
+		}
+		if err != nil {
+			resp.Error = err.Error()
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	c, err := net.DialTimeout("tcp", target, timeout)
+	if err != nil {
+		_ = json.NewEncoder(w).Encode(ExternalProbeResponse{
+			Proto:     "tcp",
+			Target:    target,
+			Reachable: false,
+			Confirmed: false,
+			Error:     err.Error(),
+		})
+		return
+	}
+	_ = c.Close()
+	_ = json.NewEncoder(w).Encode(ExternalProbeResponse{
+		Proto:     "tcp",
+		Target:    target,
+		Reachable: true,
+		Confirmed: true,
+	})
+}
+
+// probeUDPWithConfirmation sends a UDP probe packet and waits for a verified response (either a Driftless
+// UDP probe pong or an application-level datagram reply) to confirm bidirectional UDP reachability.
+func probeUDPWithConfirmation(targetAddr string, timeout time.Duration) (bool, error) {
+	if timeout <= 0 {
+		timeout = 1200 * time.Millisecond
+	}
+	raddr, err := net.ResolveUDPAddr("udp", targetAddr)
+	if err != nil {
+		return false, err
+	}
+	conn, err := net.DialUDP("udp", nil, raddr)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+
+	var nonceBytes [8]byte
+	_, _ = rand.Read(nonceBytes[:])
+	nonce := hex.EncodeToString(nonceBytes[:])
+	payload := []byte(udpProbeMagicPrefix + nonce)
+
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if _, err := conn.Write(payload); err != nil {
+		return false, err
+	}
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		return false, errors.New("empty UDP response")
+	}
+	respStr := string(buf[:n])
+	if strings.HasPrefix(respStr, udpProbeRespPrefix) && strings.TrimPrefix(respStr, udpProbeRespPrefix) != nonce {
+		return false, errors.New("mismatched UDP probe nonce")
+	}
+	return true, nil
+}
+
+func queryExternalProbeEndpoint(probeURL, proto, host string, port uint16, timeout time.Duration) (bool, error) {
+	u, err := url.Parse(strings.TrimSpace(probeURL))
+	if err != nil {
+		return false, err
+	}
+	q := u.Query()
+	q.Set("proto", proto)
+	if host != "" {
+		q.Set("host", host)
+	}
+	q.Set("port", strconv.Itoa(int(port)))
+	q.Set("timeout_ms", strconv.Itoa(int(timeout.Milliseconds())))
+	u.RawQuery = q.Encode()
+
+	client := &http.Client{Timeout: timeout + 1500*time.Millisecond}
+	resp, err := client.Get(u.String())
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	var pr ExternalProbeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return false, err
+	}
+	if !pr.Reachable {
+		if pr.Error != "" {
+			return false, errors.New(pr.Error)
+		}
+		return false, errors.New("external probe reported port unreachable")
+	}
+	return true, nil
+}
+
 type ReachabilityReport struct {
-	PublicIP       string            `json:"public_ip"`
-	LANIP          string            `json:"lan_ip"`
-	CGNATDetected  bool              `json:"cgnat_detected"`
-	Domain         string            `json:"domain,omitempty"`
-	DomainResolved []string          `json:"domain_resolved,omitempty"`
-	DomainMatches  bool              `json:"domain_matches"`
-	PortStatus     map[uint16]string `json:"port_status"`
+	PublicIP           string            `json:"public_ip"`
+	LANIP              string            `json:"lan_ip"`
+	CGNATDetected      bool              `json:"cgnat_detected"`
+	Domain             string            `json:"domain,omitempty"`
+	DomainKind         string            `json:"domain_kind,omitempty"`
+	DomainResolved     []string          `json:"domain_resolved,omitempty"`
+	DomainMatches      bool              `json:"domain_matches"`
+	ExternalProbeUsed  bool              `json:"external_probe_used"`
+	LocalServiceStatus map[uint16]string `json:"local_service_status"`
+	PortForwardStatus  map[uint16]string `json:"port_forward_status"`
+	ExternalStatus     map[uint16]string `json:"external_status"`
+	PortStatus         map[uint16]string `json:"port_status"`
+}
+
+func hasActiveRouterMappingForPort(extPort uint16) bool {
+	upnpStateMu.Lock()
+	defer upnpStateMu.Unlock()
+	for _, m := range activeUPnPMappings {
+		if m.Port == extPort {
+			return true
+		}
+	}
+	return false
 }
 
 func checkExternalReachability(pubIP, targetHost string, ddns DDNSConfig, mappings []PortMapping, timeout time.Duration) ReachabilityReport {
+	return checkExternalReachabilityWithProbe(pubIP, targetHost, ddns, mappings, defaultExternalProbeURL, timeout)
+}
+
+func checkExternalReachabilityWithProbe(pubIP, targetHost string, ddns DDNSConfig, mappings []PortMapping, probeURL string, timeout time.Duration) ReachabilityReport {
 	if timeout <= 0 {
 		timeout = 1500 * time.Millisecond
 	}
+	probeURL = strings.TrimSpace(probeURL)
 	rep := ReachabilityReport{
-		PublicIP:      pubIP,
-		LANIP:         detectLocalLANIP(),
-		CGNATDetected: isCGNATOrPrivateIP(pubIP) && pubIP != "127.0.0.1",
-		Domain:        ddns.Domain,
-		PortStatus:    make(map[uint16]string, len(mappings)),
+		PublicIP:           pubIP,
+		LANIP:              detectLocalLANIP(),
+		CGNATDetected:      isCGNATOrPrivateIP(pubIP) && pubIP != "127.0.0.1",
+		Domain:             ddns.Domain,
+		DomainKind:         classifyDomainKind(ddns),
+		ExternalProbeUsed:  probeURL != "",
+		LocalServiceStatus: make(map[uint16]string, len(mappings)),
+		PortForwardStatus:  make(map[uint16]string, len(mappings)),
+		ExternalStatus:     make(map[uint16]string, len(mappings)),
+		PortStatus:         make(map[uint16]string, len(mappings)),
 	}
 	if ddns.Domain != "" && !strings.EqualFold(ddns.Domain, "auto") {
 		if ips, err := net.LookupHost(ddns.Domain); err == nil {
@@ -1900,31 +2167,90 @@ func checkExternalReachability(pubIP, targetHost string, ddns DDNSConfig, mappin
 		}
 	}
 	for _, m := range mappings {
+		// 1. Check router port-forwarding state
+		if hasActiveRouterMappingForPort(m.PublicPort) {
+			rep.PortForwardStatus[m.PublicPort] = "forwarded (UPnP/NAT-PMP/PCP rule active)"
+		} else {
+			rep.PortForwardStatus[m.PublicPort] = "no automatic router rule (manual forward or local-only)"
+		}
+
 		if m.Proto == "udp" {
-			rep.PortStatus[m.PublicPort] = "udp-listening"
+			// Verify local UDP response confirmation first
+			localUDPOK, _ := probeUDPWithConfirmation(fmt.Sprintf("%s:%d", targetHost, m.TargetPort), timeout)
+			if !localUDPOK && m.RouterUDPPort > 0 {
+				localUDPOK, _ = probeUDPWithConfirmation(fmt.Sprintf("127.0.0.1:%d", m.RouterUDPPort), timeout)
+			}
+			if localUDPOK {
+				rep.LocalServiceStatus[m.PublicPort] = "ok (udp response confirmed)"
+			} else {
+				rep.LocalServiceStatus[m.PublicPort] = "unverified (no udp response on :" + strconv.Itoa(int(m.TargetPort)) + ")"
+			}
+
+			if probeURL != "" && pubIP != "" {
+				extUDPOK, err := queryExternalProbeEndpoint(probeURL, "udp", pubIP, m.PublicPort, timeout)
+				if extUDPOK {
+					rep.ExternalStatus[m.PublicPort] = "verified-from-internet (external UDP probe response confirmed)"
+					rep.PortStatus[m.PublicPort] = "reachable (verified externally via UDP response confirmation)"
+				} else {
+					errMsg := "timeout/filtered"
+					if err != nil {
+						errMsg = err.Error()
+					}
+					rep.ExternalStatus[m.PublicPort] = "unreachable-from-internet (" + errMsg + ")"
+					rep.PortStatus[m.PublicPort] = "external UDP check failed (" + errMsg + ")"
+				}
+			} else {
+				rep.ExternalStatus[m.PublicPort] = "unverified-from-internet (не удалось проверить извне: specify -probe-url for external UDP verification)"
+				if localUDPOK {
+					rep.PortStatus[m.PublicPort] = "local UDP OK; не удалось проверить извне (no external probe configured)"
+				} else {
+					rep.PortStatus[m.PublicPort] = "udp listener active; не удалось проверить извне (no external probe configured)"
+				}
+			}
 			continue
 		}
+
+		// 2. Check local TCP target service
 		localOK := false
 		if c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", targetHost, m.TargetPort), timeout); err == nil {
 			_ = c.Close()
 			localOK = true
+			rep.LocalServiceStatus[m.PublicPort] = "ok (local TCP :" + strconv.Itoa(int(m.TargetPort)) + " reachable)"
+		} else {
+			rep.LocalServiceStatus[m.PublicPort] = "waiting for local service on :" + strconv.Itoa(int(m.TargetPort))
 		}
-		extOK := false
-		if pubIP != "" {
-			if c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", pubIP, m.PublicPort), timeout); err == nil {
-				_ = c.Close()
-				extOK = true
+
+		// 3. Check external reachability: NEVER treat a local dial to our own public IP (NAT hairpin/loopback)
+		// as proof of internet reachability. Only mark externally reachable when verified via an independent external probe.
+		if probeURL != "" && pubIP != "" {
+			extOK, err := queryExternalProbeEndpoint(probeURL, "tcp", pubIP, m.PublicPort, timeout)
+			if extOK {
+				rep.ExternalStatus[m.PublicPort] = "verified-from-internet (external TCP probe OK)"
+				if localOK {
+					rep.PortStatus[m.PublicPort] = "reachable (verified from internet + local service OK)"
+				} else {
+					rep.PortStatus[m.PublicPort] = "external listener reachable (waiting for local service on :" + strconv.Itoa(int(m.TargetPort)) + ")"
+				}
+			} else {
+				errMsg := "connection failed"
+				if err != nil {
+					errMsg = err.Error()
+				}
+				rep.ExternalStatus[m.PublicPort] = "unreachable-from-internet (" + errMsg + ")"
+				if localOK {
+					rep.PortStatus[m.PublicPort] = "local service OK, but unreachable from internet (" + errMsg + ")"
+				} else {
+					rep.PortStatus[m.PublicPort] = "unreachable from internet and waiting for local service on :" + strconv.Itoa(int(m.TargetPort))
+				}
 			}
-		}
-		switch {
-		case extOK && localOK:
-			rep.PortStatus[m.PublicPort] = "reachable (external + local OK)"
-		case extOK && !localOK:
-			rep.PortStatus[m.PublicPort] = "listener reachable (waiting for local service on :" + strconv.Itoa(int(m.TargetPort)) + ")"
-		case localOK:
-			rep.PortStatus[m.PublicPort] = "local service OK (router/ISP hairpin or CGNAT on external IP)"
-		default:
-			rep.PortStatus[m.PublicPort] = "waiting for local service on :" + strconv.Itoa(int(m.TargetPort))
+		} else {
+			// No external probe available: explicitly report that external reachability could not be verified from outside
+			rep.ExternalStatus[m.PublicPort] = "unverified-from-internet (не удалось проверить извне: local hairpin dial is not proof of internet reachability)"
+			if localOK {
+				rep.PortStatus[m.PublicPort] = fmt.Sprintf("local service OK | port-forward: %s | внешняя доступность: не удалось проверить извне (no external probe)", rep.PortForwardStatus[m.PublicPort])
+			} else {
+				rep.PortStatus[m.PublicPort] = "waiting for local service on :" + strconv.Itoa(int(m.TargetPort)) + " | внешняя доступность: не удалось проверить извне"
+			}
 		}
 	}
 	return rep
@@ -1935,11 +2261,17 @@ func printStandaloneBanner(pubIP string, ddns DDNSConfig, mappings []PortMapping
 	if ddns.Domain != "" {
 		host = ddns.Domain
 	}
+	domainKind := classifyDomainKind(ddns)
 	var summary strings.Builder
 	log.Printf("[standalone] ==========================================================")
 	if ddns.Domain != "" {
-		log.Printf("[standalone] Published Endpoints (Domain: %s | Public IP: %s):", ddns.Domain, pubIP)
-		fmt.Fprintf(&summary, "  Host: %s (Public IP: %s)\n", ddns.Domain, pubIP)
+		if domainKind == "ip-based (sslip.io)" {
+			log.Printf("[standalone] Published Endpoints (Temporary IP-based hostname: %s [changes when ISP IP changes] | Public IP: %s):", ddns.Domain, pubIP)
+			fmt.Fprintf(&summary, "  Host: %s (Temporary IP-based sslip.io hostname; changes if ISP IP changes | Public IP: %s)\n", ddns.Domain, pubIP)
+		} else {
+			log.Printf("[standalone] Published Endpoints (Domain [%s]: %s | Public IP: %s):", domainKind, ddns.Domain, pubIP)
+			fmt.Fprintf(&summary, "  Host: %s (%s | Public IP: %s)\n", ddns.Domain, domainKind, pubIP)
+		}
 	} else {
 		log.Printf("[standalone] Published Endpoints (Public IP: %s):", pubIP)
 		fmt.Fprintf(&summary, "  Host: %s\n", pubIP)
@@ -2074,8 +2406,10 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 	} else if autoSSLIPMode {
 		if autoDom := autoZeroConfigDomain(pubIP); autoDom != "" {
 			cfg.DDNS.Domain = autoDom
+			cfg.DDNS.DomainKind = "ip-based (sslip.io)"
 		} else {
 			cfg.DDNS.Domain = pubIP
+			cfg.DDNS.DomainKind = "raw-ip"
 		}
 	}
 	if cfg.DDNS.Domain != "" {
@@ -2111,13 +2445,20 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 		}
 	}
 
+	forwardPorts := func(currentLAN string) int {
+		if len(cfg.MockUPnPEndpoints) > 0 || cfg.MockGatewayIP != "" {
+			return autoForwardRouterPortsWithEndpoints(currentLAN, allowedMappings, upnpVHostAddr, upnpHTTPSAddr, cfg.MockUPnPEndpoints, cfg.MockGatewayIP)
+		}
+		return autoForwardRouterPorts(currentLAN, allowedMappings, upnpVHostAddr, upnpHTTPSAddr)
+	}
+
 	lastUPnPMapped := 0
 	var lastUPnPRefresh time.Time
 	if cfg.EnableUPnP {
 		if _, err := cleanupStaleUPnPState(); err != nil {
 			log.Printf("[standalone] ERROR: stale UPnP state cleanup could not persist remaining state: %v", err)
 		}
-		lastUPnPMapped = autoForwardRouterPorts(lanIP, allowedMappings, upnpVHostAddr, upnpHTTPSAddr)
+		lastUPnPMapped = forwardPorts(lanIP)
 		lastUPnPRefresh = time.Now()
 		if lastUPnPMapped == 0 {
 			log.Printf("[standalone] warning: router UPnP/NAT-PMP mapped 0 ports (will retry every 15s automatically)")
@@ -2139,7 +2480,7 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 
 	// Asynchronous startup reachability check so listener readiness is never blocked
 	go func(initialIP string) {
-		rep := checkExternalReachability(initialIP, cfg.TargetHost, cfg.DDNS, allowedMappings, 800*time.Millisecond)
+		rep := checkExternalReachabilityWithProbe(initialIP, cfg.TargetHost, cfg.DDNS, allowedMappings, cfg.ProbeURL, 800*time.Millisecond)
 		for port, status := range rep.PortStatus {
 			log.Printf("[standalone] reachability check :%d -> %s", port, status)
 		}
@@ -2147,12 +2488,19 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 
 	// 1-second STUN IP change detector + automatic DDNS retry + fast router-reboot UPnP recovery
 	interval := cfg.STUNInterval
-	if interval < 250*time.Millisecond {
+	if interval < 50*time.Millisecond {
 		interval = time.Second
 	}
 	stunTicker := time.NewTicker(interval)
 	defer stunTicker.Stop()
-	upnpTicker := time.NewTicker(15 * time.Second)
+
+	upnpTickDur := 15 * time.Second
+	upnpForceRefreshDur := time.Minute
+	if cfg.UPnPRefreshInterval > 0 {
+		upnpTickDur = cfg.UPnPRefreshInterval
+		upnpForceRefreshDur = cfg.UPnPRefreshInterval
+	}
+	upnpTicker := time.NewTicker(upnpTickDur)
 	defer upnpTicker.Stop()
 
 	currentIP := pubIP
@@ -2163,9 +2511,9 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 			log.Printf("[standalone] shutting down cleanly...")
 			return nil
 		case <-upnpTicker.C:
-			if cfg.EnableUPnP && (lastUPnPMapped == 0 || time.Since(lastUPnPRefresh) >= time.Minute) {
+			if cfg.EnableUPnP && (lastUPnPMapped == 0 || time.Since(lastUPnPRefresh) >= upnpForceRefreshDur) {
 				lanIP = detectLocalLANIP()
-				lastUPnPMapped = autoForwardRouterPorts(lanIP, allowedMappings, upnpVHostAddr, upnpHTTPSAddr)
+				lastUPnPMapped = forwardPorts(lanIP)
 				lastUPnPRefresh = time.Now()
 			}
 		case <-stunTicker.C:
@@ -2185,13 +2533,14 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 					}
 					if cfg.EnableUPnP {
 						lanIP = detectLocalLANIP()
-						lastUPnPMapped = autoForwardRouterPorts(lanIP, allowedMappings, upnpVHostAddr, upnpHTTPSAddr)
+						lastUPnPMapped = forwardPorts(lanIP)
 						lastUPnPRefresh = time.Now()
 					}
 					if ipChanged {
 						if autoSSLIPMode {
 							if autoDom := autoZeroConfigDomain(currentIP); autoDom != "" {
 								cfg.DDNS.Domain = autoDom
+								cfg.DDNS.DomainKind = "ip-based (sslip.io)"
 								go sniMgr.ensureDomainCertificate(cfg.DDNS.Domain)
 								printStandaloneBanner(currentIP, cfg.DDNS, allowedMappings, cfg.EnableTLS, cfg.CertDir)
 							}
@@ -2201,7 +2550,7 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 				}
 			}
 			// Retry DDNS automatically if it hasn't synced currentIP yet (e.g. right after PPTP/PPP reconnect)
-			if hasDDNSProvider && ddnsSyncedIP != currentIP && time.Since(lastDDNSAttempt) >= 5*time.Second {
+			if hasDDNSProvider && ddnsSyncedIP != currentIP && (lastDDNSAttempt.IsZero() || time.Since(lastDDNSAttempt) >= 5*time.Second) {
 				lastDDNSAttempt = time.Now()
 				if err := updateDDNS(cfg.DDNS, currentIP); err != nil {
 					log.Printf("[standalone] DDNS update error (will retry in 5s): %v", err)
@@ -2405,6 +2754,11 @@ func startStandaloneUDP(ctx context.Context, targetHost string, m *PortMapping) 
 				continue
 			}
 			if n == 0 {
+				continue
+			}
+			if bytes.HasPrefix(buf[:n], []byte(udpProbeMagicPrefix)) {
+				nonce := string(buf[len(udpProbeMagicPrefix):n])
+				_, _ = pubConn.WriteToUDP([]byte(udpProbeRespPrefix+nonce), clientAddr)
 				continue
 			}
 			key := clientAddr.String()

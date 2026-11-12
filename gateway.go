@@ -78,6 +78,7 @@ type Gateway struct {
 	agentLanIP      string
 	vhostRoutes     map[string]VHostRoute
 	portRoutes      map[uint16]PortMapping
+	portConflicts   []string
 	boundTCPPorts   map[uint16]bool
 	boundUDPPorts   map[uint16]bool
 	sessions        map[uint64]*Session
@@ -305,39 +306,6 @@ func runGateway(ctx context.Context, quicAddr, token, directHTTPAddr, vhostAddr,
 	}
 	defer listener.Close()
 
-	// Also listen on TCP (TLS-Mux) on the same address so agents behind UDP-blocking firewalls can fall back automatically
-	tcpMuxListener, tcpMuxErr := tls.Listen("tcp", quicAddr, tlsConf)
-	if tcpMuxErr == nil {
-		defer tcpMuxListener.Close()
-		go func() {
-			<-ctx.Done()
-			_ = tcpMuxListener.Close()
-		}()
-		go func() {
-			for {
-				c, err := tcpMuxListener.Accept()
-				if err != nil {
-					if ctx.Err() != nil {
-						return
-					}
-					continue
-				}
-				go func(raw net.Conn) {
-					if tlsC, ok := raw.(*tls.Conn); ok {
-						_ = tlsC.SetDeadline(time.Now().Add(5 * time.Second))
-						if err := tlsC.Handshake(); err != nil {
-							_ = raw.Close()
-							return
-						}
-						_ = tlsC.SetDeadline(time.Time{})
-					}
-					muxConn := newTCPMuxConn(raw, false, quicKeepalive, quicIdle)
-					gw.authenticateAndServeAgent(ctx, muxConn)
-				}(c)
-			}
-		}()
-	}
-
 	go gw.cleanupLoop(ctx)
 
 	if directHTTPAddr != "" {
@@ -370,6 +338,39 @@ func runGateway(ctx context.Context, quicAddr, token, directHTTPAddr, vhostAddr,
 			go gw.authenticateAndServeAgent(ctx, &quicTunnelConn{conn: conn})
 		}
 	}()
+
+	// Also listen on TCP (TLS-Mux) on the same address so agents behind UDP-blocking firewalls can fall back automatically
+	tcpMuxListener, tcpMuxErr := tls.Listen("tcp", quicAddr, tlsConf)
+	if tcpMuxErr == nil {
+		defer tcpMuxListener.Close()
+		go func() {
+			<-ctx.Done()
+			_ = tcpMuxListener.Close()
+		}()
+		go func() {
+			for {
+				c, err := tcpMuxListener.Accept()
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					continue
+				}
+				go func(raw net.Conn) {
+					if tlsC, ok := raw.(*tls.Conn); ok {
+						_ = tlsC.SetDeadline(time.Now().Add(5 * time.Second))
+						if err := tlsC.Handshake(); err != nil {
+							_ = raw.Close()
+							return
+						}
+						_ = tlsC.SetDeadline(time.Time{})
+					}
+					muxConn := newTCPMuxConn(raw, false, quicKeepalive, quicIdle)
+					gw.authenticateAndServeAgent(ctx, muxConn)
+				}(c)
+			}
+		}()
+	}
 
 	quicHost, quicPort, _ := net.SplitHostPort(quicAddr)
 	if quicPort == "" {
@@ -415,9 +416,31 @@ func runGateway(ctx context.Context, quicAddr, token, directHTTPAddr, vhostAddr,
 	return nil
 }
 
-func (gw *Gateway) ensurePublicPortListeners(ctx context.Context, m PortMapping, strict bool) error {
+func (gw *Gateway) recordConflict(msg string) {
 	gw.mu.Lock()
-	gw.portRoutes[m.PublicPort] = m
+	gw.portConflicts = append(gw.portConflicts, msg)
+	gw.mu.Unlock()
+	log.Printf("[gateway] CONFLICT: %s", msg)
+}
+
+func (gw *Gateway) Conflicts() []string {
+	gw.mu.RLock()
+	defer gw.mu.RUnlock()
+	return append([]string(nil), gw.portConflicts...)
+}
+
+func (gw *Gateway) ensurePublicPortListeners(ctx context.Context, m PortMapping, strict bool) error {
+	reqNode := strings.ToLower(strings.TrimSpace(m.NodeID))
+	gw.mu.Lock()
+	if existing, ok := gw.portRoutes[m.PublicPort]; ok {
+		exNode := strings.ToLower(strings.TrimSpace(existing.NodeID))
+		if exNode != "" && reqNode != "" && exNode != reqNode {
+			gw.mu.Unlock()
+			conflictErr := fmt.Errorf("public port :%d requested by agent %q is already assigned to agent %q", m.PublicPort, reqNode, exNode)
+			gw.recordConflict(conflictErr.Error())
+			return conflictErr
+		}
+	}
 	needTCP := (m.Proto == "tcp" || m.Proto == "http" || m.Proto == "https" || m.Proto == "both") && !gw.boundTCPPorts[m.PublicPort]
 	needUDP := (m.Proto == "udp" || m.Proto == "both") && !gw.boundUDPPorts[m.PublicPort]
 	if needTCP {
@@ -433,10 +456,9 @@ func (gw *Gateway) ensurePublicPortListeners(ctx context.Context, m PortMapping,
 			gw.mu.Lock()
 			delete(gw.boundTCPPorts, m.PublicPort)
 			gw.mu.Unlock()
-			if strict {
-				return err
-			}
-			log.Printf("[gateway] warning: could not dynamically bind TCP :%d for agent %q: %v", m.PublicPort, m.NodeID, err)
+			conflictMsg := fmt.Sprintf("could not bind TCP :%d for agent %q: %v", m.PublicPort, nodeLabel(m.NodeID), err)
+			gw.recordConflict(conflictMsg)
+			return err
 		}
 	}
 	if needUDP {
@@ -444,12 +466,18 @@ func (gw *Gateway) ensurePublicPortListeners(ctx context.Context, m PortMapping,
 			gw.mu.Lock()
 			delete(gw.boundUDPPorts, m.PublicPort)
 			gw.mu.Unlock()
-			if strict && m.Proto == "udp" {
+			if strict || m.Proto == "udp" {
+				conflictMsg := fmt.Sprintf("could not bind UDP :%d for agent %q: %v", m.PublicPort, nodeLabel(m.NodeID), err)
+				gw.recordConflict(conflictMsg)
 				return err
 			}
 			log.Printf("[gateway] note: UDP :%d not bound (%v)", m.PublicPort, err)
 		}
 	}
+
+	gw.mu.Lock()
+	gw.portRoutes[m.PublicPort] = m
+	gw.mu.Unlock()
 	return nil
 }
 
@@ -889,10 +917,6 @@ func (gw *Gateway) authenticateAndServeAgent(ctx context.Context, conn TunnelCon
 	}
 	conn.SetAuthenticated()
 	_ = authStream.SetDeadline(time.Time{})
-	serverMAC := computeServerAuthMAC(matchedTok, nonce, gw.certSHA256, mac)
-	okReply := append([]byte{cmdAuthOK}, serverMAC...)
-	_, _ = authStream.Write(okReply)
-	_ = authStream.Close()
 	gw.authReset(peerHost)
 
 	reg := decodeAgentAuthPayload(authPayload)
@@ -902,6 +926,8 @@ func (gw *Gateway) authenticateAndServeAgent(ctx context.Context, conn TunnelCon
 	}
 
 	metricActiveTransportName.Store(conn.TransportName())
+	var authConflicts []string
+
 	gw.mu.Lock()
 	gw.agentEpoch++
 	myEpoch := gw.agentEpoch
@@ -920,7 +946,12 @@ func (gw *Gateway) authenticateAndServeAgent(ctx context.Context, conn TunnelCon
 		vhosts:   reg.VHosts,
 	}
 	gw.agents[nodeID] = agEntry
-	gw.defaultNodeID = nodeID
+	// Only update defaultNodeID if none is set yet, if this is the "default" node, or if the current default node is offline
+	if gw.defaultNodeID == "" || nodeID == "default" {
+		gw.defaultNodeID = nodeID
+	} else if curDef, ok := gw.agents[gw.defaultNodeID]; !ok || curDef == nil || curDef.conn == nil {
+		gw.defaultNodeID = nodeID
+	}
 	gw.activeAgent = conn
 	gw.agentPubIP = peerHost
 	gw.agentLanIP = reg.LanIP
@@ -928,6 +959,13 @@ func (gw *Gateway) authenticateAndServeAgent(ctx context.Context, conn TunnelCon
 	for _, vh := range reg.VHosts {
 		dom := strings.ToLower(strings.TrimSpace(vh.Domain))
 		if dom != "" && vh.TargetPort > 0 {
+			if existingVH, exists := gw.vhostRoutes[dom]; exists && existingVH.NodeID != "" && existingVH.NodeID != nodeID {
+				cMsg := fmt.Sprintf("vhost %q requested by agent %q is already assigned to agent %q", dom, nodeID, existingVH.NodeID)
+				gw.portConflicts = append(gw.portConflicts, cMsg)
+				authConflicts = append(authConflicts, cMsg)
+				log.Printf("[gateway] CONFLICT: %s", cMsg)
+				continue
+			}
 			gw.vhostRoutes[dom] = VHostRoute{
 				Domain:     dom,
 				TargetPort: vh.TargetPort,
@@ -944,13 +982,39 @@ func (gw *Gateway) authenticateAndServeAgent(ctx context.Context, conn TunnelCon
 			pm.Proto = "both"
 		}
 		if gw.ctx != nil {
-			_ = gw.ensurePublicPortListeners(gw.ctx, pm, false)
+			if err := gw.ensurePublicPortListeners(gw.ctx, pm, false); err != nil {
+				authConflicts = append(authConflicts, err.Error())
+			}
 		} else {
 			gw.mu.Lock()
-			gw.portRoutes[pm.PublicPort] = pm
-			gw.mu.Unlock()
+			if existingPM, ok := gw.portRoutes[pm.PublicPort]; ok && existingPM.NodeID != "" && existingPM.NodeID != nodeID {
+				cMsg := fmt.Sprintf("public port :%d requested by agent %q is already assigned to agent %q", pm.PublicPort, nodeID, existingPM.NodeID)
+				gw.portConflicts = append(gw.portConflicts, cMsg)
+				authConflicts = append(authConflicts, cMsg)
+				gw.mu.Unlock()
+				log.Printf("[gateway] CONFLICT: %s", cMsg)
+			} else {
+				gw.portRoutes[pm.PublicPort] = pm
+				gw.mu.Unlock()
+			}
 		}
 	}
+
+	// Send cmdAuthOK + serverMAC ONLY AFTER all VHosts and public port listeners for this Agent are bound and ready
+	serverMAC := computeServerAuthMAC(matchedTok, nonce, gw.certSHA256, mac)
+	okReply := append([]byte{cmdAuthOK}, serverMAC...)
+	if len(authConflicts) > 0 {
+		conflictNotice := strings.Join(authConflicts, "; ")
+		if len(conflictNotice) > 65000 {
+			conflictNotice = conflictNotice[:65000]
+		}
+		var cLen [2]byte
+		binary.BigEndian.PutUint16(cLen[:], uint16(len(conflictNotice)))
+		okReply = append(okReply, cLen[0], cLen[1])
+		okReply = append(okReply, []byte(conflictNotice)...)
+	}
+	_, _ = authStream.Write(okReply)
+	_ = authStream.Close()
 
 	if oldConn != nil && oldConn != conn {
 		_ = oldConn.CloseWithError(0, "superseded by new agent connection for node "+nodeID)
@@ -1106,10 +1170,13 @@ func (gw *Gateway) cleanupLoop(ctx context.Context) {
 }
 
 func sessionMatchesNode(sessNodeID, connectedNodeID, defaultNodeID string) bool {
-	if sessNodeID == "" || sessNodeID == connectedNodeID {
-		return sessNodeID == connectedNodeID || connectedNodeID == defaultNodeID
+	sessNodeID = strings.ToLower(strings.TrimSpace(sessNodeID))
+	connectedNodeID = strings.ToLower(strings.TrimSpace(connectedNodeID))
+	defaultNodeID = strings.ToLower(strings.TrimSpace(defaultNodeID))
+	if sessNodeID != "" {
+		return sessNodeID == connectedNodeID
 	}
-	return false
+	return connectedNodeID == "default" || connectedNodeID == defaultNodeID
 }
 
 func (gw *Gateway) flushPendingSessionsForNode(nodeID string, agent TunnelConn) {
@@ -1248,6 +1315,7 @@ func (gw *Gateway) startDirectRedirector(ctx context.Context, listenAddr string,
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/probe", handleExternalProbeHTTP)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		nodeParam := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("node")))
 		gw.mu.RLock()
@@ -1299,7 +1367,7 @@ func (gw *Gateway) startDirectRedirector(ctx context.Context, listenAddr string,
 		<-ctx.Done()
 		_ = srv.Close()
 	}()
-	log.Printf("[gateway] direct LAN/WAN redirector active on %s", listenAddr)
+	log.Printf("[gateway] direct LAN/WAN redirector & external reachability probe active on %s", listenAddr)
 	_ = srv.ListenAndServe()
 }
 
@@ -1408,13 +1476,15 @@ func (gw *Gateway) handleAgentStreams(ctx context.Context, nodeID string, conn T
 					for _, other := range gw.agents {
 						if other != nil && other.conn != nil {
 							gw.activeAgent = other.conn
-							gw.defaultNodeID = other.nodeID
+							if gw.defaultNodeID == nodeID {
+								gw.defaultNodeID = other.nodeID
+							}
 							break
 						}
 					}
 				}
 				for _, us := range gw.udpSessions {
-					if us.nodeID == "" || us.nodeID == nodeID {
+					if us.nodeID == nodeID || (us.nodeID == "" && nodeID == "default") {
 						us.mu.Lock()
 						if us.stream != nil {
 							_ = us.stream.Close()
@@ -1441,7 +1511,7 @@ func (gw *Gateway) handleAgentStreams(ctx context.Context, nodeID string, conn T
 				gw.mu.RLock()
 				us, ok := gw.udpByID[sessID]
 				gw.mu.RUnlock()
-				if !ok {
+				if !ok || (us.nodeID != "" && us.nodeID != nodeID) {
 					_ = s.Close()
 					return
 				}
@@ -1453,7 +1523,7 @@ func (gw *Gateway) handleAgentStreams(ctx context.Context, nodeID string, conn T
 			gw.mu.RLock()
 			sess, ok := gw.sessions[sessID]
 			gw.mu.RUnlock()
-			if !ok || sess.closed {
+			if !ok || sess.closed || (sess.nodeID != "" && sess.nodeID != nodeID) {
 				_ = s.Close()
 				return
 			}

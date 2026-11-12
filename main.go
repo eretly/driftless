@@ -68,10 +68,12 @@ var (
 	defaultClientCAFile  string
 	defaultClientCert    string
 	defaultClientKey     string
-	defaultAgentNodeID   string
-	defaultAgentMappings []PortMapping
-	defaultAgentVHosts   []VHostRoute
-	defaultVHostNodeMap  = make(map[string]string)
+	defaultAgentNodeID      string
+	defaultAgentMappings    []PortMapping
+	defaultAgentVHosts      []VHostRoute
+	defaultVHostNodeMap     = make(map[string]string)
+	defaultExternalProbeURL string
+	lastAgentAuthConflict   atomic.Value
 
 	chunkBufPool = sync.Pool{
 		New: func() any {
@@ -564,7 +566,7 @@ func printSavedTokenAndCommand() error {
 	return nil
 }
 
-func runInteractiveCheck(stunAddr, targetHost, portsRaw, duckFlag string) {
+func runInteractiveCheck(stunAddr, targetHost, portsRaw, duckFlag, probeURL string) {
 	stunFailCount.Store(3)
 	pubIP, _ := querySTUNPublicIP(stunAddr, 1200*time.Millisecond)
 	if pubIP == "" {
@@ -572,7 +574,7 @@ func runInteractiveCheck(stunAddr, targetHost, portsRaw, duckFlag string) {
 	}
 	mappings, _ := parseMappingsWithDefault(portsRaw, true)
 	ddns := resolveAndPersistDDNS(DDNSConfig{}, duckFlag)
-	rep := checkExternalReachability(pubIP, targetHost, ddns, mappings, 1500*time.Millisecond)
+	rep := checkExternalReachabilityWithProbe(pubIP, targetHost, ddns, mappings, probeURL, 1500*time.Millisecond)
 	out, _ := json.MarshalIndent(rep, "", "  ")
 	fmt.Println(string(out))
 }
@@ -646,6 +648,7 @@ func main() {
 	enableUPnP := flag.Bool("upnp", true, "automatically open ports on home router via UPnP IGD / NAT-PMP / PCP (standalone mode)")
 	stunServer := flag.String("stun", "stun.cloudflare.com:3478", "STUN server or comma-separated list for 5ms external IP change detection (standalone mode)")
 	stunInterval := flag.Duration("stun-interval", 1*time.Second, "how often to check external IP via STUN (standalone mode)")
+	probeURL := flag.String("probe-url", "", "optional external probe endpoint (e.g. http://VPS_IP:8888/probe) for independent internet TCP/UDP reachability verification")
 	duckShort := flag.String("duck", "", "automatic zero-config domain & DuckDNS sync (just pass -duck)")
 	ddnsProvider := flag.String("ddns-provider", "", "built-in Dynamic DNS provider: 'duckdns', 'cloudflare', or 'noip'")
 	ddnsDomain := flag.String("ddns-domain", "", "domain/subdomain to update when IP changes (e.g. myhome.duckdns.org)")
@@ -690,9 +693,10 @@ func main() {
 			*ddnsDomain = d
 		}
 	}
+	defaultExternalProbeURL = strings.TrimSpace(*probeURL)
 
 	if runCheckCmd {
-		runInteractiveCheck(*stunServer, *host, *ports, *duckShort)
+		runInteractiveCheck(*stunServer, *host, *ports, *duckShort, defaultExternalProbeURL)
 		return
 	}
 
@@ -767,6 +771,7 @@ func main() {
 			TLSCertFile:  *tlsCertFile,
 			TLSKeyFile:   *tlsKeyFile,
 			DDNS:         ddnsCfg,
+			ProbeURL:     defaultExternalProbeURL,
 		}
 		if err := runStandalone(ctx, cfg); err != nil {
 			log.Fatalf("[standalone] %v", err)
@@ -811,8 +816,10 @@ func main() {
 			} else if strings.EqualFold(ddnsCfg.Domain, "auto") {
 				if autoDom := autoZeroConfigDomain(pubIP); autoDom != "" {
 					ddnsCfg.Domain = autoDom
+					ddnsCfg.DomainKind = "ip-based (sslip.io)"
 				} else if pubIP != "" {
 					ddnsCfg.Domain = pubIP
+					ddnsCfg.DomainKind = "raw-ip"
 				}
 			}
 			*enableTLS = true
