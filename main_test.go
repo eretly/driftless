@@ -3049,3 +3049,125 @@ func TestDDNSAPIErrorHandlingAndStandaloneRouterRebootRecovery(t *testing.T) {
 		t.Fatalf("expected runStandalone to automatically re-apply UPnP rule %s after router reboot and WAN recovery", ruleKey)
 	}
 }
+
+func TestV156AuditFixesCertDirDynuProtoBothAndEviction(t *testing.T) {
+	// 1. Custom -cert-dir token persistence and retrieval
+	customCertDir := filepath.Join(t.TempDir(), "custom-certs")
+	_ = os.Unsetenv("DRIFTLESS_TOKEN")
+	tok1, err := loadOrGenerateTokenInDir(true, "", "", customCertDir)
+	if err != nil || len(tok1) < 32 {
+		t.Fatalf("loadOrGenerateTokenInDir failed: tok=%q err=%v", tok1, err)
+	}
+	if _, err := os.Stat(filepath.Join(customCertDir, "token.secret")); err != nil {
+		t.Fatalf("expected token.secret in custom cert dir %s: %v", customCertDir, err)
+	}
+	tok2, err := loadOrGenerateTokenInDir(true, "", "", customCertDir)
+	if err != nil || tok2 != tok1 {
+		t.Fatalf("expected persisted token %q from custom cert dir, got %q (err=%v)", tok1, tok2, err)
+	}
+	if err := printSavedTokenAndCommandInDir(customCertDir); err != nil {
+		t.Fatalf("printSavedTokenAndCommandInDir failed: %v", err)
+	}
+
+	// 2. Dynu DDNS provider validation
+	if err := updateDDNS(DDNSConfig{Provider: "dynu", Domain: "", Token: ""}, "198.51.100.1"); err == nil {
+		t.Fatalf("expected dynu updateDDNS with empty domain/token to return error")
+	}
+
+	// 3. Proto: "both" reachability check populates both TCP ExternalStatus and UDPStatus
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcpLn.Close()
+	bothPort := uint16(tcpLn.Addr().(*net.TCPAddr).Port)
+	go func() {
+		for {
+			c, err := tcpLn.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	udpAddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", bothPort))
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpConn.Close()
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			n, raddr, err := udpConn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if bytes.HasPrefix(buf[:n], []byte(udpProbeMagicPrefix)) {
+				nonce := string(buf[len(udpProbeMagicPrefix):n])
+				_, _ = udpConn.WriteToUDP([]byte(udpProbeRespPrefix+nonce), raddr)
+			}
+		}
+	}()
+
+	directPort := getFreePort(t, "tcp")
+	directAddr := fmt.Sprintf("127.0.0.1:%d", directPort)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var hostVal atomic.Value
+	hostVal.Store("myhome.example.com")
+	startStandaloneDirectRedirector(ctx, directAddr, "127.0.0.1", &hostVal, []PortMapping{{PublicPort: bothPort, TargetPort: bothPort, Proto: "both"}}, true)
+
+	probeURL := fmt.Sprintf("http://%s/probe", directAddr)
+	rep := checkExternalReachabilityWithProbe("127.0.0.1", "127.0.0.1", DDNSConfig{}, []PortMapping{
+		{PublicPort: bothPort, TargetPort: bothPort, Proto: "both"},
+	}, probeURL, 300*time.Millisecond)
+	if !strings.HasPrefix(rep.ExternalStatus[bothPort], "verified-from-internet") {
+		t.Fatalf("expected TCP ExternalStatus on Proto=both port %d to be verified-from-internet, got %q", bothPort, rep.ExternalStatus[bothPort])
+	}
+	if !strings.HasPrefix(rep.UDPStatus[bothPort], "verified-from-internet") {
+		t.Fatalf("expected UDPStatus on Proto=both port %d to be verified-from-internet, got %q", bothPort, rep.UDPStatus[bothPort])
+	}
+
+	// Verify DirectAddr HTTP 307 redirect
+	noRedirClient := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 2 * time.Second,
+	}
+	resp, err := noRedirClient.Get(fmt.Sprintf("http://%s/dashboard", directAddr))
+	if err != nil {
+		t.Fatalf("direct redirector request failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("expected HTTP 307 from standalone direct redirector, got %d", resp.StatusCode)
+	}
+	loc := resp.Header.Get("Location")
+	if !strings.Contains(loc, fmt.Sprintf("https://myhome.example.com:%d/dashboard", bothPort)) {
+		t.Fatalf("unexpected redirect Location %q", loc)
+	}
+
+	// 4. Concurrent session status updates and FIFO RAM eviction safety
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	s := newSession(1, bothPort, c1, 4096, 8192, nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 50; i++ {
+			s.mu.Lock()
+			s.lastActive = time.Now()
+			s.mu.Unlock()
+		}
+	}()
+	for i := 0; i < 50; i++ {
+		_, _ = s.snapshotStatus()
+	}
+	<-done
+	s.closeSession()
+}
+

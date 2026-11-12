@@ -8,11 +8,15 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY *.go ./
 ARG TARGETARCH=amd64
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o /out/driftless .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o /out/driftless . && \
+    mkdir -p /out/.driftless-certs && chown -R 65532:65532 /out/.driftless-certs
 
 FROM scratch
+WORKDIR /src
 COPY --from=builder /out/driftless /driftless
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder --chown=65532:65532 /out/.driftless-certs /src/.driftless-certs
 USER 65532:65532
-EXPOSE 4242/udp
+EXPOSE 4242/udp 4242/tcp
 ENTRYPOINT ["/driftless", "server"]
+

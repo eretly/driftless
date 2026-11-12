@@ -253,14 +253,17 @@ func (ag *Agent) evictOldestSessionIfNeeded() {
 		ag.mu.Lock()
 		var oldestID uint64
 		var oldestSess *Session
+		var oldestLastActive time.Time
 		for id, s := range ag.sessions {
-			if s.closed {
+			closed, lastAct := s.snapshotStatus()
+			if closed {
 				delete(ag.sessions, id)
 				continue
 			}
-			if oldestSess == nil || s.lastActive.Before(oldestSess.lastActive) {
+			if oldestSess == nil || lastAct.Before(oldestLastActive) {
 				oldestID = id
 				oldestSess = s
+				oldestLastActive = lastAct
 			}
 		}
 		if oldestSess != nil {
@@ -415,7 +418,7 @@ func (ag *Agent) resumeActiveSessions(conn TunnelConn) {
 	ag.mu.Lock()
 	defer ag.mu.Unlock()
 	for id, sess := range ag.sessions {
-		if sess.closed {
+		if closed, _ := sess.snapshotStatus(); closed {
 			delete(ag.sessions, id)
 			continue
 		}
@@ -519,7 +522,11 @@ func (ag *Agent) acceptGatewayStreams(ctx context.Context, conn TunnelConn) {
 					ag.mu.Unlock()
 				}
 			}
-			if sess == nil || sess.closed {
+			if sess == nil {
+				_ = s.Close()
+				return
+			}
+			if closed, _ := sess.snapshotStatus(); closed {
 				_ = s.Close()
 				return
 			}
@@ -543,10 +550,15 @@ func (ag *Agent) handleUDPStream(sessID uint64, targetPort uint16, st TunnelStre
 		if len(ag.udpSessions) >= maxGatewayUDPSessions {
 			var oldestID uint64
 			var oldestUS *agentUDPSession
+			var oldestLastActive time.Time
 			for id, existing := range ag.udpSessions {
-				if oldestUS == nil || existing.lastActive.Before(oldestUS.lastActive) {
+				existing.mu.Lock()
+				exLast := existing.lastActive
+				existing.mu.Unlock()
+				if oldestUS == nil || exLast.Before(oldestLastActive) {
 					oldestID = id
 					oldestUS = existing
+					oldestLastActive = exLast
 				}
 			}
 			if oldestUS != nil {

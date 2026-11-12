@@ -1654,12 +1654,16 @@ func updateDDNS(cfg DDNSConfig, newIP string) error {
 		}
 		return nil
 
-	case "noip", "dyndns":
+	case "noip", "dyndns", "dynu":
 		if strings.TrimSpace(cfg.Domain) == "" || strings.TrimSpace(cfg.Token) == "" {
-			return errors.New("no-ip DDNS requires domain and password/token")
+			return fmt.Errorf("%s DDNS requires domain and password/token", provider)
 		}
-		u := fmt.Sprintf("https://dynupdate.no-ip.com/nic/update?hostname=%s&myip=%s",
-			url.QueryEscape(cfg.Domain), url.QueryEscape(newIP))
+		baseEndpoint := "https://dynupdate.no-ip.com/nic/update"
+		if provider == "dynu" {
+			baseEndpoint = "https://api.dynu.com/nic/update"
+		}
+		u := fmt.Sprintf("%s?hostname=%s&myip=%s",
+			baseEndpoint, url.QueryEscape(cfg.Domain), url.QueryEscape(newIP))
 		req, err := http.NewRequest("GET", u, nil)
 		if err != nil {
 			return err
@@ -1674,11 +1678,11 @@ func updateDDNS(cfg DDNSConfig, newIP string) error {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 128))
 		bodyStr := strings.TrimSpace(string(b))
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("no-ip status %d: %s", resp.StatusCode, bodyStr)
+			return fmt.Errorf("%s status %d: %s", provider, resp.StatusCode, bodyStr)
 		}
 		lowerBody := strings.ToLower(bodyStr)
 		if bodyStr != "" && !strings.HasPrefix(lowerBody, "good") && !strings.HasPrefix(lowerBody, "nochg") && !strings.HasPrefix(lowerBody, "ok") {
-			return fmt.Errorf("no-ip error response: %s", bodyStr)
+			return fmt.Errorf("%s error response: %s", provider, bodyStr)
 		}
 		return nil
 
@@ -2327,6 +2331,7 @@ type ReachabilityReport struct {
 	LocalServiceStatus map[uint16]string `json:"local_service_status"`
 	PortForwardStatus  map[uint16]string `json:"port_forward_status"`
 	ExternalStatus     map[uint16]string `json:"external_status"`
+	UDPStatus          map[uint16]string `json:"udp_status,omitempty"`
 	PortStatus         map[uint16]string `json:"port_status"`
 }
 
@@ -2360,6 +2365,7 @@ func checkExternalReachabilityWithProbe(pubIP, targetHost string, ddns DDNSConfi
 		LocalServiceStatus: make(map[uint16]string, len(mappings)),
 		PortForwardStatus:  make(map[uint16]string, len(mappings)),
 		ExternalStatus:     make(map[uint16]string, len(mappings)),
+		UDPStatus:          make(map[uint16]string, len(mappings)),
 		PortStatus:         make(map[uint16]string, len(mappings)),
 	}
 	if ddns.Domain != "" && !strings.EqualFold(ddns.Domain, "auto") {
@@ -2425,6 +2431,7 @@ func checkExternalReachabilityWithProbe(pubIP, targetHost string, ddns DDNSConfi
 					rep.PortStatus[m.PublicPort] = "local UDP closed; не удалось проверить извне (no external probe configured)"
 				}
 			}
+			rep.UDPStatus[m.PublicPort] = rep.ExternalStatus[m.PublicPort]
 			continue
 		}
 
@@ -2461,9 +2468,27 @@ func checkExternalReachabilityWithProbe(pubIP, targetHost string, ddns DDNSConfi
 					rep.PortStatus[m.PublicPort] = "unreachable from internet and waiting for local service on :" + strconv.Itoa(int(m.TargetPort))
 				}
 			}
+			if m.Proto == "both" {
+				prUDP, uErr := queryExternalProbeEndpointDetailed(probeURL, "udp", pubIP, m.PublicPort, timeout)
+				switch {
+				case prUDP.Confirmed || prUDP.Reachable:
+					rep.UDPStatus[m.PublicPort] = "verified-from-internet (external UDP probe response confirmed)"
+				case prUDP.Status == string(UDPProbeNoResponse):
+					rep.UDPStatus[m.PublicPort] = "unconfirmed-udp (ответа на пробный UDP-пакет нет)"
+				default:
+					uMsg := "connection refused"
+					if uErr != nil {
+						uMsg = uErr.Error()
+					}
+					rep.UDPStatus[m.PublicPort] = "unreachable-from-internet (" + uMsg + ")"
+				}
+			}
 		} else {
 			// No external probe available: explicitly report that external reachability could not be verified from outside
 			rep.ExternalStatus[m.PublicPort] = "unverified-from-internet (не удалось проверить извне: local hairpin dial is not proof of internet reachability)"
+			if m.Proto == "both" {
+				rep.UDPStatus[m.PublicPort] = "unverified-from-internet (не удалось проверить извне: no external UDP probe configured)"
+			}
 			if localOK {
 				rep.PortStatus[m.PublicPort] = fmt.Sprintf("local service OK | port-forward: %s | внешняя доступность: не удалось проверить извне (no external probe)", rep.PortForwardStatus[m.PublicPort])
 			} else {
@@ -2662,6 +2687,15 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 			return err
 		}
 	}
+	var activePublicHost atomic.Value
+	if cfg.DDNS.Domain != "" {
+		activePublicHost.Store(cfg.DDNS.Domain)
+	} else {
+		activePublicHost.Store(pubIP)
+	}
+	if strings.TrimSpace(cfg.DirectAddr) != "" && cfg.DirectAddr != cfg.VHostAddr && cfg.DirectAddr != cfg.HTTPSAddr {
+		startStandaloneDirectRedirector(ctx, cfg.DirectAddr, lanIP, &activePublicHost, allowedMappings, cfg.EnableTLS)
+	}
 
 	forwardPorts := func(currentLAN string) int {
 		if len(cfg.MockUPnPEndpoints) > 0 || cfg.MockGatewayIP != "" {
@@ -2762,6 +2796,11 @@ func runStandalone(ctx context.Context, cfg StandaloneConfig) error {
 								go sniMgr.ensureDomainCertificate(cfg.DDNS.Domain)
 								printStandaloneBanner(currentIP, cfg.DDNS, allowedMappings, cfg.EnableTLS, cfg.CertDir)
 							}
+						}
+						if cfg.DDNS.Domain != "" {
+							activePublicHost.Store(cfg.DDNS.Domain)
+						} else {
+							activePublicHost.Store(currentIP)
 						}
 						lastDDNSAttempt = time.Time{} // force immediate DDNS update on IP change
 					}
@@ -2941,13 +2980,29 @@ func startStandaloneUDP(ctx context.Context, targetHost string, m *PortMapping) 
 	pubConn, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		if m.PublicPort == m.TargetPort && isAddrInUseError(err) {
-			log.Printf("[standalone] UDP :%d already bound by local service (UPnP forwards directly to :%d)", m.PublicPort, m.TargetPort)
-			return nil
+			bridgeAddr, bErr := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:0", bindIP))
+			if bErr == nil {
+				if bridgeConn, lErr := net.ListenUDP("udp", bridgeAddr); lErr == nil {
+					if uAddr, ok := bridgeConn.LocalAddr().(*net.UDPAddr); ok && uAddr.Port > 0 {
+						m.RouterUDPPort = uint16(uAddr.Port)
+						pubConn = bridgeConn
+						log.Printf("[standalone] UDP :%d is bound by local service; bridging router external port %d -> local UDP proxy :%d -> %s:%d", m.PublicPort, m.PublicPort, m.RouterUDPPort, targetHost, m.TargetPort)
+					} else {
+						_ = bridgeConn.Close()
+					}
+				}
+			}
+			if pubConn == nil {
+				log.Printf("[standalone] UDP :%d already bound by local service (UPnP forwards directly to :%d)", m.PublicPort, m.TargetPort)
+				return nil
+			}
+		} else {
+			return err
 		}
-		return err
+	} else {
+		m.RouterUDPPort = m.PublicPort
+		log.Printf("[standalone] UDP :%d -> %s:%d", m.PublicPort, targetHost, m.TargetPort)
 	}
-	m.RouterUDPPort = m.PublicPort
-	log.Printf("[standalone] UDP :%d -> %s:%d", m.PublicPort, targetHost, m.TargetPort)
 
 	go func() {
 		<-ctx.Done()
@@ -3105,5 +3160,49 @@ func startStandaloneVHost(ctx context.Context, listenAddr, targetHost string, vh
 	}()
 	return nil
 }
+
+func startStandaloneDirectRedirector(ctx context.Context, listenAddr, lanIP string, activePublicHost *atomic.Value, mappings []PortMapping, enableTLS bool) {
+	defaultPort := uint16(8096)
+	scheme := "http"
+	if enableTLS {
+		scheme = "https"
+	}
+	for _, m := range mappings {
+		if m.Proto != "udp" {
+			defaultPort = m.PublicPort
+			if m.Proto == "https" {
+				scheme = "https"
+			}
+			break
+		}
+	}
+	l, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/probe", handleExternalProbeHTTP)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		targetHost, _ := activePublicHost.Load().(string)
+		if targetHost == "" {
+			targetHost = lanIP
+		}
+		targetURL := fmt.Sprintf("%s://%s:%d%s", scheme, targetHost, defaultPort, r.URL.RequestURI())
+		http.Redirect(w, r, targetURL, http.StatusTemporaryRedirect)
+	})
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
+		_ = l.Close()
+	}()
+	go func() {
+		_ = srv.Serve(l)
+	}()
+}
+
 
 

@@ -208,6 +208,14 @@ func (s *Session) trimAcked(ackOffset uint64) {
 	s.cond.Broadcast()
 }
 
+func (s *Session) snapshotStatus() (closed bool, lastActive time.Time) {
+	s.mu.Lock()
+	closed = s.closed
+	lastActive = s.lastActive
+	s.mu.Unlock()
+	return closed, lastActive
+}
+
 func (s *Session) closeSession() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

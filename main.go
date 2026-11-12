@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	versionString = "v1.5.5"
+	versionString = "v1.5.6"
 	alpnProtocol  = "driftless-v1"
 	cmdAuth       = uint8(0)
 	cmdNewConn    = uint8(1)
@@ -74,6 +74,8 @@ var (
 	defaultVHostNodeMap     = make(map[string]string)
 	defaultExternalProbeURL string
 	defaultProbeAuthToken   string
+	defaultCertDir          string
+	defaultGatewayDDNS      DDNSConfig
 	lastAgentAuthConflict   atomic.Value
 
 	chunkBufPool = sync.Pool{
@@ -491,7 +493,19 @@ func syncParentDir(dir string) error {
 	return nil
 }
 
+func resolveTokenCertDir(certDir string) string {
+	dir := strings.TrimSpace(certDir)
+	if dir == "" {
+		dir = ".driftless-certs"
+	}
+	return dir
+}
+
 func loadOrGenerateToken(isServer bool, tokenFlag, tokenFile string) (string, error) {
+	return loadOrGenerateTokenInDir(isServer, tokenFlag, tokenFile, defaultCertDir)
+}
+
+func loadOrGenerateTokenInDir(isServer bool, tokenFlag, tokenFile, certDir string) (string, error) {
 	if tokenFlag != "" {
 		tok := strings.TrimSpace(tokenFlag)
 		registerSecretForLogRedaction(tok)
@@ -512,57 +526,62 @@ func loadOrGenerateToken(isServer bool, tokenFlag, tokenFile string) (string, er
 		return trimmed, nil
 	}
 	if isServer {
-		const defaultTokenPath = ".driftless-certs/token.secret"
-		if b, err := os.ReadFile(defaultTokenPath); err == nil {
+		dir := resolveTokenCertDir(certDir)
+		tokenPath := filepath.Join(dir, "token.secret")
+		if b, err := os.ReadFile(tokenPath); err == nil {
 			if saved := strings.TrimSpace(string(b)); len(saved) >= 16 {
 				registerSecretForLogRedaction(saved)
-				log.Printf("[gateway] loaded persistent token from %s [token=valid, hidden]", defaultTokenPath)
+				log.Printf("[gateway] loaded persistent token from %s [token=valid, hidden]", tokenPath)
 				return saved, nil
 			}
 		} else if !os.IsNotExist(err) {
-			log.Printf("[gateway] ERROR: failed to read persistent token file %s: %v", defaultTokenPath, err)
-			return "", fmt.Errorf("read persistent token file %s: %w", defaultTokenPath, err)
+			log.Printf("[gateway] ERROR: failed to read persistent token file %s: %v", tokenPath, err)
+			return "", fmt.Errorf("read persistent token file %s: %w", tokenPath, err)
 		}
 		var b [16]byte // 128-bit cryptographic token (32 hex chars)
 		if _, err := rand.Read(b[:]); err != nil {
 			return "", fmt.Errorf("generate token: %w", err)
 		}
 		autoTok := hex.EncodeToString(b[:])
-		if err := os.MkdirAll(".driftless-certs", 0o700); err != nil {
-			log.Printf("[gateway] ERROR: failed to create token directory .driftless-certs: %v", err)
-			return "", fmt.Errorf("create token directory .driftless-certs: %w", err)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			log.Printf("[gateway] ERROR: failed to create token directory %s: %v", dir, err)
+			return "", fmt.Errorf("create token directory %s: %w", dir, err)
 		}
-		if err := writeFileAtomic0600(defaultTokenPath, []byte(autoTok+"\n")); err != nil {
-			log.Printf("[gateway] ERROR: failed to persist generated token to %s: %v", defaultTokenPath, err)
-			return "", fmt.Errorf("persist generated token to %s: %w", defaultTokenPath, err)
+		if err := writeFileAtomic0600(tokenPath, []byte(autoTok+"\n")); err != nil {
+			log.Printf("[gateway] ERROR: failed to persist generated token to %s: %v", tokenPath, err)
+			return "", fmt.Errorf("persist generated token to %s: %w", tokenPath, err)
 		}
 		registerSecretForLogRedaction(autoTok)
-		log.Printf("[gateway] no -token specified; generated 128-bit password (saved to %s with mode 0600; run './driftless show-token' or 'cat %s' to view) [token=valid, hidden]", defaultTokenPath, defaultTokenPath)
+		log.Printf("[gateway] no -token specified; generated 128-bit password (saved to %s with mode 0600; run './driftless show-token' or 'cat %s' to view) [token=valid, hidden]", tokenPath, tokenPath)
 		return autoTok, nil
 	}
 	return "", errors.New("password required: run './driftless client -quic VPS_IP:4242 -token YOUR_PASSWORD'")
 }
 
 func printSavedTokenAndCommand() error {
-	const (
-		defaultTokenPath          = ".driftless-certs/token.secret"
-		defaultCmdPath            = ".driftless-certs/client-connect.cmd"
-		defaultStandaloneInfoPath = ".driftless-certs/standalone-info.txt"
-	)
-	tokBytes, tokErr := os.ReadFile(defaultTokenPath)
-	cmdBytes, cmdErr := os.ReadFile(defaultCmdPath)
-	infoBytes, infoErr := os.ReadFile(defaultStandaloneInfoPath)
+	return printSavedTokenAndCommandInDir(defaultCertDir)
+}
+
+func printSavedTokenAndCommandInDir(certDir string) error {
+	dir := resolveTokenCertDir(certDir)
+	tokenPath := filepath.Join(dir, "token.secret")
+	cmdPath := filepath.Join(dir, "client-connect.cmd")
+	standaloneInfoPath := filepath.Join(dir, "standalone-info.txt")
+
+	tokBytes, tokErr := os.ReadFile(tokenPath)
+	cmdBytes, cmdErr := os.ReadFile(cmdPath)
+	infoBytes, infoErr := os.ReadFile(standaloneInfoPath)
 	if tokErr != nil && cmdErr != nil && infoErr != nil {
-		return fmt.Errorf("no saved token or connection info found in .driftless-certs/ (start './driftless server' or './driftless standalone' first): %w", tokErr)
+		return fmt.Errorf("no saved token or connection info found in %s/ (start './driftless server' or './driftless standalone' first): %w", dir, tokErr)
 	}
 	if tokErr == nil {
-		fmt.Fprintf(os.Stdout, "Token (%s):\n  %s\n", defaultTokenPath, strings.TrimSpace(string(tokBytes)))
+		fmt.Fprintf(os.Stdout, "Token (%s):\n  %s\n", tokenPath, strings.TrimSpace(string(tokBytes)))
 	}
 	if cmdErr == nil {
-		fmt.Fprintf(os.Stdout, "Ready-to-copy Home PC command (%s):\n  %s\n", defaultCmdPath, strings.TrimSpace(string(cmdBytes)))
+		fmt.Fprintf(os.Stdout, "Ready-to-copy Home PC command (%s):\n  %s\n", cmdPath, strings.TrimSpace(string(cmdBytes)))
 	}
 	if infoErr == nil {
-		fmt.Fprintf(os.Stdout, "Standalone Connection Summary (%s):\n%s\n", defaultStandaloneInfoPath, strings.TrimSpace(string(infoBytes)))
+		fmt.Fprintf(os.Stdout, "Standalone Connection Summary (%s):\n%s\n", standaloneInfoPath, strings.TrimSpace(string(infoBytes)))
 	}
 	return nil
 }
@@ -598,7 +617,17 @@ func main() {
 			runCheckCmd = true
 			os.Args = append(os.Args[:1], os.Args[2:]...)
 		case "show-token", "token", "connect-cmd":
-			if err := printSavedTokenAndCommand(); err != nil {
+			customDir := ""
+			for i := 2; i < len(os.Args); i++ {
+				if (os.Args[i] == "-cert-dir" || os.Args[i] == "--cert-dir") && i+1 < len(os.Args) {
+					customDir = os.Args[i+1]
+				} else if strings.HasPrefix(os.Args[i], "-cert-dir=") {
+					customDir = strings.TrimPrefix(os.Args[i], "-cert-dir=")
+				} else if strings.HasPrefix(os.Args[i], "--cert-dir=") {
+					customDir = strings.TrimPrefix(os.Args[i], "--cert-dir=")
+				}
+			}
+			if err := printSavedTokenAndCommandInDir(customDir); err != nil {
 				fmt.Fprintf(os.Stderr, "[driftless] %v\n", err)
 				os.Exit(1)
 			}
@@ -651,10 +680,10 @@ func main() {
 	stunInterval := flag.Duration("stun-interval", 1*time.Second, "how often to check external IP via STUN (standalone mode)")
 	probeURL := flag.String("probe-url", "", "optional external probe endpoint (e.g. http://VPS_IP:8888/probe) for independent internet TCP/UDP reachability verification")
 	duckShort := flag.String("duck", "", "automatic zero-config domain & DuckDNS sync (just pass -duck)")
-	ddnsProvider := flag.String("ddns-provider", "", "built-in Dynamic DNS provider: 'duckdns', 'cloudflare', or 'noip'")
+	ddnsProvider := flag.String("ddns-provider", "", "built-in Dynamic DNS provider: 'duckdns', 'cloudflare', 'noip', or 'dynu'")
 	ddnsDomain := flag.String("ddns-domain", "", "domain/subdomain to update when IP changes (e.g. myhome.duckdns.org)")
 	ddnsToken := flag.String("ddns-token", "", "API token or password for Dynamic DNS provider")
-	ddnsUser := flag.String("ddns-user", "", "username for No-IP / DynDNS provider")
+	ddnsUser := flag.String("ddns-user", "", "username for No-IP / DynDNS / Dynu provider")
 	ddnsZone := flag.String("ddns-zone", "", "Cloudflare Zone ID (when -ddns-provider=cloudflare)")
 	ddnsURL := flag.String("ddns-url", "", "custom DDNS webhook URL (replaces {ip} with current external IP)")
 
@@ -694,6 +723,7 @@ func main() {
 			*ddnsDomain = d
 		}
 	}
+	defaultCertDir = strings.TrimSpace(*certDir)
 	defaultExternalProbeURL = strings.TrimSpace(*probeURL)
 	defaultProbeAuthToken = strings.TrimSpace(*tokenFlag)
 	if defaultProbeAuthToken == "" && strings.TrimSpace(*tokenFile) != "" {
@@ -830,10 +860,8 @@ func main() {
 				}
 			}
 			*enableTLS = true
-			if sm, err := newSNICertManager(*certDir, *tlsCertFile, *tlsKeyFile); err == nil {
-				go sm.ensureDomainCertificate(ddnsCfg.Domain)
-			}
 		}
+		defaultGatewayDDNS = ddnsCfg
 		if err := runGateway(ctx, *quicAddr, token, *direct, *vhostAddr, *httpsAddr, vhostMap, mappings, *maxMem, *maxBuf, *quicIdle, *quicKeepalive, *sessionTTL, *certDir, *tlsCertFile, *tlsKeyFile, *enableTLS, *sameLAN); err != nil {
 			log.Fatalf("[gateway] %v", err)
 		}

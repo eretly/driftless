@@ -1,4 +1,4 @@
-# Driftless (v1.5.5)
+# Driftless (v1.5.6)
 
 > 🌐 **Choose Language / Выберите язык:** [🇺🇸 English (Full Documentation)](#english-documentation) · [🇷🇺 Русский (Полная инструкция)](#ru)
 
@@ -78,7 +78,7 @@ To get a **permanent** `*.duckdns.org` address that never changes when your ISP 
 
 Driftless separates three types of domains:
 1. **Temporary IP-based hostname (`sslip.io`):** generated when `-duck` is used without a DDNS provider; changes when your ISP IP changes.
-2. **Dynamic DNS domain (`duckdns`, `cloudflare`, `noip`, `-ddns-url`):** a permanent hostname automatically updated via DNS API whenever your ISP rotates your IP, persisted in `.driftless-ddns.json` across restarts.
+2. **Dynamic DNS domain (`duckdns`, `cloudflare`, `noip`, `dynu`, `-ddns-url`):** a permanent hostname automatically updated via DNS API whenever your ISP rotates your IP, persisted in `.driftless-ddns.json` across restarts.
 3. **Custom domain (`-domain`, `-vhosts`):** your own domain pointed to your VPS or home IP.
 
 #### Option A: One-Flag Custom Domain (`-domain`)
@@ -96,7 +96,7 @@ Point your domain's `A` record to your PC (or VPS) IP and pass `-domain`:
 ./driftless standalone -vhosts site.mysite.com:3000,media.mysite.com:8096 -vhost-addr :80 -https :443
 ```
 
-#### Option C: Permanent Dynamic DNS (DuckDNS / Cloudflare / No-IP)
+#### Option C: Permanent Dynamic DNS (DuckDNS / Cloudflare / No-IP / Dynu)
 Settings are saved to `.driftless-ddns.json` (mode `0600`) and automatically restored on future restarts:
 ```bash
 # DuckDNS shorthand (get your subdomain & token at https://www.duckdns.org)
@@ -108,8 +108,9 @@ Settings are saved to `.driftless-ddns.json` (mode `0600`) and automatically res
 # Cloudflare DNS API v4 (TTL=60s)
 ./driftless standalone -ports 8096 -ddns-provider cloudflare -ddns-zone YOUR_ZONE_ID -ddns-domain home.mysite.com -ddns-token YOUR_CF_TOKEN
 
-# No-IP
+# No-IP or Dynu
 ./driftless standalone -ports 8096 -ddns-provider noip -ddns-domain mypc.ddns.net -ddns-user USER -ddns-token PASS
+./driftless standalone -ports 8096 -ddns-provider dynu -ddns-domain mypc.dynu.net -ddns-user USER -ddns-token PASS
 ```
 
 ---
@@ -195,7 +196,7 @@ Driftless separates reachability into three distinct checks:
 | `driftless client` | Run Agent on a Home PC (connects to VPS Gateway, supports `-id` and `-vps2`) |
 | `driftless check` | Run external IP, CGNAT, local service, router port-forward, and external probe diagnostics |
 | `driftless show-token` | Print the saved Gateway token and ready-to-copy client connection command |
-| `driftless version` | Print `driftless v1.5.5` version string |
+| `driftless version` | Print `driftless v1.5.6` version string |
 
 #### All CLI Flags
 | Flag | Default | Description |
@@ -228,10 +229,10 @@ Driftless separates reachability into three distinct checks:
 | `-upnp` | `true` | Automatically open TCP+UDP ports on home router via UPnP IGDv1/v2, NAT-PMP, and PCP v2 |
 | `-stun` | `"stun.cloudflare.com:3478"` | RFC 5389 UDP STUN server (or comma-separated list) for external IPv4 change detection |
 | `-stun-interval` | `1s` | How often to check external IP via UDP STUN in standalone mode |
-| `-ddns-provider` | `""` | Built-in Dynamic DNS provider: `duckdns`, `cloudflare`, or `noip` |
+| `-ddns-provider` | `""` | Built-in Dynamic DNS provider: `duckdns`, `cloudflare`, `noip`, or `dynu` |
 | `-ddns-domain` | `""` | Domain name to update when external IP changes |
 | `-ddns-token` | `""` | API token or password for Dynamic DNS provider |
-| `-ddns-user` | `""` | Username for No-IP / DynDNS provider |
+| `-ddns-user` | `""` | Username for No-IP / DynDNS / Dynu provider |
 | `-ddns-zone` | `""` | Cloudflare Zone ID (when `-ddns-provider=cloudflare`) |
 | `-ddns-url` | `""` | Custom DDNS webhook URL (replaces `{ip}` and `{domain}` automatically) |
 | `-max-buf` | `16777216` (16 MiB) | Max per-session sliding ring buffer in RAM for zero-drop reconnects |
@@ -317,7 +318,7 @@ Driftless separates reachability into three distinct checks:
 
 В Driftless чётко разделены три типа доменов:
 1. **Временный IP-домен (`sslip.io`):** создаётся при запуске `-duck` без токена DDNS, зависит от текущего IP и меняется при смене IP провайдером.
-2. **Постоянный DDNS-домен (`duckdns`, `cloudflare`, `noip`, `-ddns-url`):** сохраняется в `.driftless-ddns.json` (права `0600`), восстанавливается после перезапуска и автоматически обновляет `A`-запись при каждой смене внешнего IP.
+2. **Постоянный DDNS-домен (`duckdns`, `cloudflare`, `noip`, `dynu`, `-ddns-url`):** сохраняется в `.driftless-ddns.json` (права `0600`), восстанавливается после перезапуска и автоматически обновляет `A`-запись при каждой смене внешнего IP.
 3. **Собственный домен (`-domain`, `-vhosts`):** ваш купленный домен, направленный на IP вашего ВПС или домашнего ПК.
 
 #### Вариант А: Подключение своего домена флагом `-domain`
@@ -335,7 +336,7 @@ Driftless separates reachability into three distinct checks:
 ./driftless standalone -vhosts site.mysite.com:3000,media.mysite.com:8096 -vhost-addr :80 -https :443
 ```
 
-#### Вариант В: Автообновление постоянного домена в DuckDNS, Cloudflare или No-IP
+#### Вариант В: Автообновление постоянного домена в DuckDNS, Cloudflare, No-IP или Dynu
 Настройки сохраняются в `.driftless-ddns.json` и автоматически подхватываются при следующих запусках:
 ```bash
 # DuckDNS короткой командой (получите поддомен и токен на https://www.duckdns.org)
@@ -347,8 +348,9 @@ Driftless separates reachability into three distinct checks:
 # Cloudflare (автоматически обновляет A-запись при смене IP провайдером, TTL=60s)
 ./driftless standalone -ports 8096 -ddns-provider cloudflare -ddns-zone ID_ЗОНЫ -ddns-domain home.mysite.com -ddns-token ТОКЕН_CLOUDFLARE
 
-# No-IP
+# No-IP или Dynu
 ./driftless standalone -ports 8096 -ddns-provider noip -ddns-domain mypc.ddns.net -ddns-user ЛОГИН -ddns-token ПАРОЛЬ
+./driftless standalone -ports 8096 -ddns-provider dynu -ddns-domain mypc.dynu.net -ddns-user ЛОГИН -ddns-token ПАРОЛЬ
 ```
 
 ---
@@ -434,7 +436,7 @@ Driftless separates reachability into three distinct checks:
 | `driftless client` | Запуск агента на домашнем ПК (подключается к ВПС, поддерживает `-id` и `-vps2`) |
 | `driftless check` | Диагностика внешнего IP по STUN, CGNAT, локальных сервисов, проброса портов и внешней доступности |
 | `driftless show-token` | Показать сохранённый токен ВПС и готовую команду подключения для домашнего ПК |
-| `driftless version` | Вывести версию `driftless v1.5.5` |
+| `driftless version` | Вывести версию `driftless v1.5.6` |
 
 #### Все флаги (полная таблица)
 | Флаг | По умолчанию | Описание |
@@ -467,10 +469,10 @@ Driftless separates reachability into three distinct checks:
 | `-upnp` | `true` | Автоматический проброс TCP и UDP портов на роутере через UPnP IGDv1/v2, NAT-PMP и PCP v2 |
 | `-stun` | `"stun.cloudflare.com:3478"` | STUN-сервер (или список через запятую) для проверки смены внешнего IPv4 по UDP |
 | `-stun-interval` | `1s` | Частота проверки внешнего IP через STUN (по умолчанию каждую секунду) |
-| `-ddns-provider` | `""` | Провайдер динамического DNS: `duckdns`, `cloudflare` (TTL=60s) или `noip` |
+| `-ddns-provider` | `""` | Провайдер динамического DNS: `duckdns`, `cloudflare` (TTL=60s), `noip` или `dynu` |
 | `-ddns-domain` | `""` | Домен для автообновления при смене IP |
 | `-ddns-token` | `""` | API-токен или пароль для DDNS-провайдера |
-| `-ddns-user` | `""` | Логин для No-IP / DynDNS |
+| `-ddns-user` | `""` | Логин для No-IP / DynDNS / Dynu |
 | `-ddns-zone` | `""` | Zone ID для Cloudflare (при `-ddns-provider=cloudflare`) |
 | `-ddns-url` | `""` | Свой Webhook URL для обновления DNS (автоматически подставляет `{ip}` и `{domain}`) |
 | `-max-buf` | `16777216` (16 МБ) | Размер скользящего кольцевого буфера в RAM на одну сессию |

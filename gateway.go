@@ -233,8 +233,12 @@ func runGateway(ctx context.Context, quicAddr, token, directHTTPAddr, vhostAddr,
 	if err != nil {
 		return fmt.Errorf("tls manager init: %w", err)
 	}
-	if len(vhostMap) > 0 || vhostAddr != "" || httpsAddr != "" {
+	sniMgr.ddns = defaultGatewayDDNS
+	if len(vhostMap) > 0 || vhostAddr != "" || httpsAddr != "" || defaultGatewayDDNS.Domain != "" {
 		sniMgr.enableACME = true
+	}
+	if defaultGatewayDDNS.Domain != "" {
+		go sniMgr.ensureDomainCertificate(defaultGatewayDDNS.Domain)
 	}
 	sniMgr.startRenewalScheduler(ctx)
 
@@ -721,10 +725,15 @@ func (gw *Gateway) forwardUDPToAgentNode(pubConn *net.UDPConn, clientAddr *net.U
 		if len(gw.udpSessions) >= maxGatewayUDPSessions {
 			var oldestKey string
 			var oldestUS *gwUDPSession
+			var oldestLastActive time.Time
 			for k, existing := range gw.udpSessions {
-				if oldestUS == nil || existing.lastActive.Before(oldestUS.lastActive) {
+				existing.mu.Lock()
+				exLast := existing.lastActive
+				existing.mu.Unlock()
+				if oldestUS == nil || exLast.Before(oldestLastActive) {
 					oldestKey = k
 					oldestUS = existing
+					oldestLastActive = exLast
 				}
 			}
 			if oldestUS != nil {
@@ -1094,14 +1103,17 @@ func (gw *Gateway) evictOldestSessionIfNeeded() {
 		gw.mu.Lock()
 		var oldestID uint64
 		var oldestSess *Session
+		var oldestLastActive time.Time
 		for id, s := range gw.sessions {
-			if s.closed {
+			closed, lastAct := s.snapshotStatus()
+			if closed {
 				delete(gw.sessions, id)
 				continue
 			}
-			if oldestSess == nil || s.lastActive.Before(oldestSess.lastActive) {
+			if oldestSess == nil || lastAct.Before(oldestLastActive) {
 				oldestID = id
 				oldestSess = s
+				oldestLastActive = lastAct
 			}
 		}
 		if oldestSess != nil {
@@ -1529,8 +1541,12 @@ func (gw *Gateway) handleAgentStreams(ctx context.Context, nodeID string, conn T
 			if cmd == cmdUDPFlow {
 				gw.mu.RLock()
 				us, ok := gw.udpByID[sessID]
+				usNode := ""
+				if ok && us != nil {
+					usNode = us.nodeID
+				}
 				gw.mu.RUnlock()
-				if !ok || (us.nodeID != "" && us.nodeID != nodeID) {
+				if !ok || us == nil || (usNode != "" && usNode != nodeID) {
 					_ = s.Close()
 					return
 				}
@@ -1541,8 +1557,16 @@ func (gw *Gateway) handleAgentStreams(ctx context.Context, nodeID string, conn T
 
 			gw.mu.RLock()
 			sess, ok := gw.sessions[sessID]
+			sessNode := ""
+			if ok && sess != nil {
+				sessNode = sess.nodeID
+			}
 			gw.mu.RUnlock()
-			if !ok || sess.closed || (sess.nodeID != "" && sess.nodeID != nodeID) {
+			if !ok || sess == nil || (sessNode != "" && sessNode != nodeID) {
+				_ = s.Close()
+				return
+			}
+			if closed, _ := sess.snapshotStatus(); closed {
 				_ = s.Close()
 				return
 			}
