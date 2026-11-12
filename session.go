@@ -15,6 +15,7 @@ import (
 
 type Session struct {
 	id         uint64
+	nodeID     string
 	targetPort uint16
 	tcpConn    net.Conn
 	maxBuf     int64
@@ -507,6 +508,7 @@ const maxUDPReplayAge = 2 * time.Second
 
 type gwUDPSession struct {
 	id          uint64
+	nodeID      string
 	targetPort  uint16
 	clientAddr  *net.UDPAddr
 	pubConn     *net.UDPConn

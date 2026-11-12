@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/hmac"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	mrand "math/rand"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +20,7 @@ import (
 )
 
 type Agent struct {
+	nodeID          string
 	gatewayAddr     string
 	gatewayAddrs    []string
 	lastConnectedGW string
@@ -25,6 +28,8 @@ type Agent struct {
 	targetHost      string
 	token           string
 	lanIP           string
+	mappings        []PortMapping
+	vhosts          []VHostRoute
 	maxBuf          int64
 	maxMem          int64
 	sessionTTL      time.Duration
@@ -94,8 +99,25 @@ func nextBackoff(step int) time.Duration {
 	return base + jitter
 }
 
+func sanitizeNodeID(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	var b strings.Builder
+	for i := 0; i < len(raw) && b.Len() < 64; i++ {
+		c := raw[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' {
+			b.WriteByte(c)
+		} else if c == ' ' {
+			b.WriteByte('-')
+		}
+	}
+	return strings.Trim(b.String(), "-_.")
+}
 
 func runAgent(ctx context.Context, gatewayAddr, targetHost, token, lanIP, fingerprint string, maxBuf, maxMem int64, quicIdle, quicKeepalive, sessionTTL time.Duration, allowedPorts map[uint16]struct{}) error {
+	return runAgentWithServices(ctx, defaultAgentNodeID, gatewayAddr, targetHost, token, lanIP, fingerprint, defaultAgentMappings, defaultAgentVHosts, maxBuf, maxMem, quicIdle, quicKeepalive, sessionTTL, allowedPorts)
+}
+
+func runAgentWithServices(ctx context.Context, nodeID, gatewayAddr, targetHost, token, lanIP, fingerprint string, mappings []PortMapping, vhosts []VHostRoute, maxBuf, maxMem int64, quicIdle, quicKeepalive, sessionTTL time.Duration, allowedPorts map[uint16]struct{}) error {
 	registerSecretForLogRedaction(token)
 	var gwList []string
 	for _, a := range strings.Split(gatewayAddr, ",") {
@@ -113,13 +135,23 @@ func runAgent(ctx context.Context, gatewayAddr, targetHost, token, lanIP, finger
 		primaryTok = tokList[0]
 	}
 
+	nodeID = sanitizeNodeID(nodeID)
+	if nodeID == "" && (len(mappings) > 0 || len(vhosts) > 0) {
+		if hn, err := os.Hostname(); err == nil {
+			nodeID = sanitizeNodeID(hn)
+		}
+	}
+
 	ag := &Agent{
+		nodeID:       nodeID,
 		gatewayAddr:  gwList[0],
 		gatewayAddrs: gwList,
 		transport:    defaultTransportMode,
 		targetHost:   targetHost,
 		token:        primaryTok,
 		lanIP:        lanIP,
+		mappings:     append([]PortMapping(nil), mappings...),
+		vhosts:       append([]VHostRoute(nil), vhosts...),
 		maxBuf:       maxBuf,
 		maxMem:       maxMem,
 		sessionTTL:   sessionTTL,
@@ -163,7 +195,6 @@ func runAgent(ctx context.Context, gatewayAddr, targetHost, token, lanIP, finger
 		conn, err := dialTunnelGateway(ctx, targetGW, ag.transport, tlsConf, quicConf)
 		if err != nil {
 			gwIdx++
-			// Only sleep backoff once we have tried all configured gateways in the failover ring
 			if len(ag.gatewayAddrs) <= 1 || gwIdx%len(ag.gatewayAddrs) == 0 {
 				delay := nextBackoff(attempt)
 				attempt++
@@ -185,7 +216,7 @@ func runAgent(ctx context.Context, gatewayAddr, targetHost, token, lanIP, finger
 		conn.SetAuthenticated()
 		attempt = 0
 		metricActiveTransportName.Store(conn.TransportName())
-		log.Printf("[agent] connected to VPS %s via %s (auth=[token=valid, hidden], nonce=[one-time, verified]) - all local services are online and protected!", targetGW, conn.TransportName())
+		log.Printf("[agent] connected to VPS %s via %s (node=%s, auth=[token=valid, hidden], nonce=[one-time, verified]) - all local services are online!", targetGW, conn.TransportName(), nodeLabel(ag.nodeID))
 		if ag.lastConnectedGW != "" && ag.lastConnectedGW != targetGW {
 			log.Printf("[agent] failed over from %s to new gateway %s - resetting stale gateway session state", ag.lastConnectedGW, targetGW)
 			ag.closeAllSessionsForFailover()
@@ -199,7 +230,6 @@ func runAgent(ctx context.Context, gatewayAddr, targetHost, token, lanIP, finger
 			return nil
 		}
 		if len(ag.gatewayAddrs) > 1 {
-			// Immediately advance to the next gateway in the HA pool without waiting on the dead node
 			gwIdx++
 			log.Printf("[agent] gateway %s disconnected - failing over immediately to %s...", targetGW, ag.gatewayAddrs[gwIdx%len(ag.gatewayAddrs)])
 			continue
@@ -291,6 +321,26 @@ func (ag *Agent) cleanupSessions(ctx context.Context) {
 	}
 }
 
+func (ag *Agent) buildAuthPayload() string {
+	lanIP := ag.lanIP
+	if lanIP == "" {
+		lanIP = detectLocalLANIP()
+	}
+	if ag.nodeID == "" && len(ag.mappings) == 0 && len(ag.vhosts) == 0 {
+		return lanIP
+	}
+	reg := AgentRegistration{
+		NodeID:   ag.nodeID,
+		LanIP:    lanIP,
+		Mappings: ag.mappings,
+		VHosts:   ag.vhosts,
+	}
+	if b, err := json.Marshal(reg); err == nil {
+		return string(b)
+	}
+	return lanIP
+}
+
 func (ag *Agent) sendAuth(ctx context.Context, conn TunnelConn) error {
 	authCtx, cancel := context.WithTimeout(ctx, authTimeout)
 	defer cancel()
@@ -312,18 +362,21 @@ func (ag *Agent) sendAuth(ctx context.Context, conn TunnelConn) error {
 		return err
 	}
 
-	lanIP := ag.lanIP
-	if lanIP == "" {
-		lanIP = detectLocalLANIP()
-	}
+	authPayload := ag.buildAuthPayload()
 	peerCertHash := conn.PeerCertHash()
-	sum := computeClientAuthMAC(ag.token, nonce, peerCertHash, lanIP)
+	sum := computeClientAuthMAC(ag.token, nonce, peerCertHash, authPayload)
 
-	resp := make([]byte, 0, 3+len(sum)+len(lanIP))
+	resp := make([]byte, 0, 5+len(sum)+len(authPayload))
 	resp = append(resp, cmdAuthResp, byte(len(sum)))
 	resp = append(resp, sum...)
-	resp = append(resp, byte(len(lanIP)))
-	resp = append(resp, []byte(lanIP)...)
+	if len(authPayload) < 255 {
+		resp = append(resp, byte(len(authPayload)))
+	} else {
+		var extLen [2]byte
+		binary.BigEndian.PutUint16(extLen[:], uint16(len(authPayload)))
+		resp = append(resp, 255, extLen[0], extLen[1])
+	}
+	resp = append(resp, []byte(authPayload)...)
 	if _, err := st.Write(resp); err != nil {
 		return err
 	}
@@ -435,21 +488,7 @@ func (ag *Agent) acceptGatewayStreams(ctx context.Context, conn TunnelConn) {
 			sess, exists := ag.sessions[sessID]
 			ag.mu.Unlock()
 			if !exists && (cmd == cmdNewConn || cmd == cmdResume) {
-				var c net.Conn
-				var err error
-				if defaultUserPassAuth != nil && targetPort == 22 {
-					c1, c2 := net.Pipe()
-					go defaultUserPassAuth.ServeConn(c2)
-					c = c1
-				} else {
-					c, err = net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ag.targetHost, targetPort), 5*time.Second)
-					if err != nil && targetPort == 22 && defaultUserPassAuth != nil {
-						c1, c2 := net.Pipe()
-						go defaultUserPassAuth.ServeConn(c2)
-						c = c1
-						err = nil
-					}
-				}
+				c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ag.targetHost, targetPort), 5*time.Second)
 				if err != nil || c == nil {
 					_ = s.Close()
 					return
@@ -598,4 +637,3 @@ func (ag *Agent) readFromLocalUDP(us *agentUDPSession) {
 		}
 	}
 }
-

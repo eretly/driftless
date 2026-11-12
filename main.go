@@ -65,10 +65,13 @@ var (
 	metricActiveTransportName atomic.Value
 
 	defaultTransportMode = "auto"
-	defaultIPACL         *IPACL
 	defaultClientCAFile  string
 	defaultClientCert    string
 	defaultClientKey     string
+	defaultAgentNodeID   string
+	defaultAgentMappings []PortMapping
+	defaultAgentVHosts   []VHostRoute
+	defaultVHostNodeMap  = make(map[string]string)
 
 	chunkBufPool = sync.Pool{
 		New: func() any {
@@ -77,7 +80,7 @@ var (
 		},
 	}
 	defaultProxyProtocol bool
-	udpBufPool = sync.Pool{
+	udpBufPool           = sync.Pool{
 		New: func() any {
 			b := make([]byte, maxUDPPacket)
 			return &b
@@ -90,69 +93,6 @@ var (
 		},
 	}
 )
-
-
-type IPACL struct {
-	ips  map[string]struct{}
-	nets []*net.IPNet
-}
-
-func parseIPACL(raw string) (*IPACL, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, nil
-	}
-	acl := &IPACL{ips: make(map[string]struct{})}
-	for _, part := range strings.Split(raw, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		if strings.Contains(part, "/") {
-			_, ipNet, err := net.ParseCIDR(part)
-			if err != nil {
-				return nil, fmt.Errorf("invalid CIDR in -allow-ips %q: %w", part, err)
-			}
-			acl.nets = append(acl.nets, ipNet)
-		} else {
-			ip := net.ParseIP(part)
-			if ip == nil {
-				return nil, fmt.Errorf("invalid IP in -allow-ips %q", part)
-			}
-			acl.ips[ip.String()] = struct{}{}
-		}
-	}
-	return acl, nil
-}
-
-func (acl *IPACL) AllowedAddr(addr net.Addr) bool {
-	if acl == nil || (len(acl.ips) == 0 && len(acl.nets) == 0) {
-		return true
-	}
-	if addr == nil {
-		return false
-	}
-	host := addr.String()
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
-	}
-	if ip.IsLoopback() {
-		return true
-	}
-	if _, ok := acl.ips[ip.String()]; ok {
-		return true
-	}
-	for _, n := range acl.nets {
-		if n.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
 
 func startMetricsServer(ctx context.Context, listenAddr string) {
 	if strings.TrimSpace(listenAddr) == "" {
@@ -195,15 +135,15 @@ func startMetricsServer(ctx context.Context, listenAddr string) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"version":               versionString,
-			"transport":             trName,
-			"buffered_bytes":        globalBufferedBytes.Load(),
-			"active_tcp_sessions":   metricActiveTCPSessions.Load(),
-			"active_udp_sessions":   metricActiveUDPSessions.Load(),
-			"resumed_sessions":      metricResumedSessions.Load(),
-			"udp_queued_packets":    metricUDPQueuedTotal.Load(),
-			"udp_replayed_packets":  metricUDPReplayedTotal.Load(),
-			"udp_dropped_packets":   metricUDPDroppedTotal.Load(),
+			"version":              versionString,
+			"transport":            trName,
+			"buffered_bytes":       globalBufferedBytes.Load(),
+			"active_tcp_sessions":  metricActiveTCPSessions.Load(),
+			"active_udp_sessions":  metricActiveUDPSessions.Load(),
+			"resumed_sessions":     metricResumedSessions.Load(),
+			"udp_queued_packets":   metricUDPQueuedTotal.Load(),
+			"udp_replayed_packets": metricUDPReplayedTotal.Load(),
+			"udp_dropped_packets":  metricUDPDroppedTotal.Load(),
 		})
 	})
 	srv := &http.Server{Addr: listenAddr, Handler: mux}
@@ -216,7 +156,6 @@ func startMetricsServer(ctx context.Context, listenAddr string) {
 		_ = srv.ListenAndServe()
 	}()
 }
-
 
 func detectPublicIP() string {
 	client := &http.Client{Timeout: 2 * time.Second}
@@ -266,6 +205,14 @@ func detectLocalLANIP() string {
 	return "127.0.0.1"
 }
 
+func isProtocolToken(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "http", "https", "tls", "udp", "tcp", "both":
+		return true
+	}
+	return false
+}
+
 func parseMappingsWithDefault(raw string, defaultBothUDP bool) ([]PortMapping, error) {
 	var res []PortMapping
 	for _, pair := range strings.Split(raw, ",") {
@@ -296,8 +243,8 @@ func parseMappingsWithDefault(raw string, defaultBothUDP bool) ([]PortMapping, e
 			pair = pair[:len(pair)-5]
 		}
 
-		// Support shorthand single port "8096" ("8096:8096") or local bind "127.0.0.1:8080:80"
 		bindIP := "0.0.0.0"
+		nodeID := ""
 		p := strings.Split(pair, ":")
 		if len(p) == 1 {
 			p = []string{p[0], p[0]}
@@ -305,8 +252,15 @@ func parseMappingsWithDefault(raw string, defaultBothUDP bool) ([]PortMapping, e
 			bindIP = p[0]
 			p = p[1:]
 		}
+		// Support PUBLIC:NODE_ID:LOCAL (e.g. "25565:pc3:25565") when middle token is not a protocol and last token is a port number
+		if len(p) == 3 && !isProtocolToken(p[2]) {
+			if _, errLast := strconv.Atoi(p[2]); errLast == nil {
+				nodeID = sanitizeNodeID(p[1])
+				p = []string{p[0], p[2]}
+			}
+		}
 		if len(p) < 2 || len(p) > 3 {
-			return nil, fmt.Errorf("invalid port mapping %q (expected PORT, PUBLIC:LOCAL, or 127.0.0.1:PUBLIC:LOCAL)", pair)
+			return nil, fmt.Errorf("invalid port mapping %q (expected PORT, PUBLIC:LOCAL, PUBLIC:NODE:LOCAL, or 127.0.0.1:PUBLIC:LOCAL)", pair)
 		}
 		pub, err1 := strconv.Atoi(p[0])
 		loc, err2 := strconv.Atoi(p[1])
@@ -323,7 +277,7 @@ func parseMappingsWithDefault(raw string, defaultBothUDP bool) ([]PortMapping, e
 			}
 			proto = sub
 		}
-		res = append(res, PortMapping{BindIP: bindIP, PublicPort: uint16(pub), TargetPort: uint16(loc), Proto: proto})
+		res = append(res, PortMapping{BindIP: bindIP, PublicPort: uint16(pub), TargetPort: uint16(loc), Proto: proto, NodeID: nodeID})
 	}
 	if len(res) == 0 {
 		return nil, errors.New("at least one port mapping is required")
@@ -336,7 +290,22 @@ func parseMappings(raw string) ([]PortMapping, error) {
 }
 
 func parseVHosts(raw string) (map[string]uint16, error) {
-	res := make(map[string]uint16)
+	routes, err := parseVHostRoutes(raw)
+	if err != nil {
+		return nil, err
+	}
+	res := make(map[string]uint16, len(routes))
+	for _, r := range routes {
+		res[r.Domain] = r.TargetPort
+		if r.NodeID != "" {
+			defaultVHostNodeMap[r.Domain] = r.NodeID
+		}
+	}
+	return res, nil
+}
+
+func parseVHostRoutes(raw string) ([]VHostRoute, error) {
+	var res []VHostRoute
 	if strings.TrimSpace(raw) == "" {
 		return res, nil
 	}
@@ -346,19 +315,26 @@ func parseVHosts(raw string) (map[string]uint16, error) {
 			continue
 		}
 		parts := strings.Split(entry, ":")
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid -vhosts entry %q (expected domain.com:LOCAL_PORT)", entry)
+		var domain, nodeID, portStr string
+		switch len(parts) {
+		case 2:
+			domain = strings.ToLower(strings.TrimSpace(parts[0]))
+			portStr = strings.TrimSpace(parts[1])
+		case 3:
+			domain = strings.ToLower(strings.TrimSpace(parts[0]))
+			nodeID = sanitizeNodeID(parts[1])
+			portStr = strings.TrimSpace(parts[2])
+		default:
+			return nil, fmt.Errorf("invalid -vhosts entry %q (expected domain.com:LOCAL_PORT or domain.com:NODE_ID:LOCAL_PORT)", entry)
 		}
-		domain := strings.ToLower(strings.TrimSpace(parts[0]))
-		port, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		port, err := strconv.Atoi(portStr)
 		if err != nil || port <= 0 || port > 65535 {
 			return nil, fmt.Errorf("invalid port in -vhosts entry %q", entry)
 		}
-		res[domain] = uint16(port)
+		res = append(res, VHostRoute{Domain: domain, TargetPort: uint16(port), NodeID: nodeID})
 	}
 	return res, nil
 }
-
 
 var (
 	redactedSecretsMu sync.RWMutex
@@ -568,16 +544,12 @@ func printSavedTokenAndCommand() error {
 	const (
 		defaultTokenPath          = ".driftless-certs/token.secret"
 		defaultCmdPath            = ".driftless-certs/client-connect.cmd"
-		defaultKnockPath          = ".driftless-certs/knock-url.txt"
 		defaultStandaloneInfoPath = ".driftless-certs/standalone-info.txt"
-		defaultSSHAuthPath        = ".driftless-certs/ssh-auth.txt"
 	)
 	tokBytes, tokErr := os.ReadFile(defaultTokenPath)
 	cmdBytes, cmdErr := os.ReadFile(defaultCmdPath)
-	knockBytes, knockErr := os.ReadFile(defaultKnockPath)
 	infoBytes, infoErr := os.ReadFile(defaultStandaloneInfoPath)
-	authBytes, authErr := os.ReadFile(defaultSSHAuthPath)
-	if tokErr != nil && cmdErr != nil && knockErr != nil && infoErr != nil && authErr != nil {
+	if tokErr != nil && cmdErr != nil && infoErr != nil {
 		return fmt.Errorf("no saved token or connection info found in .driftless-certs/ (start './driftless server' or './driftless standalone' first): %w", tokErr)
 	}
 	if tokErr == nil {
@@ -589,17 +561,25 @@ func printSavedTokenAndCommand() error {
 	if infoErr == nil {
 		fmt.Fprintf(os.Stdout, "Standalone Connection Summary (%s):\n%s\n", defaultStandaloneInfoPath, strings.TrimSpace(string(infoBytes)))
 	}
-	if authErr == nil {
-		fmt.Fprintf(os.Stdout, "Login Credentials user:password (%s):\n  %s\n", defaultSSHAuthPath, strings.TrimSpace(string(authBytes)))
-	}
-	if knockErr == nil {
-		fmt.Fprintf(os.Stdout, "Magic Knock URL (%s):\n  %s\n", defaultKnockPath, strings.TrimSpace(string(knockBytes)))
-	}
 	return nil
+}
+
+func runInteractiveCheck(stunAddr, targetHost, portsRaw, duckFlag string) {
+	stunFailCount.Store(3)
+	pubIP, _ := querySTUNPublicIP(stunAddr, 1200*time.Millisecond)
+	if pubIP == "" {
+		pubIP = detectPublicIP()
+	}
+	mappings, _ := parseMappingsWithDefault(portsRaw, true)
+	ddns := resolveAndPersistDDNS(DDNSConfig{}, duckFlag)
+	rep := checkExternalReachability(pubIP, targetHost, ddns, mappings, 1500*time.Millisecond)
+	out, _ := json.MarshalIndent(rep, "", "  ")
+	fmt.Println(string(out))
 }
 
 func main() {
 	defaultMode := "agent"
+	runCheckCmd := false
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "server", "gateway":
@@ -610,6 +590,9 @@ func main() {
 			os.Args = append(os.Args[:1], os.Args[2:]...)
 		case "standalone", "direct", "p2p":
 			defaultMode = "standalone"
+			os.Args = append(os.Args[:1], os.Args[2:]...)
+		case "check", "diagnose":
+			runCheckCmd = true
 			os.Args = append(os.Args[:1], os.Args[2:]...)
 		case "show-token", "token", "connect-cmd":
 			if err := printSavedTokenAndCommand(); err != nil {
@@ -623,19 +606,21 @@ func main() {
 		}
 	}
 
-	mode := flag.String("mode", defaultMode, "'server' (VPS), 'client' (Home PC to VPS), or 'standalone' (Zero-VPS Home PC)")
+	mode := flag.String("mode", defaultMode, "'server' (VPS Gateway), 'client' (Home PC Agent), or 'standalone' (Zero-VPS Home PC)")
+	nodeIDFlag := flag.String("id", "", "unique node ID / computer name for this Agent when connecting multiple Home PCs to one VPS Gateway (e.g. pc1, media-pc)")
+	nodeAliasFlag := flag.String("node", "", "alias for -id (unique node ID / computer name for multi-agent Gateway routing)")
 	quicAddr := flag.String("quic", "0.0.0.0:4242", "gateway address or comma-separated failover list (e.g. VPS1:4242,VPS2:4242)")
 	transportMode := flag.String("transport", "auto", "tunnel transport: 'auto' (QUIC with automatic TCP-Mux fallback), 'quic', or 'tcp'")
-	tokenFlag := flag.String("token", "", "shared secret password or comma-separated rotation list (auto-generated on server if omitted)")
-	tokenFile := flag.String("token-file", "", "path to file containing shared secret password")
-	ports := flag.String("ports", "8080:80,8096:8096", "PUBLIC:LOCAL or PORT mappings (forwards both TCP+UDP by default)")
+	tokenFlag := flag.String("token", "", "shared secret tunnel password or comma-separated rotation list (auto-generated on server if omitted)")
+	tokenFile := flag.String("token-file", "", "path to file containing shared secret tunnel password")
+	ports := flag.String("ports", "8080:80,8096:8096", "PUBLIC:LOCAL, PORT, or PUBLIC:NODE_ID:LOCAL mappings (forwards both TCP+UDP by default)")
 	udpDefault := flag.Bool("udp", true, "forward UDP alongside TCP by default on all mapped ports")
 	enableTLS := flag.Bool("tls", false, "enable automatic HTTPS/TLS termination on mapped TCP ports")
 	httpsAddr := flag.String("https", "", "optional HTTPS VHost router listen address (e.g. :443 or :8443)")
 	tlsCertFile := flag.String("tls-cert", "", "optional path to custom TLS certificate PEM file")
 	tlsKeyFile := flag.String("tls-key", "", "optional path to custom TLS private key PEM file")
 	vhostAddr := flag.String("vhost-addr", "", "optional HTTP/HTTPS Host router listen address (e.g. :80)")
-	vhosts := flag.String("vhosts", "", "comma-separated domain:LOCAL_PORT mappings (e.g. app.example.com:3000,media.example.com:8096)")
+	vhosts := flag.String("vhosts", "", "comma-separated domain:LOCAL_PORT or domain:NODE_ID:LOCAL_PORT mappings (e.g. media.example.com:pc1:8096,site.example.com:pc2:3000)")
 	direct := flag.String("direct", ":8888", "direct LAN/WAN HTTP redirector listen address (empty to disable)")
 	host := flag.String("host", "127.0.0.1", "local target host on agent/standalone")
 	maxBuf := flag.Int64("max-buf", 16*1024*1024, "max per-session ring buffer in bytes (default 16 MiB)")
@@ -647,14 +632,6 @@ func main() {
 	fingerprint := flag.String("fingerprint", "", "optional gateway SHA-256 cert fingerprint for strict pinning")
 	lanIP := flag.String("lan-ip", "", "override auto-detected agent LAN IP")
 	allowPorts := flag.String("allow-ports", "", "optional whitelist of local ports on agent/standalone (e.g. 80,8096,25565)")
-	allowIPs := flag.String("allow-ips", "", "optional IP/CIDR ACL whitelist for public listeners (e.g. 192.168.1.0/24,203.0.113.5)")
-	userFlag := flag.String("user", "", "username for built-in SSH server (WebSSH/Termius) and optional HTTP Basic Auth")
-	passFlag := flag.String("pass", "", "password for built-in SSH server (WebSSH/Termius) and optional HTTP Basic Auth")
-	authFlag := flag.String("auth", "", "shorthand 'user:password' for built-in SSH and optional HTTP Basic Auth")
-	httpAuth := flag.Bool("http-auth", false, "require HTTP Basic Auth (-user/-pass) on forwarded HTTP/VHost web ports")
-	enableKnock := flag.Bool("knock", false, "enable HTTPS Magic Knock IP gatekeeper (per-port unlock, 1h TTL, instant IP revoke)")
-	knockToken := flag.String("knock-token", "", "optional custom secret for -knock Magic Link (auto-generated and persisted if omitted)")
-	knockTTL := flag.Duration("knock-ttl", 1*time.Hour, "how long a device IP stays unlocked after opening the Magic Knock Link (default 1h)")
 	clientCA := flag.String("client-ca", "", "optional CA PEM file on server to require mTLS client certificates from agents")
 	clientCert := flag.String("client-cert", "", "optional mTLS client certificate PEM file on agent")
 	clientKey := flag.String("client-key", "", "optional mTLS client private key PEM file on agent")
@@ -663,7 +640,7 @@ func main() {
 	proxyProto := flag.Bool("proxy-protocol", false, "prepend HAProxy PROXY protocol v1 header so backend services see real client IP")
 
 	// Standalone / Zero-VPS mode flags
-	enableUPnP := flag.Bool("upnp", true, "automatically open ports on home router via UPnP IGD / NAT-PMP (standalone mode)")
+	enableUPnP := flag.Bool("upnp", true, "automatically open ports on home router via UPnP IGD / NAT-PMP / PCP (standalone mode)")
 	stunServer := flag.String("stun", "stun.cloudflare.com:3478", "STUN server or comma-separated list for 5ms external IP change detection (standalone mode)")
 	stunInterval := flag.Duration("stun-interval", 1*time.Second, "how often to check external IP via STUN (standalone mode)")
 	duckShort := flag.String("duck", "", "shorthand DuckDNS 'subdomain:token' or update URL (saved automatically for next runs)")
@@ -673,15 +650,25 @@ func main() {
 	ddnsUser := flag.String("ddns-user", "", "username for No-IP / DynDNS provider")
 	ddnsZone := flag.String("ddns-zone", "", "Cloudflare Zone ID (when -ddns-provider=cloudflare)")
 	ddnsURL := flag.String("ddns-url", "", "custom DDNS webhook URL (replaces {ip} with current external IP)")
-	// Allow bare '-duck' or '--duck' without arguments on CLI (rewritten to '-duck=auto')
+
+	portsExplicit := false
 	for i := 1; i < len(os.Args); i++ {
-		if os.Args[i] == "-duck" || os.Args[i] == "--duck" {
+		arg := os.Args[i]
+		if arg == "-ports" || arg == "--ports" || strings.HasPrefix(arg, "-ports=") || strings.HasPrefix(arg, "--ports=") {
+			portsExplicit = true
+		}
+		if arg == "-duck" || arg == "--duck" {
 			if i+1 >= len(os.Args) || strings.HasPrefix(os.Args[i+1], "-") {
 				os.Args[i] = "-duck=auto"
 			}
 		}
 	}
 	flag.Parse()
+
+	if runCheckCmd {
+		runInteractiveCheck(*stunServer, *host, *ports, *duckShort)
+		return
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -692,13 +679,11 @@ func main() {
 	defaultClientKey = strings.TrimSpace(*clientKey)
 	defaultProxyProtocol = *proxyProto
 
-	if *allowIPs != "" {
-		acl, err := parseIPACL(*allowIPs)
-		if err != nil {
-			log.Fatalf("[driftless] %v", err)
-		}
-		defaultIPACL = acl
+	chosenNodeID := strings.TrimSpace(*nodeIDFlag)
+	if chosenNodeID == "" {
+		chosenNodeID = strings.TrimSpace(*nodeAliasFlag)
 	}
+	defaultAgentNodeID = sanitizeNodeID(chosenNodeID)
 
 	if *metricsAddr != "" {
 		startMetricsServer(ctx, *metricsAddr)
@@ -718,31 +703,6 @@ func main() {
 			}
 			portsAllow[uint16(port)] = struct{}{}
 		}
-	}
-
-	parsedMappingsForAuth, _ := parseMappingsWithDefault(*ports, *udpDefault)
-	hasPort22 := false
-	for _, m := range parsedMappingsForAuth {
-		if m.TargetPort == 22 || m.PublicPort == 22 {
-			hasPort22 = true
-			break
-		}
-	}
-	if upAuth, err := initUserPassAuth(*certDir, *userFlag, *passFlag, *authFlag, *httpAuth, hasPort22); err != nil {
-		log.Fatalf("[driftless] failed to initialize user/password authentication: %v", err)
-	} else if upAuth != nil {
-		defaultUserPassAuth = upAuth
-	}
-
-	if *enableKnock || strings.TrimSpace(*knockToken) != "" {
-		*enableTLS = true
-		parsedMappings, _ := parseMappingsWithDefault(*ports, *udpDefault)
-		isStandaloneMode := *mode == "standalone" || *mode == "direct" || *mode == "p2p"
-		kc, err := newKnockController(*certDir, *knockToken, *knockTTL, parsedMappings, portsAllow, isStandaloneMode, *host)
-		if err != nil {
-			log.Fatalf("[driftless] failed to initialize -knock controller: %v", err)
-		}
-		defaultKnockController = kc
 	}
 
 	if *mode == "standalone" || *mode == "direct" || *mode == "p2p" {
@@ -831,16 +791,33 @@ func main() {
 			}
 			*enableTLS = true
 			if sm, err := newSNICertManager(*certDir, *tlsCertFile, *tlsKeyFile); err == nil {
-				sm.ensureDomainCertificate(ddnsCfg.Domain)
+				go sm.ensureDomainCertificate(ddnsCfg.Domain)
 			}
 		}
 		if err := runGateway(ctx, *quicAddr, token, *direct, *vhostAddr, *httpsAddr, vhostMap, mappings, *maxMem, *maxBuf, *quicIdle, *quicKeepalive, *sessionTTL, *certDir, *tlsCertFile, *tlsKeyFile, *enableTLS, *sameLAN); err != nil {
 			log.Fatalf("[gateway] %v", err)
 		}
 	} else {
-		if err := runAgent(ctx, *quicAddr, *host, token, *lanIP, *fingerprint, *maxBuf, *maxMem, *quicIdle, *quicKeepalive, *sessionTTL, portsAllow); err != nil {
+		var agentMappings []PortMapping
+		if portsExplicit {
+			parsed, err := parseMappingsWithDefault(*ports, *udpDefault)
+			if err != nil {
+				log.Fatalf("[agent] %v", err)
+			}
+			agentMappings = parsed
+		}
+		var agentVHosts []VHostRoute
+		if strings.TrimSpace(*vhosts) != "" {
+			parsedVH, err := parseVHostRoutes(*vhosts)
+			if err != nil {
+				log.Fatalf("[agent] %v", err)
+			}
+			agentVHosts = parsedVH
+		}
+		defaultAgentMappings = agentMappings
+		defaultAgentVHosts = agentVHosts
+		if err := runAgentWithServices(ctx, defaultAgentNodeID, *quicAddr, *host, token, *lanIP, *fingerprint, agentMappings, agentVHosts, *maxBuf, *maxMem, *quicIdle, *quicKeepalive, *sessionTTL, portsAllow); err != nil {
 			log.Fatalf("[agent] %v", err)
 		}
 	}
 }
-

@@ -1,351 +1,382 @@
-# driftless
+# Driftless (v1.5.4)
 
-[English](#english) | [Русский](#ru)
+**Static-IP Convenience for Dynamic IP Connections | Multi-Node Reverse Tunnel & Standalone Port Publisher**
 
----
+[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go)](https://go.dev/)
+[![Transport](https://img.shields.io/badge/Transport-QUIC_%2B_TLS_1.3_%2F_TCP--Mux-10b981?style=flat-square)](#architecture)
+[![NAT Traversal](https://img.shields.io/badge/Router-UPnP_%2B_NAT--PMP_%2B_PCP_v2-3b82f6?style=flat-square)](#router-port-forwarding-upnp--nat-pmp--pcp)
+[![License](https://img.shields.io/badge/License-MIT-a855f7?style=flat-square)](LICENSE)
 
-<a id="english"></a>
-
-## English
-
-**Open ports on your Home PC or Linux server (24/7 websites, Minecraft/CS2/Rust servers, Jellyfin, SSH, AnyDesk, RDP) and keep them running for months without disconnects when your dynamic IP changes.**
-
-### Which mode do I need?
-1. **No VPS (`standalone` mode):** Your ISP gives you a dynamic public ("white") IP. You run `driftless` **only on your PC or Linux box**. It opens ports on your router automatically (UPnP / NAT-PMP / PCP v2), tracks IP changes every second via STUN, updates your domain, and restores router rules automatically even if your router reboots.
-2. **With a cheap VPS (`server` + `client` mode):** Your ISP puts you behind CGNAT ("gray" IP), so incoming connections to your router are blocked by the provider. Run `server` on a VPS and `client` on your Home PC. When your home IP changes, active TCP streams (downloads, websites, SSH, RDP) freeze in a 16 MB RAM ring buffer and resume from the exact byte offset with zero drops.
-
-Download one binary from [Releases](https://github.com/ERETLY/driftless/releases):
-- **Windows:** `driftless-windows-amd64.exe`
-- **Linux:** `driftless-linux-amd64` (or `arm64`)
-- **macOS:** `driftless-darwin-arm64`
+[English Documentation](#1-what-driftless-is) | [Русская документация](#русская-документация-ru)
 
 ---
 
-### Quick Start 1: Without a VPS (only on your PC / Linux with a dynamic IP)
+## 1. What Driftless Is
 
-Suppose you want to run a website 24/7 on port `3000` (exposed on public port `80`), connect from your phone via **WebSSH** (`22`) with your own username and password (`-user admin -pass mypass123`), or connect via **AnyDesk** (`7070`) and **RDP** (`3389`).
+Most residential ISPs assign a **dynamic public IP address** that changes whenever your PPPoE session resets, your router reboots, or your DHCP lease expires. Some ISPs also place subscribers behind **CGNAT** (`100.64.0.0/10`), where inbound connections from the internet cannot reach your router at all.
 
-**Step 1. Run one command on your PC:**
+**Driftless** gives you the convenience of a static IP on top of a dynamic home connection:
+- **Network-layer transport & port publishing:** Driftless publishes your existing local TCP and UDP services (HTTP/HTTPS web apps, Jellyfin/Plex media servers, SSH, RDP, WireGuard, Minecraft/Valheim/CS2 game servers, APIs) under permanent domain names and public ports.
+- **No interference with application auth:** Driftless does not inject custom login screens, custom SSH accounts, or proprietary HTTP Basic Auth layers. Your services use their own native authentication (OpenSSH keys/passwords, Windows RDP credentials, Jellyfin/Nextcloud accounts, TLS certificates).
+- **Two operating modes in a single zero-config binary:**
+  1. **Standalone Mode (`driftless standalone`):** Runs directly on your Home PC or home server without a VPS. Automatically opens ports on your router via **UPnP IGDv1/v2**, **NAT-PMP (RFC 6886)**, and **PCP v2 (RFC 6887)**, monitors your public IP every `1s` via **RFC 5389 UDP STUN**, updates **DuckDNS / No-IP / Cloudflare / Webhook DDNS** within milliseconds of an IP change, and verifies external reachability.
+  2. **Gateway + Multi-Agent Mode (`driftless server` + `driftless client`):** Runs a Gateway on a public VPS and connects **one or multiple Home PCs simultaneously** (`pc1`, `pc2`, `pc3`) through encrypted **QUIC (TLS 1.3)** or **TCP-Mux** reverse tunnels. Works even behind strict **ISP CGNAT** and preserves active TCP streams and UDP sessions across home WAN IP changes without dropping connections.
 
-Windows:
+---
+
+## 2. How Dynamic IP + DDNS Works
+
+1. **Millisecond External IP Detection (RFC 5389 UDP STUN):**
+   Every `1s` (configurable via `-stun-interval`), Driftless sends a lightweight 20-byte UDP STUN Binding Request (`XOR-MAPPED-ADDRESS`, cookie `0x2112A442`) to redundant STUN servers (`stun.cloudflare.com:3478`, `stun.l.google.com:19302`, `stun1.l.google.com:19302`).
+2. **Instant DDNS Synchronization:**
+   The moment your ISP assigns a new public IPv4 address:
+   - In **Standalone Mode**, Driftless immediately pushes the new IP to **DuckDNS**, **No-IP**, **Cloudflare DNS API v4**, or your custom `-ddns-url` webhook and refreshes router port mappings.
+   - In **Gateway + Agent Mode**, the Agent immediately dials a new encrypted tunnel epoch to your VPS Gateway and replays in-flight ring buffers so active TCP downloads, SSH sessions, and UDP game packets continue uninterrupted.
+
+---
+
+## 3. Standalone Mode (No VPS Required)
+
+Use **Standalone Mode** when your ISP gives your router a real (even if dynamic) public IPv4 address.
+
+### First Run with DuckDNS (Saves Domain & Token Automatically)
+1. Sign in at [duckdns.org](https://www.duckdns.org), create a subdomain (for example `mypc`), and copy your token.
+2. Run Driftless on your PC:
+
+**Windows (PowerShell):**
 ```powershell
-.\driftless-windows-amd64.exe standalone -ports 80:3000,22,7070,3389 -user admin -pass mypass123 -duck
+.\driftless-windows-amd64.exe standalone -ports 8096,25565/both,22 -duck mypc:YOUR_DUCKDNS_TOKEN
 ```
 
-Linux:
+**Linux / macOS:**
 ```bash
-./driftless standalone -ports 80:3000,22,7070,3389 -user admin -pass mypass123 -duck
+./driftless standalone -ports 8096,25565/both,22 -duck mypc:YOUR_DUCKDNS_TOKEN
 ```
 
-**How `-duck` works automatically:**
-- **With your own free DuckDNS domain:** Run `-duck mypc:YOUR_TOKEN` **once**. `driftless` saves it in `.driftless-ddns.json`. On every future launch (even after stopping the program or rebooting your PC), just write `-duck` and it automatically loads `mypc.duckdns.org`.
-- **Without any account at all:** Just write `-duck`. If no saved token is found, `driftless` automatically assigns an `<IP>.sslip.io` domain and updates it whenever your IP changes.
+### Subsequent Runs (Just `-duck`)
+Driftless saves your DuckDNS credentials in `.driftless-ddns.json` (`0600` permissions). On every future run or reboot, simply pass `-duck`:
 
-**Step 2. Copy the ready-to-use login details printed in your terminal:**
+```powershell
+.\driftless-windows-amd64.exe standalone -ports 8096,25565/both,22 -duck
+```
+
+### Other DDNS Providers (No-IP, Cloudflare, Custom Webhook)
+```bash
+# Cloudflare DNS API v4 (ZoneID:APIToken)
+./driftless standalone -ports 443,8096 -ddns-provider cloudflare -ddns-domain home.example.com -ddns-token ZONE_ID:CF_API_TOKEN -tls -acme-email you@example.com
+
+# No-IP (username:password)
+./driftless standalone -ports 8096,25565/both -ddns-provider noip -ddns-domain mypc.ddns.net -ddns-token USER:PASS
+
+# Custom Webhook ({ip} and {domain} placeholders)
+./driftless standalone -ports 8096 -ddns-domain home.example.com -ddns-url "https://dns.example.com/update?host={domain}&ip={ip}"
+```
+
+---
+
+## 4. Gateway + Multi-Agent Mode (Multiple Home PCs Through One VPS)
+
+When your ISP uses **CGNAT** (`100.64.0.0/10`), blocks inbound ports, or when you want to expose services from **multiple home computers (`pc1`, `pc2`, `pc3`) through a single VPS IP**, run `driftless server` on your VPS and `driftless client` on each home machine.
+
 ```text
-[standalone] driftless v1.5.4 Zero-VPS mode active (LAN=192.168.1.50, Public IP=203.0.113.45)
-[standalone] DDNS updated -> 203.0.113.45 (mypc.duckdns.org)
-[standalone] router UPnP/NAT-PMP auto-forwarded 8 port rules to 192.168.1.50
-[standalone] ==========================================================
-[standalone] Ready-to-use connections (Domain: mypc.duckdns.org | IP: 203.0.113.45):
-[standalone]   Website (24/7 HTTPS): https://mypc.duckdns.org:80 (or http://mypc.duckdns.org:80)
-[standalone]   SSH (WebSSH/Phone)  : Host: mypc.duckdns.org | Port: 22 | User: admin  (CLI: ssh admin@mypc.duckdns.org)
-[standalone]   AnyDesk Direct TCP  : mypc.duckdns.org:7070 (enter in AnyDesk app + your AnyDesk password)
-[standalone]   Remote Desktop      : mypc.duckdns.org:3389 (Windows App / Microsoft Remote Desktop / mstsc)
-[standalone] Connect from Phone (WebSSH / Termius):
-  Host: mypc.duckdns.org   Port: 22   User: admin   Password: mypass123
-[standalone] ==========================================================
+                        +---------------------------------------+
+                        |       Public VPS (driftless server)   |
+                        |  -http :80  -tls :443  -addr :4443    |
+                        +-------------------+-------------------+
+                                            |
+              +-----------------------------+-----------------------------+
+              | QUIC / TCP-Mux              | QUIC / TCP-Mux              | QUIC / TCP-Mux
+              | (-id pc1)                   | (-id pc2)                   | (-id pc3)
+              v                             v                             v
+   +--------------------+        +--------------------+        +--------------------+
+   |   Home PC 1 (pc1)  |        |   Home PC 2 (pc2)  |        |   Home PC 3 (pc3)  |
+   | media.example.com  |        |  site.example.com  |        |  game.example.com  |
+   |  127.0.0.1:8096    |        |   127.0.0.1:3000   |        |  127.0.0.1:8080    |
+   |  TCP :2221 -> :22  |        |   TCP :2222 -> :22 |        | UDP :25565->:25565 |
+   +--------------------+        +--------------------+        +--------------------+
 ```
-*(Closed the window or running in the background? Run `./driftless show-token` anytime to print all addresses and saved login credentials again).*
 
----
+### Step 1: Start the Gateway on Your VPS
+Point your DNS `A` records (`media.example.com`, `site.example.com`, `game.example.com`) to your VPS public IP.
 
-### How to Log In from Android / iPhone (WebSSH, AnyDesk, RDP, Browser)
-
-`driftless` runs **only on your PC** (or VPS + PC). You do not install `driftless` on your phone. Open the standard app on your phone and enter what is shown in your console:
-
-#### 1. WebSSH / Termius / JuiceSSH (Run scripts & terminal on your PC from iPhone/Android)
-`driftless` includes a **built-in SSHv2 server** when `-user` and `-pass` are set (or when port `22` is in `-ports` and no system `sshd` is running). You do **not** need to install Windows OpenSSH Server or generate private keys:
-- **Host / IP:** `mypc.duckdns.org` (or the IP shown in console)
-- **Port:** `22` *(or any other open port like `8096` - `driftless` auto-detects SSH on any port)*
-- **User:** `admin` (what you passed in `-user`)
-- **Password:** `mypass123` (what you passed in `-pass`)
-- **Private Key:** Leave empty (not required). Once connected, you get a live PowerShell / CMD (Windows) or Bash (Linux) terminal to start/stop scripts and servers.
-
-#### 2. AnyDesk from Android / iPhone (Direct TCP without cloud lag)
-1. In AnyDesk on your PC, open **Settings -> Security -> Unlock Security Settings**, check **Enable unattended access**, and set your AnyDesk password.
-2. Include port `7070` in `-ports` (e.g. `-ports 7070,22`).
-3. Open the **AnyDesk** app on your Android or iPhone, and in the **Remote Address** field type:
-   ```text
-   mypc.duckdns.org:7070
-   ```
-4. Enter your AnyDesk password when prompted.
-
-#### 3. Windows App / Microsoft Remote Desktop (Full Windows Desktop from Phone/Tablet)
-1. Include port `3389` in `-ports`.
-2. Open **Windows App** (or Microsoft Remote Desktop) on iPhone/Android -> tap **+** -> **Add PC**.
-3. **PC Name:** `mypc.duckdns.org:3389`
-4. **User Account:** Your Windows account username and password.
-
-#### 4. Hosting a Website 24/7 for a Month (with optional password lock)
-- Run your local web server (Node.js, Python, Nginx, Docker) on e.g. port `3000` and start `driftless` with `-ports 80:3000 -duck`.
-- Your website is live 24/7 at `http://mypc.duckdns.org` and `https://mypc.duckdns.org:80`.
-- Want to password-protect a private web dashboard? Add `-user admin -pass mypass123 -http-auth` and any browser visiting your port will prompt for that login and password.
-
----
-
-### Quick Start 2: Through a VPS (works on any internet, including CGNAT / "gray" IP)
-
-**Step 1. Run on your VPS:**
 ```bash
-wget -O driftless https://github.com/ERETLY/driftless/releases/latest/download/driftless-linux-amd64
-chmod +x driftless
-./driftless server -ports 80:3000,8096,22,7070
+./driftless server \
+  -addr 0.0.0.0:4443 \
+  -http 0.0.0.0:80 \
+  -tls 0.0.0.0:443 \
+  -acme-email admin@example.com
 ```
-The VPS generates a secret token and prints the exact command for your Home PC right on screen (run `./driftless show-token` to view it again anytime).
+On first startup, the Gateway prints its persistent **Token** and **TLS SHA-256 Fingerprint** (stored in `.driftless-certs/token.secret`).
 
-**Step 2. Run that printed command on your Home PC:**
-```powershell
-.\driftless-windows-amd64.exe client -quic YOUR_VPS_IP:4242 -token PASSWORD -fingerprint CERT_HASH -user admin -pass mypass123
-```
-Done. Your Home PC website, SSH terminal, and AnyDesk are now live through `YOUR_VPS_IP`.
+### Step 2: Connect Multiple Home Computers (`pc1`, `pc2`, `pc3`)
+Each computer connects with its own `-id` (`-node`) and publishes its own domains (`-vhosts`) and TCP/UDP ports (`-ports`):
 
----
-
-### Optional: Stealth Port Protection (`-knock`)
-If you want all ports (`22`, `3389`, `7070`) completely invisible to internet scanners until you unlock them from your phone, add `-knock`:
-```powershell
-.\driftless-windows-amd64.exe standalone -ports 8096,3389,22 -user admin -pass mypass123 -duck -knock
-```
-- All mapped TCP and UDP ports drop packets from unknown IPs.
-- `driftless` prints a secret `https://` Magic Knock link in your terminal (view anytime via `./driftless show-token`).
-- Open that link once in your phone's browser to unlock your phone's IP for **1 hour** (`-knock-ttl 1h`).
-- Supports unlocking a single port only (`?port=22`), downloading a ready `.rdp` file (`/connect.rdp`), or revoking access immediately (`/revoke` or `/revoke?all=1`).
-
----
-
-### Designed to Run 24/7 for Months ("Turn On and Forget")
-
-- **Survives ISP IP changes without dropping streams:** Active TCP streams are buffered in a 16 MB ring buffer and resume from the exact byte offset; UDP sessions preserve port mappings and buffer brief link blips (with a 2-second freshness window so stale packets are never replayed).
-- **Zero socket leaks over 30+ days:** Automatic idle socket deadlines clean up abandoned half-open scanner connections so file descriptors and RAM stay flat over months of uptime.
-- **Survives local server restarts:** Restarting your website (`:3000`), game server (`:25565`), or UDP service while `driftless` is running never breaks listeners or active UDP sessions.
-- **Survives home router reboots:** In `standalone` mode, if your router reboots and wipes its UPnP/PCP table (or finishes booting after your PC), `driftless` automatically detects the recovery and re-registers all port forwards within 60 seconds.
-- **Full Stop/Restart Persistence:** Stopping `driftless` (or rebooting your PC) and starting it again with `-duck` automatically reloads your saved DuckDNS domain/token (`.driftless-ddns.json`), TLS certificates, SSH host key, and login credentials (`.driftless-certs/`).
-- **Smart Ephemeral Port Bridging & Single-Port Auto-Routing:** Works even if a local service is already bound to `0.0.0.0`, and automatically routes SSH (`SSH-2.0-`) to `:22` and RDP (`0x03 0x00`) to `:3389` on any mapped TCP port.
-
----
-
-### All CLI Flags Reference
-
-| Flag | Default | Description |
-| :--- | :--- | :--- |
-| `-ports` | `"8080:80,8096:8096"` | Ports to open: `8096,25565`, `80:3000`, or `127.0.0.1:8080:3000`. Supports `/tcp`, `/udp`, `/https`. |
-| `-duck` | `""` | Automatic domain & TLS certificate: pass `-duck mypc:TOKEN` once (saved to `.driftless-ddns.json`), then just `-duck`. |
-| `-user` / `-pass` | `""` | Username and password for built-in SSH server (WebSSH/Termius) and optional `-http-auth` (saved automatically). |
-| `-auth` | `""` | Shorthand `"user:password"` for `-user` and `-pass`. |
-| `-http-auth` | `false` | Require HTTP Basic Auth (`-user`/`-pass`) on forwarded HTTP/VHost web ports. |
-| `-udp` | `true` | Forward UDP alongside TCP on all ports (`-udp=false` for TCP only). |
-| `-quic` | `"0.0.0.0:4242"` | Tunnel address on VPS or comma-separated failover list on Home PC (`vps1:4242,vps2:4242`). |
-| `-transport` | `"auto"` | Tunnel transport: `"auto"` (QUIC with automatic TCP-Mux fallback), `"quic"`, or `"tcp"`. |
-| `-token` | auto | Shared password or comma-separated rotation list (`"new_tok,old_tok"`). |
-| `-fingerprint` | `""` | VPS SHA-256 certificate fingerprint (auto-filled in the generated client command). |
-| `-knock` | `false` | Enable HTTPS Magic Knock stealth gatekeeper (per-port `?port=22`, 1h TTL, `/revoke`). |
-| `-knock-token` | auto | Custom secret for `-knock` URL (auto-generated and saved in `.driftless-certs/knock.secret` if omitted). |
-| `-knock-ttl` | `1h` | How long an IP stays unlocked after opening the Magic Knock URL (default `1h`). |
-| `-tls` | `false` | Enable automatic HTTPS/TLS termination on mapped TCP ports. |
-| `-vhosts` | `""` | Route domains and URL paths to local ports: `"site.com:3000,site.com/api:4000,*.site.com:5000"`. |
-| `-vhost-addr` / `-https` | `":80"` / `""` | HTTP and HTTPS listen addresses for `-vhosts`. |
-| `-tls-cert` / `-tls-key` | `""` | Custom `.pem` TLS certificate and private key files. |
-| `-direct` | `":8888"` | Direct home Wi-Fi/LAN HTTP redirector bypassing the VPS (`""` to disable). |
-| `-host` | `"127.0.0.1"` | Local target IP on your Home PC. |
-| `-allow-ports` | `""` | Whitelist allowed local target ports on your Home PC (e.g. `"80,3000,8096,25565"`). |
-| `-allow-ips` | `""` | IP/CIDR ACL whitelist for public listeners (e.g. `"192.168.1.0/24,203.0.113.5"`). |
-| `-client-ca` / `-client-cert` / `-client-key` | `""` | Optional mutual TLS (mTLS) client certificate verification between VPS and Home PC. |
-| `-proxy-protocol` | `false` | Prepend HAProxy PROXY protocol v1 header so local backends see the real client IP. |
-| `-metrics` | `""` | Observability listen address for `/metrics` (Prometheus) and `/status` (JSON), e.g. `"127.0.0.1:9090"`. |
-| `-upnp` | `true` | Automatically open ports on home router via UPnP IGD / NAT-PMP / PCP v2 (`standalone` mode). |
-| `-stun` | `"stun.cloudflare.com:3478"` | STUN server(s) for external IP change detection (`standalone` mode). |
-| `-stun-interval` | `1s` | How often to check external IP via STUN (`standalone` mode). |
-| `-ddns-provider` | `""` | Additional DDNS providers: `"duckdns"`, `"cloudflare"`, or `"noip"`. |
-| `-ddns-domain` / `-ddns-token` | `""` | Domain and API token when using `-ddns-provider`. |
-| `-ddns-user` / `-ddns-zone` / `-ddns-url` | `""` | Username (No-IP), Zone ID (Cloudflare) or custom webhook URL (`{ip}`). |
-| `-max-buf` / `-max-mem` | `16 MB` / `256 MB` | Per-session ring buffer size and global memory cap across all sessions. |
-| `-session-ttl` | `90s` | How long to hold frozen TCP sessions while home internet reconnects. |
-
----
-
-<a id="ru"></a>
-
-## Русский
-
-[Read in English ↑](#english)
-
-**Открой порты на домашнем ПК или Linux-сервере (свой сайт 24/7, игровой сервер Minecraft/CS2/Rust, Jellyfin, SSH с телефона, AnyDesk, удаленный рабочий стол RDP) один раз на месяц - без обрывов связи при смене динамического IP.**
-
-### Какой режим выбрать?
-1. **Вообще без ВПС (`standalone`):** Если провайдер дает динамический белый IP. Ты запускаешь один файл **только на своем ПК или Linux**. Программа сама открывает порты на роутере (UPnP / NAT-PMP / PCP v2), каждую секунду следит за внешним IP через STUN, обновляет домен и сама восстанавливает проброс портов даже после перезагрузки роутера.
-2. **Через дешевый ВПС (`server` + `client`):** Если у провайдера серый IP (CGNAT) и входящие подключения из интернета заблокированы. Запускаешь `server` на ВПС и `client` дома на ПК. При смене домашнего IP все активные TCP-соединения (загрузки, стримы, сайты, SSH) удерживаются в буфере памяти 16 МБ и продолжают работу с точного байта без разрыва.
-
-Скачай один готовый файл под свою ОС из [Releases](https://github.com/ERETLY/driftless/releases):
-- **Windows:** `driftless-windows-amd64.exe`
-- **Linux:** `driftless-linux-amd64` (или `arm64`)
-- **macOS:** `driftless-darwin-arm64`
-
----
-
-### Способ 1. Без ВПС - только на своем ПК или Linux (если IP динамический)
-
-Допустим, ты хочешь держать свой сайт 24/7 на порту `3000` (открыть его наружу на `80` порту), подключаться к ПК с телефона через **WebSSH** (`22`) по своему логину и паролю (`-user admin -pass mypass123`), а также заходить через **AnyDesk** (`7070`) или **RDP** (`3389`).
-
-**Шаг 1. Запусти одну команду на своем ПК:**
-
-На Windows:
-```powershell
-.\driftless-windows-amd64.exe standalone -ports 80:3000,22,7070,3389 -user admin -pass mypass123 -duck
-```
-
-На Linux:
+**Computer 1 (`pc1` - Media Server & SSH):**
 ```bash
-./driftless standalone -ports 80:3000,22,7070,3389 -user admin -pass mypass123 -duck
+./driftless client \
+  -id pc1 \
+  -gateway vps.example.com:4443 \
+  -token YOUR_GATEWAY_TOKEN \
+  -vhosts media.example.com:8096 \
+  -ports 2221:22/tcp
 ```
 
-**Как работает флаг `-duck` (ничего настраивать вручную не нужно):**
-- **Если есть бесплатный домен на DuckDNS:** Один раз запусти с токеном: `-duck mypc:ТВОЙ_ТОКЕН`. Программа сама сохранит его в файл `.driftless-ddns.json`. При всех следующих запусках (даже после остановки программы или перезагрузки ПК) пиши просто `-duck` - она сама подхватит твой домен `mypc.duckdns.org`.
-- **Если токена вообще нет:** Пиши просто `-duck`. Если сохраненного токена нет, программа автоматически создаст рабочий домен `<ТВОЙ_IP>.sslip.io` + TLS-сертификат и будет обновлять его при каждой смене IP.
+**Computer 2 (`pc2` - Web Application & SSH):**
+```bash
+./driftless client \
+  -id pc2 \
+  -gateway vps.example.com:4443 \
+  -token YOUR_GATEWAY_TOKEN \
+  -vhosts site.example.com:3000 \
+  -ports 2222:22/tcp
+```
 
-**Шаг 2. Программа сразу выведет в консоль готовые данные для входа:**
+**Computer 3 (`pc3` - Game Server Status Page & UDP/TCP Game Port):**
+```bash
+./driftless client \
+  -id pc3 \
+  -gateway vps.example.com:4443 \
+  -token YOUR_GATEWAY_TOKEN \
+  -vhosts game.example.com:8080 \
+  -ports 25565:25565/both
+```
+
+*(Optional)* You can also define static multi-node routing rules directly on the VPS Gateway:
+```bash
+./driftless server \
+  -addr 0.0.0.0:4443 \
+  -http 0.0.0.0:80 \
+  -tls 0.0.0.0:443 \
+  -vhosts media.example.com:pc1:8096,site.example.com:pc2:3000,game.example.com:pc3:8080 \
+  -ports 2221:pc1:22/tcp,2222:pc2:22/tcp,25565:pc3:25565/both
+```
+
+**Multi-Agent Isolation Guarantee:**
+- If `pc1` reboots or its ISP rotates its IP, `pc2` and `pc3` continue serving traffic with zero interruption.
+- When `pc1` reconnects, its sessions and routes on `media.example.com` and port `2221` automatically resume.
+
+---
+
+## 5. Publishing TCP and UDP Services (`-ports`)
+
+The `-ports` flag accepts comma-separated rules in any of these formats:
+- `8096` -> Public TCP port `8096` to local TCP port `8096`
+- `25565/both` -> Both TCP and UDP port `25565` to local port `25565`
+- `51820/udp` -> Public UDP port `51820` to local UDP port `51820`
+- `2222:22/tcp` -> Public TCP port `2222` to local TCP port `22`
+- `127.0.0.1:8443:443/tcp` -> Bind only on `127.0.0.1:8443` and forward to local port `443`
+- `25565:pc3:25565/both` -> (On Gateway) Route public TCP+UDP port `25565` to Agent node `pc3` port `25565`
+
+---
+
+## 6. Router Port Forwarding (UPnP / NAT-PMP / PCP) & Limitations
+
+In Standalone Mode, Driftless automatically maps external ports on your router using three standard protocols:
+1. **UPnP IGDv1 / IGDv2 (`WANIPConnection` & `WANPPPConnection`):** Parallel SSDP multicast discovery (`239.255.255.250:1900`), automatic fallback to gateway XML descriptions, and automatic fallback from `LeaseDuration=3600` to permanent leases (`0`) on consumer routers that return UPnP error `725 OnlyPermanentLeasesSupported`.
+2. **PCP v2 (RFC 6887):** Port Control Protocol with 96-bit cryptographic nonce verification.
+3. **NAT-PMP (RFC 6886):** Apple/IETF NAT Port Mapping Protocol on UDP port `5351`.
+
+### Crash-Safe Cleanup & Self-Healing
+- Active router mappings are atomically persisted in `.driftless-upnp-state.json` (`0600` permissions) with cross-process lock protection.
+- Every `60s`, Driftless renews router mappings so router reboots never leave your ports closed.
+- Running `./driftless stop` or pressing `Ctrl+C` deletes all UPnP / NAT-PMP / PCP mappings from your router.
+
+### When Standalone Mode Cannot Work Without a VPS
+Standalone Mode requires your home router to receive inbound packets from the internet. It **cannot** accept incoming connections without a VPS if:
+1. **Your ISP uses CGNAT (`100.64.0.0/10`) or Double NAT:** Your router's WAN interface has a private/carrier-grade NAT address rather than a public IPv4 address.
+2. **UPnP / NAT-PMP / PCP is disabled on your router** and you have not manually forwarded the ports in your router's admin UI.
+3. **Your ISP firewall blocks inbound ports** (many residential ISPs block ports `80`, `443`, `22`, or `445`).
+4. **Local OS firewall (Windows Defender Firewall / `ufw` / `nftables`)** blocks incoming connections to the `driftless` binary.
+
+---
+
+## 7. External Reachability Check & Diagnostics (`./driftless check`)
+
+Driftless automatically checks your public IP, CGNAT status, and TCP port reachability on Standalone startup. You can also run a standalone diagnostic at any time:
+
+```bash
+./driftless check -ports 8096,25565/both,22 -duck
+```
+
+Example output:
 ```text
-[standalone] driftless v1.5.4 Zero-VPS mode active (LAN=192.168.1.50, Public IP=203.0.113.45)
-[standalone] DDNS updated -> 203.0.113.45 (mypc.duckdns.org)
-[standalone] router UPnP/NAT-PMP auto-forwarded 8 port rules to 192.168.1.50
-[standalone] ==========================================================
-[standalone] Ready-to-use connections (Domain: mypc.duckdns.org | IP: 203.0.113.45):
-[standalone]   Website (24/7 HTTPS): https://mypc.duckdns.org:80 (or http://mypc.duckdns.org:80)
-[standalone]   SSH (WebSSH/Phone)  : Host: mypc.duckdns.org | Port: 22 | User: admin  (CLI: ssh admin@mypc.duckdns.org)
-[standalone]   AnyDesk Direct TCP  : mypc.duckdns.org:7070 (enter in AnyDesk app + your AnyDesk password)
-[standalone]   Remote Desktop      : mypc.duckdns.org:3389 (Windows App / Microsoft Remote Desktop / mstsc)
-[standalone] Connect from Phone (WebSSH / Termius):
-  Host: mypc.duckdns.org   Port: 22   User: admin   Password: mypass123
-[standalone] ==========================================================
+========================================================================
+  DRIFTLESS NETWORK & REACHABILITY CHECK (v1.5.4)
+========================================================================
+  LAN IP Address        : 192.168.1.50
+  Public IP (STUN)      : 198.51.100.42
+  CGNAT Status          : OK (Public IPv4 detected)
+  UPnP / NAT-PMP / PCP  : 4 router rule(s) mapped
+  PORT 8096 (TCP)       : REACHABLE (198.51.100.42:8096)
+  PORT 25565 (TCP)      : REACHABLE (198.51.100.42:25565)
+  PORT 22 (TCP)         : UNREACHABLE (Check router port-forward / ISP CGNAT / local service)
+========================================================================
 ```
-*(Если закрыл окно или перезапустил консоль - в любой момент выполни `./driftless show-token`, и программа снова покажет все твои ссылки, логин и пароль).*
 
 ---
 
-### Как войти с телефона (Android / iPhone) через WebSSH, AnyDesk, RDP или браузер
+## 8. CLI Reference: Start, Stop & Flags
 
-Сама `driftless` стоит **только на твоем ПК** (или ВПС + ПК). На телефон ничего необычного ставить не нужно - открываешь привычное приложение и вводишь данные из консоли:
+### Subcommands
+| Command | Description |
+| :--- | :--- |
+| `driftless standalone [flags]` | Run on Home PC without a VPS (STUN + DDNS + UPnP/NAT-PMP/PCP + TCP/UDP/TLS proxy) |
+| `driftless server [flags]` | Run Gateway on a public VPS (accepts one or multiple Home PC Agents) |
+| `driftless client [flags]` | Run Agent on a Home PC (connects to VPS Gateway with `-id` node name) |
+| `driftless check [flags]` | Diagnose public IP via STUN, detect CGNAT, test UPnP/NAT-PMP/PCP, and verify port reachability |
+| `driftless stop` | Gracefully stop running background/foreground instances and clean up router UPnP rules |
 
-#### 1. Вход через WebSSH / Termius (управление ПК и запуск скриптов с iPhone / Android)
-В `driftless` уже встроен собственный **SSH-сервер**, когда ты указываешь `-user` и `-pass` (или открываешь порт `22`). Тебе **не нужно** устанавливать OpenSSH в Windows или возиться с приватными ключами:
-- Открываешь **WebSSH** (или Termius / JuiceSSH) на телефоне и нажимаешь **Add Connection**:
-  - **Host / IP:** `mypc.duckdns.org` (или IP из консоли)
-  - **Port:** `22` *(или любой другой открытый порт, например `8096` - `driftless` сама распознает SSH на любом порту)*
-  - **User (Логин):** `admin` (то, что ты указал во флаге `-user`)
-  - **Password (Пароль):** `mypass123` (то, что ты указал во флаге `-pass`)
-  - **Private Key (Приватный ключ):** оставляешь пустым (не нужен).
-- Нажимаешь **Connect** - и сразу попадаешь в командную строку своего ПК (PowerShell / CMD на Windows или Bash на Linux), где можешь запускать любые скрипты, ботов и серверы.
-
-#### 2. Вход через AnyDesk с Android / iPhone (напрямую без лагов)
-1. В AnyDesk на ПК открой **Настройки -> Безопасность -> Разблокировать настройки безопасности**, включи **Неконтролируемый доступ (Unattended Access)** и задай постоянный пароль.
-2. Добавь порт `7070` в `-ports` (например: `-ports 7070,22 -duck`).
-3. Открой приложение **AnyDesk** на Android или iPhone и в строке адреса (вместо 9 цифр ID) введи:
-   ```text
-   mypc.duckdns.org:7070
-   ```
-4. Введи свой пароль от AnyDesk - подключение пойдет напрямую к твоему ПК.
-
-#### 3. Вход на рабочий стол Windows (Windows App / Microsoft Remote Desktop)
-1. Добавь порт `3389` в `-ports`.
-2. На телефоне открой **Windows App** (Microsoft Remote Desktop) -> нажми **+** -> **Add PC**.
-3. **Имя ПК (PC Name):** `mypc.duckdns.org:3389`
-4. **Учетная запись:** логин и пароль от твоей учетной записи Windows.
-
-#### 4. Свой сайт 24/7 на месяц (и закрытие сайта паролем при желании)
-- Запусти свой сайт (Node.js, Python, Nginx, Docker) например на порту `3000` и запусти `driftless` с `-ports 80:3000 -duck`.
-- Сайт работает круглосуточно по адресу `http://mypc.duckdns.org` и `https://mypc.duckdns.org:80` и сам обновляет IP при любых переподключениях провайдера.
-- Если хочешь закрыть сайт или веб-панель своим логином и паролем, добавь `-user admin -pass mypass123 -http-auth` - браузер при входе спросит этот логин и пароль.
+### Flags
+| Flag | Default | Mode | Description |
+| :--- | :--- | :--- | :--- |
+| `-id`, `-node` | `default` | `client` | Unique computer/node ID when connecting multiple PCs to one VPS (`pc1`, `pc2`, `pc3`) |
+| `-ports` | `8080:8080/tcp` | All | Comma-separated TCP/UDP mappings (`8096,25565/both,51820/udp,2222:22/tcp,25565:pc1:25565`) |
+| `-vhosts` | *(none)* | All | HTTP/HTTPS virtual hosts (`media.example.com:8096` or `media.example.com:pc1:8096`) |
+| `-duck` | *(none)* | `standalone`, `check` | DuckDNS shortcut: `-duck mypc:TOKEN` on first run, or bare `-duck` thereafter |
+| `-ddns-provider` | *(auto)* | `standalone` | DDNS provider (`duckdns`, `cloudflare`, `noip`, `webhook`) |
+| `-ddns-domain` | *(none)* | `standalone` | DDNS domain name (`mypc.duckdns.org`, `home.example.com`) |
+| `-ddns-token` | *(none)* | `standalone` | DDNS token (`TOKEN` for DuckDNS, `ZoneID:APIToken` for Cloudflare, `user:pass` for No-IP) |
+| `-ddns-url` | *(none)* | `standalone` | Custom DDNS webhook URL with `{ip}` and `{domain}` placeholders |
+| `-upnp` | `true` | `standalone`, `check` | Automatically forward ports on home router via UPnP / NAT-PMP / PCP |
+| `-gateway` | `127.0.0.1:4443` | `client` | Gateway address(es), comma-separated for High-Availability failover |
+| `-addr` | `0.0.0.0:4443` | `server` | Tunnel listen address for incoming Agents |
+| `-token` | *(auto)* | `server`, `client` | Shared secret token for Agent <-> Gateway HMAC-SHA256 channel-bound authentication |
+| `-fingerprint` | *(TOFU)* | `client` | Optional Gateway TLS certificate SHA-256 fingerprint pin |
+| `-transport` | `auto` | `server`, `client` | Tunnel transport: `auto` (QUIC with TCP fallback), `quic`, or `tcp` |
+| `-http` | *(none)* | `server`, `standalone` | Public HTTP Virtual Host router bind address (e.g. `0.0.0.0:80`) |
+| `-tls` | *(none)* | `server`, `standalone` | Enable HTTPS/TLS termination (`-tls` in standalone, or `-tls 0.0.0.0:443` on server) |
+| `-acme-email` | *(none)* | `server`, `standalone` | Let's Encrypt ACME email for automatic trusted TLS certificates |
+| `-acme-dns-cmd` | *(none)* | `server`, `standalone` | External command for ACME DNS-01 challenges when port 80/443 is blocked |
+| `-stun` | `stun.cloudflare.com:3478` | `client`, `standalone` | STUN server(s) for RFC 5389 external IP monitoring |
+| `-stun-interval` | `1s` | `client`, `standalone` | Interval for checking external IP changes via UDP STUN |
+| `-allow-ports` | *(all)* | `client`, `standalone` | Optional whitelist of local ports allowed to be forwarded |
+| `-proxy-proto` | `false` | `server`, `client` | Prepend HAProxy PROXY protocol v1 headers to preserve real visitor IP |
+| `-health` | *(none)* | All | Local JSON telemetry & `/healthz` endpoint (e.g. `127.0.0.1:9090`) |
+| `-d` | `false` | All | Run detached in the background (stop anytime with `./driftless stop`) |
 
 ---
 
-### Способ 2. Через ВПС (работает везде, даже если дома серый IP / CGNAT)
+# Русская документация (RU)
 
-**Шаг 1. Запусти на ВПС:**
+## 1. Что такое Driftless и какую задачу он решает
+
+У большинства домашних провайдеров публичный IP-адрес является **динамическим** и меняется при переподключении PPPoE, перезагрузке роутера или обновлении аренды DHCP. Кроме того, многие провайдеры выдают «серый» IP за **CGNAT** (`100.64.0.0/10`), куда входящие подключения из интернета напрямую не доходят.
+
+**Driftless** даёт пользователю с динамическим IP удобство статического IP:
+- **Публикация существующих локальных TCP и UDP сервисов** (сайты, Jellyfin/Plex, SSH, RDP, WireGuard, игровые серверы Minecraft/Valheim/CS2, API) под постоянными доменными именами и портами.
+- **Никакого вмешательства в прикладную авторизацию:** Driftless работает строго на сетевом/транспортном уровне. Он не добавляет собственные логины/пароли, встроенные SSH-серверы или веб-порталы. Ваши сервисы используют свою штатную аутентификацию (ключи и учётные записи OpenSSH, учётную запись Windows для RDP, логин/пароль вашего сайта или медиасервера).
+- **Два режима работы в одном бинарном файле:**
+  1. **Standalone без VPS (`driftless standalone`):** Запускается прямо на домашнем ПК или сервере. Автоматически открывает порты на роутере по **UPnP IGDv1/v2**, **NAT-PMP (RFC 6886)** и **PCP v2 (RFC 6887)**, каждую секунду отслеживает внешний IP через **UDP STUN (RFC 5389)**, мгновенно обновляет **DuckDNS / No-IP / Cloudflare** при смене IP и проверяет внешнюю доступность портов.
+  2. **Gateway + Multi-Agent через один VPS (`driftless server` + `driftless client`):** На публичном VPS запускается единый шлюз (`Gateway`), к которому одновременно подключаются **несколько домашних компьютеров (`pc1`, `pc2`, `pc3`)**. Работает даже за жёстким **CGNAT** и сохраняет активные TCP-соединения и UDP-сессии при смене домашнего IP без обрыва связи.
+
+---
+
+## 2. Режим Standalone (без VPS)
+
+Подходит, если ваш провайдер выдаёт роутеру «белый» (пусть и динамический) публичный IPv4-адрес.
+
+### Первый запуск с DuckDNS (сохраняет домен и токен)
+1. Зайдите на [duckdns.org](https://www.duckdns.org), создайте поддомен (например, `mypc`) и скопируйте токен.
+2. Запустите Driftless на своём ПК:
+
+**Windows (PowerShell):**
+```powershell
+.\driftless-windows-amd64.exe standalone -ports 8096,25565/both,22 -duck mypc:ТВОЙ_ТОКЕН_DUCKDNS
+```
+
+**Linux / macOS:**
 ```bash
-wget -O driftless https://github.com/ERETLY/driftless/releases/latest/download/driftless-linux-amd64
-chmod +x driftless
-./driftless server -ports 80:3000,8096,22,7070
+./driftless standalone -ports 8096,25565/both,22 -duck mypc:ТВОЙ_ТОКЕН_DUCKDNS
 ```
-Сервер сам сгенерирует пароль и выведет на экран готовую строчку для запуска на домашнем ПК (посмотреть ее снова можно командой `./driftless show-token`).
 
-**Шаг 2. Скопируй эту команду и запусти на домашнем ПК:**
+### Повторные запуски (достаточно просто `-duck`)
+После первого запуска домен и токен надёжно сохраняются в `.driftless-ddns.json`. В следующий раз достаточно указать просто `-duck`:
+
 ```powershell
-.\driftless-windows-amd64.exe client -quic IP_ВПС:4242 -token ПАРОЛЬ -fingerprint ОТПЕЧАТОК -user admin -pass mypass123
+.\driftless-windows-amd64.exe standalone -ports 8096,25565/both,22 -duck
 ```
-Готово. Твой сайт, терминал WebSSH и AnyDesk доступны по адресу `IP_ВПС`.
 
 ---
 
-### По желанию: Секретная защита портов от ботов (`-knock`)
-Если не хочешь, чтобы порты `22` (SSH), `7070` (AnyDesk) или `3389` (RDP) были видны сканерам в интернете, добавь флаг `-knock`:
-```powershell
-.\driftless-windows-amd64.exe standalone -ports 8096,3389,22 -user admin -pass mypass123 -duck -knock
+## 3. Несколько домашних компьютеров через один VPS (Multi-Agent Gateway)
+
+Если у вас **CGNAT** (`100.64.0.0/10`) или вы хотите опубликовать сервисы сразу с **нескольких домашних компьютеров (`pc1`, `pc2`, `pc3`) через один VPS**, запустите `driftless server` на VPS, а на каждом компьютере запустите `driftless client` со своим `-id`:
+
+### Шаг 1: Запуск Gateway на VPS
+Направьте DNS `A`-записи ваших доменов (`media.example.com`, `site.example.com`, `game.example.com`) на IP-адрес VPS и запустите сервер:
+
+```bash
+./driftless server \
+  -addr 0.0.0.0:4443 \
+  -http 0.0.0.0:80 \
+  -tls 0.0.0.0:443 \
+  -acme-email admin@example.com
 ```
-- Все порты полностью закрыты для чужих IP.
-- В консоли появится секретная `https://` ссылка (посмотреть снова: `./driftless show-token`).
-- Открываешь эту ссылку один раз в браузере на телефоне - твой мобильный IP разблокируется на **1 час** (`-knock-ttl 1h`), и ты спокойно заходишь через WebSSH, AnyDesk или RDP.
-- Можно открыть только один порт (`?port=22`), скачать готовый `.rdp` ярлык (`/connect.rdp`) или мгновенно закрыть доступ обратно (`/revoke` или `/revoke?all=1`).
+При первом запуске Gateway создаст и выведет в консоль секретный **Token** (сохраняется в `.driftless-certs/token.secret`).
+
+### Шаг 2: Подключение компьютеров `pc1`, `pc2`, `pc3`
+
+**Компьютер 1 (`pc1` - медиасервер `media.example.com` и SSH на порту `2221`):**
+```bash
+./driftless client \
+  -id pc1 \
+  -gateway vps.example.com:4443 \
+  -token ВАШ_ТОКЕН_GATEWAY \
+  -vhosts media.example.com:8096 \
+  -ports 2221:22/tcp
+```
+
+**Компьютер 2 (`pc2` - веб-сайт `site.example.com` и SSH на порту `2222`):**
+```bash
+./driftless client \
+  -id pc2 \
+  -gateway vps.example.com:4443 \
+  -token ВАШ_ТОКЕН_GATEWAY \
+  -vhosts site.example.com:3000 \
+  -ports 2222:22/tcp
+```
+
+**Компьютер 3 (`pc3` - статус-страница `game.example.com` и UDP/TCP игровой сервер `25565`):**
+```bash
+./driftless client \
+  -id pc3 \
+  -gateway vps.example.com:4443 \
+  -token ВАШ_ТОКЕН_GATEWAY \
+  -vhosts game.example.com:8080 \
+  -ports 25565:25565/both
+```
+
+**Полная изоляция агентов:**
+- Отключение или смена IP у `pc1` никак не влияет на работу `pc2` и `pc3`.
+- При переподключении `pc1` все его маршруты и активные TCP/UDP-сессии автоматически восстанавливаются.
 
 ---
 
-### Работа 24/7 («Врубил и забыл на месяц»)
+## 4. Диагностика внешней доступности и CGNAT (`./driftless check`)
 
-- **Не рвет соединения при смене IP провайдером:** Активные TCP-потоки (загрузки, стримы, SSH, RDP) ждут переподключения в кольцевом буфере 16 МБ и продолжаются с точного байта. Свежие UDP-пакеты буферизуются в окне до 2 секунд (старые пакеты автоматически отбрасываются).
-- **Никаких утечек памяти и сокетов за 30+ дней:** Зависшие или брошенные сканерами соединения автоматически очищаются по таймауту неактивности, поэтому потребление памяти и файловых дескрипторов остается стабильным месяцами.
-- **Все сохраняется при остановке и перезапуске:** Если ты остановил программу или перезагрузил ПК, при следующем запуске с `-duck` автоматически подхватываются сохраненный домен/токен DuckDNS (`.driftless-ddns.json`), TLS-сертификаты, ключ SSH-сервера и логин/пароль (`.driftless-certs/`).
-- **Не падает при перезапуске твоих серверов:** Ты можешь сколько угодно перезапускать свой сайт (`:3000`), игровой сервер (`:25565`) или UDP-сервер на ПК - `driftless` продолжает работать без перезапуска.
-- **Переживает перезагрузку домашнего роутера:** Если роутер перезагрузился и сбросил таблицу портов UPnP/PCP (или включился позже компьютера), `driftless` сам определит это и заново откроет все порты в течение 60 секунд.
-- **Авто-распознавание SSH и RDP на любом порту:** Можно подключиться клиентом WebSSH или RDP к любому открытому TCP-порту (например `8096` или `80`) - программа по первым байтам сама перенаправит SSH на встроенный терминал (`:22`), а RDP на `:3389`.
+Чтобы в любой момент проверить свой внешний IP, наличие CGNAT, работу UPnP/NAT-PMP/PCP на роутере и реальную доступность портов снаружи, выполните:
+
+```bash
+./driftless check -ports 8096,25565/both,22 -duck
+```
+
+### Когда режим Standalone НЕ сработает без VPS
+1. **Провайдер использует CGNAT (`100.64.0.0/10`) или двойной NAT:** роутер получает не публичный IP, а внутренний адрес провайдера. В этом случае входящие подключения возможны только через VPS (`driftless server` + `driftless client`).
+2. **На роутере отключён UPnP / NAT-PMP / PCP**, и порты не проброшены вручную в настройках роутера.
+3. **Провайдер блокирует входящие порты** (например, `80`, `443`, `22`).
+4. **Брандмауэр ОС (Windows Firewall / `ufw`)** блокирует входящие подключения к локальному сервису или `driftless`.
 
 ---
 
-### Полный справочник флагов
+## 5. Управление и сборка
 
-| Флаг | По умолчанию | Описание |
-| :--- | :--- | :--- |
-| `-ports` | `"8080:80,8096:8096"` | Порты: `8096,25565`, `80:3000` или локально `127.0.0.1:8080:3000`. Поддерживает `/tcp`, `/udp`, `/https`. |
-| `-duck` | `""` | Авто-домен и сертификат: один раз укажи `-duck домен:токен` (сохранится сам), дальше пиши просто `-duck`. |
-| `-user` / `-pass` | `""` | Логин и пароль для встроенного SSH-сервера (WebSSH/Termius) и `-http-auth` (сохраняются автоматически). |
-| `-auth` | `""` | Короткая запись `"логин:пароль"` вместо `-user` и `-pass`. |
-| `-http-auth` | `false` | Защитить открытые HTTP/VHost веб-порты паролем (`-user` и `-pass`). |
-| `-udp` | `true` | Открывать UDP вместе с TCP на всех портах (`-udp=false` оставит только TCP). |
-| `-quic` | `"0.0.0.0:4242"` | Адрес туннеля на ВПС или список ВПС через запятую на ПК (`vps1:4242,vps2:4242`). |
-| `-transport` | `"auto"` | Транспорт туннеля: `"auto"` (QUIC с авто-переходом на TCP-Mux), `"quic"` или `"tcp"`. |
-| `-token` | создается сам | Общий пароль (или список через запятую для ротации без разрыва `"новый,старый"`). |
-| `-fingerprint` | `""` | SHA-256 отпечаток сертификата ВПС (сам подставляется в готовую команду). |
-| `-knock` | `false` | Включить HTTPS защиту портов по секретной ссылке (TTL 1 час, `?port=22`, отзыв `/revoke`). |
-| `-knock-token` | создается сам | Свой секрет для ссылки `-knock` (если не указать, сохраняется в `.driftless-certs/knock.secret`). |
-| `-knock-ttl` | `1h` | На сколько времени открывать доступ для IP после перехода по ссылке `-knock` (по умолчанию `1h`). |
-| `-tls` | `false` | Включить HTTPS/TLS сразу на всех открытых TCP-портах. |
-| `-vhosts` | `""` | Маршрутизация доменов и путей по портам: `"site.ru:3000,site.ru/api:4000,*.site.ru:5000"`. |
-| `-vhost-addr` / `-https` | `":80"` / `""` | Порты HTTP и HTTPS для доменного режима `-vhosts`. |
-| `-tls-cert` / `-tls-key` | `""` | Путь к своим файлам сертификата и ключа `.pem`. |
-| `-direct` | `":8888"` | Прямое подключение дома по Wi-Fi/LAN в обход ВПС (`""` - выключить). |
-| `-host` | `"127.0.0.1"` | Локальный IP-адрес назначения на домашнем ПК. |
-| `-allow-ports` | `""` | Белый список разрешенных локальных портов на ПК (например, `"80,3000,8096,25565"`). |
-| `-allow-ips` | `""` | Разрешить входящие подключения только с указанных IP или подсетей CIDR (`"192.168.1.0/24,203.0.113.5"`). |
-| `-client-ca` / `-client-cert` / `-client-key` | `""` | Опциональная проверка клиентских сертификатов mTLS между ВПС и домашним ПК. |
-| `-proxy-protocol` | `false` | Передавать реальный IP клиента локальному серверу через заголовок HAProxy PROXY protocol v1. |
-| `-metrics` | `""` | Адрес сервера метрик `/metrics` (Prometheus) и `/status` (JSON), например `"127.0.0.1:9090"`. |
-| `-upnp` | `true` | Авто-открытие портов на домашнем роутере через UPnP / NAT-PMP / PCP v2 (`standalone`). |
-| `-stun` | `"stun.cloudflare.com:3478"` | STUN-сервер (или список через запятую) для проверки внешнего IP (`standalone`). |
-| `-stun-interval` | `1s` | Частота проверки внешнего IP по STUN (`standalone`). |
-| `-ddns-provider` | `""` | Другие DDNS-провайдеры: `"duckdns"`, `"cloudflare"` или `"noip"`. |
-| `-ddns-domain` / `-ddns-token` | `""` | Домен и токен при использовании `-ddns-provider`. |
-| `-ddns-user` / `-ddns-zone` / `-ddns-url` | `""` | Логин (No-IP), Zone ID (Cloudflare) или свой вебхук (`{ip}`). |
-| `-max-buf` / `-max-mem` | `16 МБ` / `256 МБ` | Лимит буфера памяти на одно соединение и общий лимит на всю программу. |
-| `-session-ttl` | `90s` | Сколько секунд удерживать активные соединения при переподключении интернета дома. |
+```bash
+# Фоновый запуск (в режиме демона)
+./driftless standalone -ports 8096,25565/both -duck -d
 
-## License
+# Остановка фонового процесса и очистка правил UPnP на роутере
+./driftless stop
 
-[MIT](LICENSE)
+# Запуск всех тестов с детектором гонок (Go Race Detector)
+go test -race -v ./...
+```

@@ -1,171 +1,329 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/crypto/ssh"
 )
 
-func TestProductionBuiltInSSHAndUserPassAuth(t *testing.T) {
-	tmpDir := t.TempDir()
-	up, err := initUserPassAuth(tmpDir, "alex", "superSecretPass99", "", true, true)
-	if err != nil || up == nil {
-		t.Fatalf("initUserPassAuth failed: %v", err)
-	}
-	prevUP := defaultUserPassAuth
-	defaultUserPassAuth = up
+func TestMultiAgentSingleGatewayTCPUDPVHostsAndIsolation(t *testing.T) {
+	prevTransport := defaultTransportMode
+	defaultTransportMode = "tcp"
 	defer func() {
-		defaultUserPassAuth = prevUP
+		defaultTransportMode = prevTransport
 	}()
-
-	// Local HTTP backend on ephemeral port to test -http-auth and Single-Port SSH auto-routing on the same port
-	webBackendLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer webBackendLn.Close()
-	webBackendPort := uint16(webBackendLn.Addr().(*net.TCPAddr).Port)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("WEB-24X7-OK"))
-	})
-	webSrv := &http.Server{Handler: mux}
-	go func() { _ = webSrv.Serve(webBackendLn) }()
-	defer webSrv.Close()
-
-	pubWebPort := uint16(getFreePort(t, "tcp"))
-	pubSSHPort := uint16(getFreePort(t, "tcp"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	mappings := []PortMapping{
-		{BindIP: "127.0.0.1", PublicPort: pubWebPort, TargetPort: webBackendPort, Proto: "tcp"},
-		{BindIP: "127.0.0.1", PublicPort: pubSSHPort, TargetPort: 22, Proto: "tcp"},
-	}
-	for i := range mappings {
-		if err := startStandaloneTCP(ctx, "127.0.0.1", &mappings[i], mappings, nil, false); err != nil {
-			t.Fatalf("startStandaloneTCP failed: %v", err)
+	// 1. Start local services on 3 simulated Home PCs (pc1, pc2, pc3)
+	// pc1: HTTP media server ("media.example.com") + dedicated TCP service
+	pc1HTTPPort := uint16(getFreePort(t, "tcp"))
+	pc1TCPPort := uint16(getFreePort(t, "tcp"))
+	pc1PubTCPPort := uint16(getFreePort(t, "tcp"))
+
+	// pc2: HTTP website ("site.example.com") + dedicated TCP service
+	pc2HTTPPort := uint16(getFreePort(t, "tcp"))
+	pc2TCPPort := uint16(getFreePort(t, "tcp"))
+	pc2PubTCPPort := uint16(getFreePort(t, "tcp"))
+
+	// pc3: HTTP game status ("game.example.com") + UDP game server
+	pc3HTTPPort := uint16(getFreePort(t, "tcp"))
+	pc3UDPPort := uint16(getFreePort(t, "udp"))
+	pc3PubUDPPort := uint16(getFreePort(t, "udp"))
+
+	startHTTPBackend := func(port uint16, nodeTag string) *http.Server {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			t.Fatal(err)
 		}
+		srv := &http.Server{
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = fmt.Fprintf(w, "NODE=%s HOST=%s PATH=%s", nodeTag, r.Host, r.URL.Path)
+			}),
+		}
+		go func() { _ = srv.Serve(ln) }()
+		return srv
 	}
 
-	// 1. Verify wrong SSH password is rejected
-	badSSHConfig := &ssh.ClientConfig{
-		User:            "alex",
-		Auth:            []ssh.AuthMethod{ssh.Password("wrong-password")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         3 * time.Second,
-	}
-	if badClient, err := ssh.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", pubSSHPort), badSSHConfig); err == nil {
-		_ = badClient.Close()
-		t.Fatalf("expected SSH login with wrong password to fail")
-	}
-
-	// 2. Verify valid SSH login (-user alex -pass superSecretPass99) on dedicated SSH port & command execution
-	goodSSHConfig := &ssh.ClientConfig{
-		User:            "alex",
-		Auth:            []ssh.AuthMethod{ssh.Password("superSecretPass99")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         5 * time.Second,
-	}
-	sshClient, err := ssh.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", pubSSHPort), goodSSHConfig)
-	if err != nil {
-		t.Fatalf("expected built-in SSHv2 login on port %d to succeed, got: %v", pubSSHPort, err)
-	}
-	defer sshClient.Close()
-
-	sess1, err := sshClient.NewSession()
-	if err != nil {
-		t.Fatalf("failed to open SSH session: %v", err)
-	}
-	out1, err := sess1.CombinedOutput("echo DRIFTLESS_SSH_EXEC_OK")
-	_ = sess1.Close()
-	if err != nil || !strings.Contains(string(out1), "DRIFTLESS_SSH_EXEC_OK") {
-		t.Fatalf("expected SSH exec output 'DRIFTLESS_SSH_EXEC_OK', got %q (err=%v)", string(out1), err)
+	startTCPBackend := func(port uint16, nodeTag string) net.Listener {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					buf, _ := io.ReadAll(conn)
+					_, _ = fmt.Fprintf(conn, "%s:%s", nodeTag, string(buf))
+				}(c)
+			}
+		}()
+		return ln
 	}
 
-	// 3. Verify interactive SSH shell session (used by WebSSH / Termius on Android & iPhone)
-	sessShell, err := sshClient.NewSession()
-	if err != nil {
-		t.Fatalf("failed to open interactive SSH shell session: %v", err)
-	}
-	stdinPipe, err := sessShell.StdinPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var shellOut bytes.Buffer
-	sessShell.Stdout = &shellOut
-	sessShell.Stderr = &shellOut
-	if err := sessShell.RequestPty("xterm", 24, 80, ssh.TerminalModes{}); err != nil {
-		t.Fatalf("RequestPty failed: %v", err)
-	}
-	if err := sessShell.Shell(); err != nil {
-		t.Fatalf("Shell() start failed: %v", err)
-	}
-	_, _ = io.WriteString(stdinPipe, "echo WEBSSH_INTERACTIVE_OK\nexit\n")
-	_ = sessShell.Wait()
-	_ = sessShell.Close()
-	if !strings.Contains(shellOut.String(), "WEBSSH_INTERACTIVE_OK") {
-		t.Fatalf("expected interactive shell output to contain WEBSSH_INTERACTIVE_OK, got:\n%s", shellOut.String())
+	startUDPBackend := func(port uint16, nodeTag string) *net.UDPConn {
+		uaddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		uc, err := net.ListenUDP("udp", uaddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			var buf [2048]byte
+			for {
+				n, raddr, err := uc.ReadFromUDP(buf[:])
+				if err != nil {
+					return
+				}
+				reply := fmt.Sprintf("%s:%s", nodeTag, string(buf[:n]))
+				_, _ = uc.WriteToUDP([]byte(reply), raddr)
+			}
+		}()
+		return uc
 	}
 
-	// 4. Verify Single-Port Universal SSH Auto-Routing: connect SSH client to the WEB port (pubWebPort)!
-	sshOnWebClient, err := ssh.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", pubWebPort), goodSSHConfig)
-	if err != nil {
-		t.Fatalf("expected Single-Port SSH auto-routing on web port %d to succeed, got: %v", pubWebPort, err)
-	}
-	defer sshOnWebClient.Close()
-	sess2, err := sshOnWebClient.NewSession()
-	if err != nil {
-		t.Fatal(err)
-	}
-	out2, err := sess2.CombinedOutput("echo SINGLE_PORT_SSH_OK")
-	_ = sess2.Close()
-	if err != nil || !strings.Contains(string(out2), "SINGLE_PORT_SSH_OK") {
-		t.Fatalf("expected Single-Port SSH output 'SINGLE_PORT_SSH_OK', got %q (err=%v)", string(out2), err)
+	srv1 := startHTTPBackend(pc1HTTPPort, "pc1")
+	defer srv1.Close()
+	srv2 := startHTTPBackend(pc2HTTPPort, "pc2")
+	defer srv2.Close()
+	srv3 := startHTTPBackend(pc3HTTPPort, "pc3")
+	defer srv3.Close()
+
+	tcpLn1 := startTCPBackend(pc1TCPPort, "pc1")
+	defer tcpLn1.Close()
+	tcpLn2 := startTCPBackend(pc2TCPPort, "pc2")
+	defer tcpLn2.Close()
+	udpConn3 := startUDPBackend(pc3UDPPort, "pc3")
+	defer udpConn3.Close()
+
+	// 2. Start a single VPS Gateway with shared HTTP vhost listener
+	gwTunnelPort := getFreePort(t, "tcp")
+	gwHTTPPort := getFreePort(t, "tcp")
+	gwAddr := fmt.Sprintf("127.0.0.1:%d", gwTunnelPort)
+	httpBindAddr := fmt.Sprintf("127.0.0.1:%d", gwHTTPPort)
+
+	go func() {
+		_ = runGateway(
+			ctx,
+			gwAddr,
+			"multi-node-secret-token",
+			"",
+			httpBindAddr,
+			"",
+			nil,
+			nil,
+			64*1024*1024,
+			8*1024*1024,
+			2*time.Second,
+			250*time.Millisecond,
+			30*time.Second,
+			t.TempDir(),
+			"",
+			"",
+			false,
+			false,
+		)
+	}()
+	time.Sleep(150 * time.Millisecond)
+
+	// 3. Connect 3 concurrent Agents (pc1, pc2, pc3) to the same Gateway, each registering its own vhosts and TCP/UDP ports
+	pc1Ctx, pc1Cancel := context.WithCancel(ctx)
+	defer pc1Cancel()
+	pc2Ctx, pc2Cancel := context.WithCancel(ctx)
+	defer pc2Cancel()
+	pc3Ctx, pc3Cancel := context.WithCancel(ctx)
+	defer pc3Cancel()
+
+	startPC1Agent := func(agentCtx context.Context) {
+		go func() {
+			_ = runAgentWithServices(
+				agentCtx,
+				"pc1",
+				gwAddr,
+				"127.0.0.1",
+				"multi-node-secret-token",
+				"192.168.1.101",
+				"",
+				[]PortMapping{{PublicPort: pc1PubTCPPort, TargetPort: pc1TCPPort, Proto: "tcp"}},
+				[]VHostRoute{{Domain: "media.example.com", NodeID: "pc1", TargetPort: pc1HTTPPort}},
+				8*1024*1024,
+				64*1024*1024,
+				2*time.Second,
+				250*time.Millisecond,
+				30*time.Second,
+				nil,
+			)
+		}()
 	}
 
-	// 5. Verify HTTP Basic Auth (-http-auth) on the exact same web port (pubWebPort)
-	httpClient := &http.Client{Timeout: 3 * time.Second}
-	webURL := fmt.Sprintf("http://127.0.0.1:%d/hello", pubWebPort)
+	startPC1Agent(pc1Ctx)
+	go func() {
+		_ = runAgentWithServices(
+			pc2Ctx,
+			"pc2",
+			gwAddr,
+			"127.0.0.1",
+			"multi-node-secret-token",
+			"192.168.1.102",
+			"",
+			[]PortMapping{{PublicPort: pc2PubTCPPort, TargetPort: pc2TCPPort, Proto: "tcp"}},
+			[]VHostRoute{{Domain: "site.example.com", NodeID: "pc2", TargetPort: pc2HTTPPort}},
+			8*1024*1024,
+			64*1024*1024,
+			2*time.Second,
+			250*time.Millisecond,
+			30*time.Second,
+			nil,
+		)
+	}()
+	go func() {
+		_ = runAgentWithServices(
+			pc3Ctx,
+			"pc3",
+			gwAddr,
+			"127.0.0.1",
+			"multi-node-secret-token",
+			"192.168.1.103",
+			"",
+			[]PortMapping{{PublicPort: pc3PubUDPPort, TargetPort: pc3UDPPort, Proto: "udp"}},
+			[]VHostRoute{{Domain: "game.example.com", NodeID: "pc3", TargetPort: pc3HTTPPort}},
+			8*1024*1024,
+			64*1024*1024,
+			2*time.Second,
+			250*time.Millisecond,
+			30*time.Second,
+			nil,
+		)
+	}()
+	time.Sleep(350 * time.Millisecond)
 
-	// Unauthenticated HTTP request must receive 401 Unauthorized
-	respUnauth, err := httpClient.Get(webURL)
-	if err != nil {
-		t.Fatalf("unauthenticated HTTP GET failed: %v", err)
-	}
-	_ = respUnauth.Body.Close()
-	if respUnauth.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401 Unauthorized when -http-auth is enabled, got %d", respUnauth.StatusCode)
+	// Helper to query HTTP vhost through the shared Gateway HTTP port
+	checkVHost := func(hostHeader, path, wantSubstr string) error {
+		client := &http.Client{Timeout: 3 * time.Second}
+		req, err := http.NewRequest("GET", fmt.Sprintf("http://%s%s", httpBindAddr, path), nil)
+		if err != nil {
+			return err
+		}
+		req.Host = hostHeader
+		req.Close = true
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), wantSubstr) {
+			return fmt.Errorf("status=%d body=%q (want %q)", resp.StatusCode, string(body), wantSubstr)
+		}
+		return nil
 	}
 
-	// Authenticated HTTP request with -user alex -pass superSecretPass99 must receive 200 OK
-	reqAuth, _ := http.NewRequest("GET", webURL, nil)
-	reqAuth.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("alex:superSecretPass99")))
-	respAuth, err := httpClient.Do(reqAuth)
-	if err != nil {
-		t.Fatalf("authenticated HTTP GET failed: %v", err)
+	// Helper to test dedicated TCP port forwarding
+	checkTCPPort := func(pubPort uint16, payload, wantReply string) error {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", pubPort), 3*time.Second)
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		if _, err := c.Write([]byte(payload)); err != nil {
+			return err
+		}
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		got, err := io.ReadAll(c)
+		if err != nil || string(got) != wantReply {
+			return fmt.Errorf("err=%v got=%q want=%q", err, string(got), wantReply)
+		}
+		return nil
 	}
-	bodyAuth, _ := io.ReadAll(respAuth.Body)
-	_ = respAuth.Body.Close()
-	if respAuth.StatusCode != http.StatusOK || string(bodyAuth) != "WEB-24X7-OK" {
-		t.Fatalf("expected 200 OK with WEB-24X7-OK, got status=%d body=%q", respAuth.StatusCode, string(bodyAuth))
+
+	// Helper to test dedicated UDP port forwarding
+	checkUDPPort := func(pubPort uint16, payload, wantReply string) error {
+		uc, err := net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", pubPort))
+		if err != nil {
+			return err
+		}
+		defer uc.Close()
+		for attempt := 0; attempt < 10; attempt++ {
+			_, _ = uc.Write([]byte(payload))
+			_ = uc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			var buf [256]byte
+			n, rErr := uc.Read(buf[:])
+			if rErr == nil && string(buf[:n]) == wantReply {
+				return nil
+			}
+		}
+		return fmt.Errorf("failed to receive UDP reply %q on port %d", wantReply, pubPort)
+	}
+
+	// 4. Verify all 3 Agents work simultaneously through the single Gateway
+	if err := checkVHost("media.example.com", "/stream", "NODE=pc1 HOST=media.example.com PATH=/stream"); err != nil {
+		t.Fatalf("pc1 vhost failed: %v", err)
+	}
+	if err := checkVHost("site.example.com", "/index", "NODE=pc2 HOST=site.example.com PATH=/index"); err != nil {
+		t.Fatalf("pc2 vhost failed: %v", err)
+	}
+	if err := checkVHost("game.example.com", "/status", "NODE=pc3 HOST=game.example.com PATH=/status"); err != nil {
+		t.Fatalf("pc3 vhost failed: %v", err)
+	}
+	if err := checkTCPPort(pc1PubTCPPort, "hello-pc1", "pc1:hello-pc1"); err != nil {
+		t.Fatalf("pc1 TCP port failed: %v", err)
+	}
+	if err := checkTCPPort(pc2PubTCPPort, "hello-pc2", "pc2:hello-pc2"); err != nil {
+		t.Fatalf("pc2 TCP port failed: %v", err)
+	}
+	if err := checkUDPPort(pc3PubUDPPort, "udp-pkt-3", "pc3:udp-pkt-3"); err != nil {
+		t.Fatalf("pc3 UDP port failed: %v", err)
+	}
+
+	// 5. Disconnect pc1 -> verify pc2 and pc3 continue working without any interruption
+	pc1Cancel()
+	time.Sleep(250 * time.Millisecond)
+
+	if err := checkVHost("site.example.com", "/still-alive", "NODE=pc2 HOST=site.example.com PATH=/still-alive"); err != nil {
+		t.Fatalf("pc2 vhost failed after pc1 disconnected: %v", err)
+	}
+	if err := checkTCPPort(pc2PubTCPPort, "after-pc1-drop", "pc2:after-pc1-drop"); err != nil {
+		t.Fatalf("pc2 TCP port failed after pc1 disconnected: %v", err)
+	}
+	if err := checkVHost("game.example.com", "/still-alive", "NODE=pc3 HOST=game.example.com PATH=/still-alive"); err != nil {
+		t.Fatalf("pc3 vhost failed after pc1 disconnected: %v", err)
+	}
+	if err := checkUDPPort(pc3PubUDPPort, "udp-after-pc1-drop", "pc3:udp-after-pc1-drop"); err != nil {
+		t.Fatalf("pc3 UDP port failed after pc1 disconnected: %v", err)
+	}
+
+	// 6. Reconnect pc1 -> verify pc1 automatically resumes serving vhost and TCP port
+	pc1Ctx2, pc1Cancel2 := context.WithCancel(ctx)
+	defer pc1Cancel2()
+	startPC1Agent(pc1Ctx2)
+	time.Sleep(350 * time.Millisecond)
+
+	if err := checkVHost("media.example.com", "/recovered", "NODE=pc1 HOST=media.example.com PATH=/recovered"); err != nil {
+		t.Fatalf("pc1 vhost failed after reconnect: %v", err)
+	}
+	if err := checkTCPPort(pc1PubTCPPort, "reconnected-pc1", "pc1:reconnected-pc1"); err != nil {
+		t.Fatalf("pc1 TCP port failed after reconnect: %v", err)
 	}
 }
 
@@ -335,11 +493,11 @@ func TestProduction24x7WebsiteUnderLoadAndIPRotation(t *testing.T) {
 	select {
 	case <-doneIdle:
 	case <-time.After(1 * time.Second):
-		t.Fatalf("expected copyWithIdleTimeout to terminate idle half-open connection within 60ms")
+		t.Fatalf("expected copyWithIdleTimeout to terminate idle half-open connections within 60ms")
 	}
 }
 
-func TestProductionStopRestartPersistence(t *testing.T) {
+func TestProductionStopRestartPersistenceAndReachabilityCheck(t *testing.T) {
 	origDir, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -362,33 +520,40 @@ func TestProductionStopRestartPersistence(t *testing.T) {
 		t.Fatalf("expected bare '-duck' on restart to reload saved DuckDNS domain & token, got: %+v", cfg2)
 	}
 
-	// 3. First run of SSH Auth: auto-creates credentials and Ed25519 host key
-	certDir := filepath.Join(tmpDir, ".driftless-certs")
-	up1, err := initUserPassAuth(certDir, "", "", "", false, true)
-	if err != nil || up1 == nil {
-		t.Fatalf("expected initUserPassAuth on port 22 to auto-create credentials, got err=%v", err)
+	// 3. Gateway token persistence across stop/restart
+	tok1, err := loadOrGenerateToken(true, "", "")
+	if err != nil || len(tok1) < 32 {
+		t.Fatalf("expected loadOrGenerateToken to generate and persist token, got err=%v", err)
 	}
-	signer1, err := loadOrCreateSSHHostSigner(certDir)
+	tok2, err := loadOrGenerateToken(true, "", "")
+	if err != nil || tok1 != tok2 {
+		t.Fatalf("expected loadOrGenerateToken on restart to reload identical token (%q != %q, err=%v)", tok1, tok2, err)
+	}
+
+	// 4. External reachability & CGNAT detection (checkExternalReachability)
+	if !isCGNATOrPrivateIP("100.64.12.34") || !isCGNATOrPrivateIP("10.0.0.1") || isCGNATOrPrivateIP("198.51.100.42") {
+		t.Fatalf("unexpected CGNAT/private IP classification")
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	fp1 := ssh.FingerprintSHA256(signer1.PublicKey())
+	defer ln.Close()
+	openPort := uint16(ln.Addr().(*net.TCPAddr).Port)
+	closedPort := uint16(getFreePort(t, "tcp"))
 
-	// 4. Second run after stop/restart: must reload the exact same username, password, and SSH host key
-	up2, err := initUserPassAuth(certDir, "", "", "", false, true)
-	if err != nil || up2 == nil {
-		t.Fatalf("expected initUserPassAuth on restart to reload saved credentials, got err=%v", err)
+	repOpen := checkExternalReachability("127.0.0.1", "127.0.0.1", DDNSConfig{}, []PortMapping{
+		{PublicPort: openPort, TargetPort: openPort, Proto: "tcp"},
+	}, 500*time.Millisecond)
+	if !strings.HasPrefix(repOpen.PortStatus[openPort], "reachable") {
+		t.Fatalf("expected open TCP port %d to be reported reachable, got %q", openPort, repOpen.PortStatus[openPort])
 	}
-	signer2, err := loadOrCreateSSHHostSigner(certDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fp2 := ssh.FingerprintSHA256(signer2.PublicKey())
 
-	if up1.User != up2.User || up1.Pass != up2.Pass {
-		t.Fatalf("expected SSH credentials to persist across restart (%s:%s != %s:%s)", up1.User, up1.Pass, up2.User, up2.Pass)
-	}
-	if fp1 != fp2 {
-		t.Fatalf("expected SSH Ed25519 host key fingerprint to persist across restart (%s != %s)", fp1, fp2)
+	repClosed := checkExternalReachability("127.0.0.1", "127.0.0.1", DDNSConfig{}, []PortMapping{
+		{PublicPort: closedPort, TargetPort: closedPort, Proto: "tcp"},
+	}, 300*time.Millisecond)
+	if strings.HasPrefix(repClosed.PortStatus[closedPort], "reachable") {
+		t.Fatalf("expected closed TCP port %d to be reported unreachable, got %q", closedPort, repClosed.PortStatus[closedPort])
 	}
 }

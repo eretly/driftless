@@ -541,21 +541,7 @@ func TestMidStreamNetworkOutageAndIPChangeSessionRecovery(t *testing.T) {
 	}
 }
 
-func TestTCPMuxFallbackTokenRotationAndIPACL(t *testing.T) {
-	// IP/CIDR ACL filtering
-	acl, err := parseIPACL("192.168.10.0/24, 203.0.113.99")
-	if err != nil {
-		t.Fatalf("parseIPACL failed: %v", err)
-	}
-	if !acl.AllowedAddr(&net.TCPAddr{IP: net.ParseIP("192.168.10.42"), Port: 5000}) {
-		t.Fatalf("expected 192.168.10.42 to be allowed by CIDR 192.168.10.0/24")
-	}
-	if !acl.AllowedAddr(&net.TCPAddr{IP: net.ParseIP("203.0.113.99"), Port: 5000}) {
-		t.Fatalf("expected 203.0.113.99 to be allowed by exact IP rule")
-	}
-	if acl.AllowedAddr(&net.TCPAddr{IP: net.ParseIP("198.51.100.7"), Port: 5000}) {
-		t.Fatalf("expected 198.51.100.7 to be rejected by IPACL")
-	}
+func TestTCPMuxFallbackAndTokenRotation(t *testing.T) {
 
 	// IPv6 /64 prefix normalization for auth brute-force protection
 	k1 := normalizeAuthIPKey("2001:db8:abcd:1234::1")

@@ -41,6 +41,16 @@ func (p *peekedConn) Read(b []byte) (int, error) {
 	return p.r.Read(b)
 }
 
+func ensurePeekedConn(c net.Conn) (*peekedConn, *bufio.Reader) {
+	if pc, ok := c.(*peekedConn); ok {
+		return pc, pc.r
+	}
+	br := bufio.NewReaderSize(c, 4096)
+	pc := &peekedConn{Conn: c, r: br}
+	return pc, br
+}
+
+
 type SNICertManager struct {
 	mu                    sync.RWMutex
 	certDir               string
