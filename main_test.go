@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -15,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1282,5 +1285,1269 @@ func TestUPnPLifecycleAllowPortsAndUDPReplayBudget(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(corruptCertDir, "key.pem"), []byte("CORRUPTED_KEY_DATA"), 0o600)
 	if _, healedFP, healErr := loadGatewayCert(corruptCertDir); healErr != nil || len(healedFP) != 64 {
 		t.Fatalf("expected loadGatewayCert to self-heal corrupted cert.pem/key.pem, got fp=%q err=%v", healedFP, healErr)
+	}
+}
+
+func TestPCPv2RandomNonceAndSpoofedResponseRejection(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	var mu sync.Mutex
+	spoofNonceMode := false
+	spoofPortMode := false
+	recordedNonces := make([][12]byte, 0, 4)
+
+	go func() {
+		var buf [128]byte
+		for {
+			n, raddr, err := conn.ReadFromUDP(buf[:])
+			if err != nil {
+				return
+			}
+			if n < 60 || buf[0] != 2 || buf[1] != 1 {
+				continue
+			}
+			var reqNonce [12]byte
+			copy(reqNonce[:], buf[24:36])
+
+			mu.Lock()
+			doSpoofNonce := spoofNonceMode
+			doSpoofPort := spoofPortMode
+			recordedNonces = append(recordedNonces, reqNonce)
+			mu.Unlock()
+
+			var resp [60]byte
+			copy(resp[:], buf[:60])
+			resp[0] = 2
+			resp[1] = 0x81 // R=1 Response, Opcode=1 MAP
+			resp[3] = 0    // ResultCode 0 (Success)
+			if doSpoofNonce {
+				// Corrupt echoed 96-bit Mapping Nonce
+				resp[24] ^= 0xff
+				resp[35] ^= 0xaa
+			}
+			if doSpoofPort {
+				// Corrupt echoed internal port
+				binary.BigEndian.PutUint16(resp[40:42], 65000)
+			}
+			_, _ = conn.WriteToUDP(resp[:], raddr)
+		}
+	}()
+
+	gwAddr := conn.LocalAddr().String()
+
+	// 1. Two independent PCP mapping creations for the exact same parameters MUST generate cryptographically distinct random 96-bit nonces
+	nonceHex1, err1 := pcpSetPortMapping(gwAddr, "192.168.1.50", 25565, 25565, "TCP", 3600, "")
+	if err1 != nil {
+		t.Fatalf("first pcpSetPortMapping failed: %v", err1)
+	}
+	nonceHex2, err2 := pcpSetPortMapping(gwAddr, "192.168.1.50", 25565, 25565, "TCP", 3600, "")
+	if err2 != nil {
+		t.Fatalf("second pcpSetPortMapping failed: %v", err2)
+	}
+	if len(nonceHex1) != 24 || len(nonceHex2) != 24 {
+		t.Fatalf("expected 24-hex-char (12-byte) PCP nonces, got %q and %q", nonceHex1, nonceHex2)
+	}
+	if nonceHex1 == nonceHex2 {
+		t.Fatalf("SECURITY BUG: PCP Mapping Nonces are deterministic (%q == %q); RFC 6887 requires random 96-bit nonces", nonceHex1, nonceHex2)
+	}
+
+	// 2. Passing an existing saved nonce (for renewal or deletion) must transmit that exact 96-bit nonce
+	reusedHex, err3 := pcpSetPortMapping(gwAddr, "192.168.1.50", 25565, 25565, "TCP", 0, nonceHex1)
+	if err3 != nil || reusedHex != nonceHex1 {
+		t.Fatalf("expected saved PCP nonce %q to be reused on deletion, got %q (err=%v)", nonceHex1, reusedHex, err3)
+	}
+	mu.Lock()
+	if len(recordedNonces) < 3 {
+		mu.Unlock()
+		t.Fatalf("expected at least 3 recorded PCP packets, got %d", len(recordedNonces))
+	}
+	rawNonce1, _ := hex.DecodeString(nonceHex1)
+	if !bytes.Equal(recordedNonces[2][:], rawNonce1) {
+		mu.Unlock()
+		t.Fatalf("expected third packet to carry saved nonce %x, got %x", rawNonce1, recordedNonces[2])
+	}
+	// 3. Enable spoofed nonce mode and verify pcpSetPortMapping rejects the forged response
+	spoofNonceMode = true
+	mu.Unlock()
+
+	if _, spoofErr := pcpSetPortMapping(gwAddr, "192.168.1.50", 25565, 25565, "TCP", 3600, ""); spoofErr == nil {
+		t.Fatalf("SECURITY BUG: pcpSetPortMapping accepted a PCP response with a mismatched 96-bit Mapping Nonce")
+	}
+
+	// 4. Enable spoofed internal port mode and verify pcpSetPortMapping rejects the forged response
+	mu.Lock()
+	spoofNonceMode = false
+	spoofPortMode = true
+	mu.Unlock()
+
+	if _, spoofPortErr := pcpSetPortMapping(gwAddr, "192.168.1.50", 25565, 25565, "TCP", 3600, ""); spoofPortErr == nil {
+		t.Fatalf("SECURITY BUG: pcpSetPortMapping accepted a PCP response with a mismatched internal port")
+	}
+}
+
+func TestMultiRouterVendorSimulationAndStress(t *testing.T) {
+	// D-Link / Netgear / ZyXEL / Huawei XML description with <URLBase> and multiline whitespace-padded tags
+	rawXML := []byte(`<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <URLBase>
+    http://192.168.0.1:5431/upnp/
+  </URLBase>
+  <device>
+    <serviceList>
+      <service>
+        <serviceType>
+          urn:schemas-upnp-org:service:WANIPConnection:2
+        </serviceType>
+        <controlURL>
+          control/WANIPConn2
+        </controlURL>
+      </service>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:WANPPPConnection:2</serviceType>
+        <controlURL>http://198.51.100.99:1900/ssrf-attempt</controlURL>
+      </service>
+    </serviceList>
+  </device>
+</root>`)
+	eps := parseUPnPDescriptionXML("http://192.168.0.1:1900/rootDesc.xml", nil, rawXML)
+	if len(eps) != 1 || eps[0].ctrlURL != "http://192.168.0.1:5431/upnp/control/WANIPConn2" || eps[0].serviceType != "urn:schemas-upnp-org:service:WANIPConnection:2" {
+		t.Fatalf("unexpected parsed <URLBase> UPnP endpoints: %+v", eps)
+	}
+
+	// Asuswrt / TP-Link / Netgear / OpenWrt IGDv2 router simulation:
+	// - Port 25565 has a stale conflict (718 ConflictInMappingEntry) until DeletePortMapping is called first
+	// - Port 8096 rejects AddPortMapping with 606 Action Not Authorized and requires IGDv2 AddAnyPortMapping
+	// - Simulates router reboot clearing memory so subsequent DeletePortMapping returns 714 NoSuchEntryInArray
+	var routerMu sync.Mutex
+	staleConflictCleared := false
+	routerRebooted := false
+	igdv2Rules := make(map[string]bool)
+
+	igdv2Mux := http.NewServeMux()
+	igdv2Mux.HandleFunc("/ctl/IGDv2", func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		bodyStr := string(bodyBytes)
+		soapAction := r.Header.Get("SOAPAction")
+
+		routerMu.Lock()
+		defer routerMu.Unlock()
+
+		var port int
+		var proto string
+		if i := strings.Index(bodyStr, "<NewExternalPort>"); i >= 0 {
+			_, _ = fmt.Sscanf(bodyStr[i:], "<NewExternalPort>%d</NewExternalPort>", &port)
+		}
+		if i := strings.Index(bodyStr, "<NewProtocol>"); i >= 0 {
+			end := strings.Index(bodyStr[i:], "</NewProtocol>")
+			if end > len("<NewProtocol>") {
+				proto = strings.TrimSpace(bodyStr[i+len("<NewProtocol>") : i+end])
+			}
+		}
+		ruleKey := fmt.Sprintf("%s:%d", proto, port)
+
+		if strings.Contains(soapAction, "#AddPortMapping") {
+			if port == 25565 && !staleConflictCleared {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`<s:Envelope><s:Body><s:Fault><detail><UPnPError><errorCode>718</errorCode><errorDescription>ConflictInMappingEntry</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>`))
+				return
+			}
+			if port == 8096 {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`<s:Envelope><s:Body><s:Fault><detail><UPnPError><errorCode>606</errorCode><errorDescription>Action Not Authorized</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>`))
+				return
+			}
+			igdv2Rules[ruleKey] = true
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<s:Envelope><s:Body><u:AddPortMappingResponse/></s:Body></s:Envelope>`))
+			return
+		}
+
+		if strings.Contains(soapAction, "#AddAnyPortMapping") {
+			igdv2Rules[ruleKey] = true
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(fmt.Sprintf(`<s:Envelope><s:Body><u:AddAnyPortMappingResponse><NewReservedPort>%d</NewReservedPort></u:AddAnyPortMappingResponse></s:Body></s:Envelope>`, port)))
+			return
+		}
+
+		if strings.Contains(soapAction, "#DeletePortMapping") {
+			if port == 25565 && !staleConflictCleared {
+				staleConflictCleared = true
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`<s:Envelope><s:Body><u:DeletePortMappingResponse/></s:Body></s:Envelope>`))
+				return
+			}
+			if routerRebooted || !igdv2Rules[ruleKey] {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`<s:Envelope><s:Body><s:Fault><detail><UPnPError><errorCode>714</errorCode><errorDescription>NoSuchEntryInArray</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>`))
+				return
+			}
+			delete(igdv2Rules, ruleKey)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<s:Envelope><s:Body><u:DeletePortMappingResponse/></s:Body></s:Envelope>`))
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	})
+
+	igdv2Srv := &http.Server{Handler: igdv2Mux}
+	igdv2Ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer igdv2Ln.Close()
+	go func() { _ = igdv2Srv.Serve(igdv2Ln) }()
+	defer igdv2Srv.Close()
+
+	igdv2Ctrl := fmt.Sprintf("http://%s/ctl/IGDv2", igdv2Ln.Addr().String())
+	igdv2Endpoints := []upnpEndpoint{{
+		ctrlURL:     igdv2Ctrl,
+		serviceType: "urn:schemas-upnp-org:service:WANIPConnection:2",
+	}}
+	mappedIGDv2 := autoForwardRouterPortsWithEndpoints("192.168.1.50", []PortMapping{
+		{PublicPort: 25565, TargetPort: 25565, Proto: "tcp"},
+		{PublicPort: 8096, TargetPort: 8096, Proto: "tcp"},
+	}, "", "", igdv2Endpoints, "")
+	if mappedIGDv2 != 2 {
+		t.Fatalf("expected 2 ports mapped across 718 conflict recovery and IGDv2 AddAnyPortMapping, got %d", mappedIGDv2)
+	}
+
+	// Simulate router reboot wiping its internal table so DeletePortMapping returns 714 NoSuchEntryInArray
+	routerMu.Lock()
+	routerRebooted = true
+	igdv2Rules = make(map[string]bool)
+	routerMu.Unlock()
+
+	removedAfterReboot, cleanErr := cleanupActiveUPnPMappings()
+	if cleanErr != nil || removedAfterReboot != 2 {
+		t.Fatalf("expected 714 NoSuchEntryInArray after router reboot to be treated as idempotent success (removed=%d, err=%v)", removedAfterReboot, cleanErr)
+	}
+	if _, err := os.Stat(upnpStateFile); !os.IsNotExist(err) {
+		t.Fatalf("expected %s to be removed after 714 NoSuchEntryInArray cleanup", upnpStateFile)
+	}
+
+	// Apple / Ubiquiti / FreeBSD RFC 6886 NAT-PMP v0 UDP router simulation
+	natpmpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer natpmpConn.Close()
+	var natpmpMu sync.Mutex
+	natpmpActive := make(map[string]bool)
+	go func() {
+		var buf [64]byte
+		for {
+			n, raddr, err := natpmpConn.ReadFromUDP(buf[:])
+			if err != nil {
+				return
+			}
+			if n < 12 || buf[0] != 0 {
+				continue
+			}
+			op := buf[1]
+			intPort := binary.BigEndian.Uint16(buf[4:6])
+			extPort := binary.BigEndian.Uint16(buf[6:8])
+			lifetime := binary.BigEndian.Uint32(buf[8:12])
+			proto := "TCP"
+			if op == 1 {
+				proto = "UDP"
+			}
+			key := fmt.Sprintf("%s:%d", proto, intPort)
+			natpmpMu.Lock()
+			if lifetime == 0 {
+				delete(natpmpActive, key)
+			} else {
+				natpmpActive[key] = true
+			}
+			natpmpMu.Unlock()
+
+			var resp [16]byte
+			resp[0] = 0
+			resp[1] = 128 + op
+			binary.BigEndian.PutUint16(resp[2:4], 0) // ResultCode 0 (Success)
+			binary.BigEndian.PutUint32(resp[4:8], 1000)
+			binary.BigEndian.PutUint16(resp[8:10], intPort)
+			binary.BigEndian.PutUint16(resp[10:12], extPort)
+			binary.BigEndian.PutUint32(resp[12:16], lifetime)
+			_, _ = natpmpConn.WriteToUDP(resp[:], raddr)
+		}
+	}()
+
+	natpmpGW := natpmpConn.LocalAddr().String()
+	mappedNATPMP := autoForwardRouterPortsWithEndpoints("192.168.1.50", []PortMapping{
+		{PublicPort: 27015, TargetPort: 27015, Proto: "both"},
+	}, "", "", nil, natpmpGW)
+	if mappedNATPMP != 2 {
+		t.Fatalf("expected 2 NAT-PMP rules (TCP+UDP 27015), got %d", mappedNATPMP)
+	}
+	natpmpMu.Lock()
+	if !natpmpActive["TCP:27015"] || !natpmpActive["UDP:27015"] {
+		natpmpMu.Unlock()
+		t.Fatalf("expected TCP:27015 and UDP:27015 active on NAT-PMP server, got %+v", natpmpActive)
+	}
+	natpmpMu.Unlock()
+	if rem, err := cleanupActiveUPnPMappings(); err != nil || rem != 2 {
+		t.Fatalf("expected 2 NAT-PMP rules cleaned up, got rem=%d err=%v", rem, err)
+	}
+
+	// MikroTik v7 / OPNsense / ISP CPE RFC 6887 PCP v2 UDP router simulation (rejects NAT-PMP v0 with ResultCode=1)
+	pcpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pcpConn.Close()
+	var pcpMu sync.Mutex
+	pcpActive := make(map[string][12]byte)
+	go func() {
+		var buf [128]byte
+		for {
+			n, raddr, err := pcpConn.ReadFromUDP(buf[:])
+			if err != nil {
+				return
+			}
+			// Reject NAT-PMP v0 with ResultCode = 1 (Unsupported Version) to trigger RFC 6887 PCP v2 fallback
+			if n == 12 && buf[0] == 0 {
+				var reject [16]byte
+				reject[0] = 0
+				reject[1] = 128 + buf[1]
+				binary.BigEndian.PutUint16(reject[2:4], 1) // ResultCode 1 = Unsupported Version
+				_, _ = pcpConn.WriteToUDP(reject[:], raddr)
+				continue
+			}
+			if n < 60 || buf[0] != 2 || buf[1] != 1 {
+				continue
+			}
+			lifetime := binary.BigEndian.Uint32(buf[4:8])
+			var nonce [12]byte
+			copy(nonce[:], buf[24:36])
+			protoNum := buf[36]
+			intPort := binary.BigEndian.Uint16(buf[40:42])
+			extPort := binary.BigEndian.Uint16(buf[42:44])
+			if extPort == 0 {
+				extPort = intPort
+			}
+			proto := "TCP"
+			if protoNum == 17 {
+				proto = "UDP"
+			}
+			key := fmt.Sprintf("%s:%d", proto, intPort)
+
+			pcpMu.Lock()
+			if lifetime == 0 {
+				// Verify persisted RFC 6887 random 96-bit Mapping Nonce matches creation nonce
+				if savedNonce, exists := pcpActive[key]; exists && savedNonce == nonce {
+					delete(pcpActive, key)
+				}
+			} else {
+				pcpActive[key] = nonce
+			}
+			pcpMu.Unlock()
+
+			var resp [60]byte
+			copy(resp[:], buf[:60])
+			resp[0] = 2
+			resp[1] = 0x81 // R=1 Response, Opcode=1 MAP
+			resp[3] = 0    // Success
+			binary.BigEndian.PutUint16(resp[42:44], extPort)
+			_, _ = pcpConn.WriteToUDP(resp[:], raddr)
+		}
+	}()
+
+	pcpGW := pcpConn.LocalAddr().String()
+	mappedPCP := autoForwardRouterPortsWithEndpoints("192.168.1.50", []PortMapping{
+		{PublicPort: 51820, TargetPort: 51820, Proto: "both"},
+	}, "", "", nil, pcpGW)
+	if mappedPCP != 2 {
+		t.Fatalf("expected 2 PCP v2 rules (TCP+UDP 51820) after NAT-PMP v0 fallback, got %d", mappedPCP)
+	}
+	pcpMu.Lock()
+	if len(pcpActive) != 2 {
+		pcpMu.Unlock()
+		t.Fatalf("expected 2 active PCP v2 mappings on router, got %d", len(pcpActive))
+	}
+	pcpMu.Unlock()
+
+	// Simulate renewal preserving the exact random 96-bit Mapping Nonce
+	renewedPCP := autoForwardRouterPortsWithEndpoints("192.168.1.50", []PortMapping{
+		{PublicPort: 51820, TargetPort: 51820, Proto: "both"},
+	}, "", "", nil, pcpGW)
+	if renewedPCP != 2 {
+		t.Fatalf("expected 2 PCP v2 rules renewed, got %d", renewedPCP)
+	}
+
+	// Simulate crash recovery cleanup for PCP v2 (verifying persisted 96-bit Mapping Nonce deletes rules)
+	upnpStateMu.Lock()
+	activeUPnPMappings = nil
+	upnpStateMu.Unlock()
+	pcpRecovered, pcpErr := cleanupStaleUPnPState()
+	pcpMu.Lock()
+	remainingPCP := len(pcpActive)
+	pcpMu.Unlock()
+	if pcpErr != nil || pcpRecovered != 2 || remainingPCP != 0 {
+		t.Fatalf("expected PCP v2 mappings to be recovered and deleted with matching persisted 96-bit nonce (recovered=%d, remaining=%d, err=%v)", pcpRecovered, remainingPCP, pcpErr)
+	}
+
+	// Concurrent stress test across lock manager, XML parser, state salvage, and channel-bound HMACs
+	var wg sync.WaitGroup
+	for worker := 0; worker < 16; worker++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for iter := 0; iter < 10; iter++ {
+				_ = parseUPnPDescriptionXML("http://192.168.1.1:1900/igd.xml", nil, rawXML)
+				_ = discoverCandidateGatewayIPs("192.168.1.50", eps)
+				_ = withUPnPStateFileLock(func() error {
+					return nil
+				})
+			}
+		}(worker)
+	}
+	wg.Wait()
+}
+
+func TestTLSManagerUDPReplayFreshnessAndSmartPortBridge(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Verify SNICertManager Root CA persistence and on-the-fly leaf certificate signing
+	sniMgr, err := newSNICertManager(tmpDir, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sniMgr.caPEM) == 0 || len(sniMgr.caFingerprint) != 64 {
+		t.Fatalf("expected SNICertManager to persist Root CA PEM and 64-char SHA-256 fingerprint")
+	}
+	cert, err := sniMgr.getCertificate(&tls.ClientHelloInfo{ServerName: "mypc.duckdns.org"})
+	if err != nil || cert == nil {
+		t.Fatalf("expected SNICertManager to issue certificate for mypc.duckdns.org, got err=%v", err)
+	}
+
+	// 2. Verify 2-second UDP replay freshness window drops stale UDP packets while replaying fresh ones
+	us := &gwUDPSession{id: 901, targetPort: 51820}
+	us.mu.Lock()
+	us.enqueuePacketLocked([]byte("stale-udp-pkt"))
+	us.pendingAt[0] = time.Now().Add(-3 * time.Second) // older than maxUDPReplayAge (2s)
+	us.enqueuePacketLocked([]byte("fresh-udp-pkt"))
+	det := us.detachPendingForReplayLocked()
+	us.mu.Unlock()
+	if len(det) != 1 || string(det[0]) != "fresh-udp-pkt" {
+		t.Fatalf("expected stale UDP packet (>2s) to be dropped and only fresh-udp-pkt retained, got %d packets", len(det))
+	}
+	globalUDPBufferedBytes.Add(-int64(len(det[0])))
+
+	// 3. Verify Smart Ephemeral Port Bridging in Standalone Mode when TargetPort is already bound
+	backendLn, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendLn.Close()
+	occupiedPort := uint16(backendLn.Addr().(*net.TCPAddr).Port)
+	go func() {
+		for {
+			conn, err := backendLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = c.Write([]byte("BRIDGED-OK"))
+			}(conn)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bridgeMappings := []PortMapping{
+		{BindIP: "0.0.0.0", PublicPort: occupiedPort, TargetPort: occupiedPort, Proto: "tcp"},
+	}
+	if err := startStandaloneTCP(ctx, "127.0.0.1", &bridgeMappings[0], nil, false); err != nil {
+		t.Fatalf("expected startStandaloneTCP to succeed via ephemeral port bridging when port %d is occupied, got error: %v", occupiedPort, err)
+	}
+	bridgedPort := bridgeMappings[0].RouterTCPPort
+	if bridgedPort == 0 || bridgedPort == occupiedPort {
+		t.Fatalf("expected RouterTCPPort to be an ephemeral bridge port != %d, got %d", occupiedPort, bridgedPort)
+	}
+
+	dialConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", bridgedPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial ephemeral bridge port %d: %v", bridgedPort, err)
+	}
+	defer dialConn.Close()
+	_ = dialConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	gotBridge, err := io.ReadAll(dialConn)
+	if err != nil || string(gotBridge) != "BRIDGED-OK" {
+		t.Fatalf("expected BRIDGED-OK through standalone ephemeral bridge port %d -> %d, got %q (err=%v)", bridgedPort, occupiedPort, string(gotBridge), err)
+	}
+}
+
+func TestProductionChaosWANFlapsBackendRestartsAndRouterReboot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	prevTransport := defaultTransportMode
+	defaultTransportMode = "tcp"
+	defer func() {
+		defaultTransportMode = prevTransport
+	}()
+
+	// 1. Local TCP echo server (simulating an active SSH/RDP/Website stream that must survive WAN flaps)
+	tcpTargetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcpTargetLn.Close()
+	tcpTargetPort := uint16(tcpTargetLn.Addr().(*net.TCPAddr).Port)
+	go func() {
+		for {
+			c, err := tcpTargetLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	// 2. Local UDP game server that will be STOPPED and RESTARTED mid-session to verify 24/7 resilience
+	udpTargetPort := uint16(getFreePort(t, "udp"))
+	startLocalUDPServer := func(port uint16, tag string) *net.UDPConn {
+		uaddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		uc, err := net.ListenUDP("udp", uaddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			buf := make([]byte, 2048)
+			for {
+				n, raddr, err := uc.ReadFromUDP(buf)
+				if err != nil {
+					return
+				}
+				reply := append([]byte(tag+":"), buf[:n]...)
+				_, _ = uc.WriteToUDP(reply, raddr)
+			}
+		}()
+		return uc
+	}
+	udpSrv1 := startLocalUDPServer(udpTargetPort, "v1")
+	defer func() {
+		if udpSrv1 != nil {
+			_ = udpSrv1.Close()
+		}
+	}()
+
+	gwPort := getFreePort(t, "tcp")
+	pubTCPPort := uint16(getFreePort(t, "tcp"))
+	pubUDPPort := uint16(getFreePort(t, "udp"))
+
+	// Fault-injecting TCP WAN proxy between Agent and Gateway so we can sever the WAN link multiple times mid-stream
+	wanProxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wanProxyLn.Close()
+
+	var proxyMu sync.Mutex
+	var activeWANConns []net.Conn
+	severAllWANLinks := func() {
+		proxyMu.Lock()
+		conns := activeWANConns
+		activeWANConns = nil
+		proxyMu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}
+
+	gwAddr := fmt.Sprintf("127.0.0.1:%d", gwPort)
+	go func() {
+		for {
+			inC, err := wanProxyLn.Accept()
+			if err != nil {
+				return
+			}
+			outC, err := net.DialTimeout("tcp", gwAddr, 2*time.Second)
+			if err != nil {
+				_ = inC.Close()
+				continue
+			}
+			proxyMu.Lock()
+			activeWANConns = append(activeWANConns, inC, outC)
+			proxyMu.Unlock()
+			go pipeBidirectional(inC, outC)
+		}
+	}()
+
+	mappings := []PortMapping{
+		{PublicPort: pubTCPPort, TargetPort: tcpTargetPort, Proto: "tcp"},
+		{PublicPort: pubUDPPort, TargetPort: udpTargetPort, Proto: "udp"},
+	}
+
+	certDir := t.TempDir()
+	go func() {
+		_ = runGateway(ctx, gwAddr, "chaos-secret-token", "", "", "", nil, mappings, 64*1024*1024, 8*1024*1024, 2*time.Second, 250*time.Millisecond, 30*time.Second, certDir, "", "", false, false)
+	}()
+	time.Sleep(150 * time.Millisecond)
+
+	go func() {
+		_ = runAgent(ctx, wanProxyLn.Addr().String(), "127.0.0.1", "chaos-secret-token", "192.168.1.50", "", 8*1024*1024, 64*1024*1024, 2*time.Second, 250*time.Millisecond, 30*time.Second, nil)
+	}()
+	time.Sleep(250 * time.Millisecond)
+
+	// Part A: Stream 1.5 MiB over a single TCP connection while severing the WAN link twice mid-transfer
+	clientConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", pubTCPPort), 3*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial public TCP port: %v", err)
+	}
+	defer clientConn.Close()
+
+	totalBytes := 1536 * 1024
+	sendPayload := make([]byte, totalBytes)
+	_, _ = rand.Read(sendPayload)
+	wantHash := sha256.Sum256(sendPayload)
+
+	resumedBefore := metricResumedSessions.Load()
+	phase1Done := make(chan struct{})
+	phase2Done := make(chan struct{})
+	writeErrCh := make(chan error, 1)
+
+	go func() {
+		// Phase 1: Write first 256 KiB and wait until reader confirms epoch #1 is actively streaming
+		if _, wErr := clientConn.Write(sendPayload[:256*1024]); wErr != nil {
+			writeErrCh <- wErr
+			return
+		}
+		<-phase1Done
+
+		// Flap #1: Sever the WAN tunnel mid-stream and write 640 KiB while the tunnel is reconnecting
+		severAllWANLinks()
+		if _, wErr := clientConn.Write(sendPayload[256*1024 : 896*1024]); wErr != nil {
+			writeErrCh <- wErr
+			return
+		}
+		<-phase2Done
+
+		// Flap #2: Sever the WAN tunnel a second time on the same TCP session and write remaining 640 KiB
+		severAllWANLinks()
+		if _, wErr := clientConn.Write(sendPayload[896*1024:]); wErr != nil {
+			writeErrCh <- wErr
+			return
+		}
+		if tc, ok := clientConn.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+		writeErrCh <- nil
+	}()
+
+	_ = clientConn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	receivedPayload := make([]byte, totalBytes)
+	if _, err := io.ReadFull(clientConn, receivedPayload[:256*1024]); err != nil {
+		t.Fatalf("Phase 1 TCP read failed: %v", err)
+	}
+	close(phase1Done)
+
+	if _, err := io.ReadFull(clientConn, receivedPayload[256*1024:896*1024]); err != nil {
+		t.Fatalf("Phase 2 TCP read across WAN flap #1 failed: %v", err)
+	}
+	close(phase2Done)
+
+	if _, err := io.ReadFull(clientConn, receivedPayload[896*1024:]); err != nil {
+		t.Fatalf("Phase 3 TCP read across WAN flap #2 failed: %v", err)
+	}
+	if wErr := <-writeErrCh; wErr != nil {
+		t.Fatalf("TCP stream write failed: %v", wErr)
+	}
+	gotHash := sha256.Sum256(receivedPayload)
+	if gotHash != wantHash {
+		t.Fatalf("SHA-256 mismatch after multi-flap WAN outage: got %x, want %x", gotHash[:8], wantHash[:8])
+	}
+	if metricResumedSessions.Load() < resumedBefore+2 {
+		t.Fatalf("expected metricResumedSessions to increment by at least 2 after 2 WAN flaps (before=%d, after=%d)", resumedBefore, metricResumedSessions.Load())
+	}
+
+	// Part B: Verify Local UDP Server Restart Resilience (ECONNREFUSED / WSAECONNREFUSED immunity)
+	udpClient, err := net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", pubUDPPort))
+	if err != nil {
+		t.Fatalf("failed to dial public UDP port: %v", err)
+	}
+	defer udpClient.Close()
+
+	sendAndRecvUDP := func(msg, wantPrefix string) {
+		for attempt := 0; attempt < 15; attempt++ {
+			_, _ = udpClient.Write([]byte(msg))
+			_ = udpClient.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+			var rbuf [256]byte
+			n, rErr := udpClient.Read(rbuf[:])
+			if rErr == nil && strings.HasPrefix(string(rbuf[:n]), wantPrefix) {
+				return
+			}
+		}
+		t.Fatalf("failed to receive expected UDP reply %q for %q", wantPrefix, msg)
+	}
+
+	// 1) Initial UDP packet reaches v1 server
+	sendAndRecvUDP("ping1", "v1:ping1")
+
+	// 2) Stop the local UDP server and send packets while it is down (triggers ICMP Port Unreachable / ECONNREFUSED on connected UDP socket)
+	_ = udpSrv1.Close()
+	udpSrv1 = nil
+	for i := 0; i < 4; i++ {
+		_, _ = udpClient.Write([]byte("while-down"))
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// 3) Restart the local UDP server on the exact same port (v2) and verify the existing UDP session immediately works without restarting driftless
+	udpSrv2 := startLocalUDPServer(udpTargetPort, "v2")
+	defer udpSrv2.Close()
+	sendAndRecvUDP("ping2", "v2:ping2")
+}
+
+func TestMultiAgentSingleGatewayTCPUDPVHostsAndIsolation(t *testing.T) {
+	prevTransport := defaultTransportMode
+	defaultTransportMode = "tcp"
+	defer func() {
+		defaultTransportMode = prevTransport
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 1. Start local services on 3 simulated Home PCs (pc1, pc2, pc3)
+	// pc1: HTTP media server ("media.example.com") + dedicated TCP service
+	pc1HTTPPort := uint16(getFreePort(t, "tcp"))
+	pc1TCPPort := uint16(getFreePort(t, "tcp"))
+	pc1PubTCPPort := uint16(getFreePort(t, "tcp"))
+
+	// pc2: HTTP website ("site.example.com") + dedicated TCP service
+	pc2HTTPPort := uint16(getFreePort(t, "tcp"))
+	pc2TCPPort := uint16(getFreePort(t, "tcp"))
+	pc2PubTCPPort := uint16(getFreePort(t, "tcp"))
+
+	// pc3: HTTP game status ("game.example.com") + UDP game server
+	pc3HTTPPort := uint16(getFreePort(t, "tcp"))
+	pc3UDPPort := uint16(getFreePort(t, "udp"))
+	pc3PubUDPPort := uint16(getFreePort(t, "udp"))
+
+	startHTTPBackend := func(port uint16, nodeTag string) *http.Server {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := &http.Server{
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = fmt.Fprintf(w, "NODE=%s HOST=%s PATH=%s", nodeTag, r.Host, r.URL.Path)
+			}),
+		}
+		go func() { _ = srv.Serve(ln) }()
+		return srv
+	}
+
+	startTCPBackend := func(port uint16, nodeTag string) net.Listener {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					buf, _ := io.ReadAll(conn)
+					_, _ = fmt.Fprintf(conn, "%s:%s", nodeTag, string(buf))
+				}(c)
+			}
+		}()
+		return ln
+	}
+
+	startUDPBackend := func(port uint16, nodeTag string) *net.UDPConn {
+		uaddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		uc, err := net.ListenUDP("udp", uaddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			var buf [2048]byte
+			for {
+				n, raddr, err := uc.ReadFromUDP(buf[:])
+				if err != nil {
+					return
+				}
+				reply := fmt.Sprintf("%s:%s", nodeTag, string(buf[:n]))
+				_, _ = uc.WriteToUDP([]byte(reply), raddr)
+			}
+		}()
+		return uc
+	}
+
+	srv1 := startHTTPBackend(pc1HTTPPort, "pc1")
+	defer srv1.Close()
+	srv2 := startHTTPBackend(pc2HTTPPort, "pc2")
+	defer srv2.Close()
+	srv3 := startHTTPBackend(pc3HTTPPort, "pc3")
+	defer srv3.Close()
+
+	tcpLn1 := startTCPBackend(pc1TCPPort, "pc1")
+	defer tcpLn1.Close()
+	tcpLn2 := startTCPBackend(pc2TCPPort, "pc2")
+	defer tcpLn2.Close()
+	udpConn3 := startUDPBackend(pc3UDPPort, "pc3")
+	defer udpConn3.Close()
+
+	// 2. Start a single VPS Gateway with shared HTTP vhost listener
+	gwTunnelPort := getFreePort(t, "tcp")
+	gwHTTPPort := getFreePort(t, "tcp")
+	gwAddr := fmt.Sprintf("127.0.0.1:%d", gwTunnelPort)
+	httpBindAddr := fmt.Sprintf("127.0.0.1:%d", gwHTTPPort)
+
+	go func() {
+		_ = runGateway(
+			ctx,
+			gwAddr,
+			"multi-node-secret-token",
+			"",
+			httpBindAddr,
+			"",
+			nil,
+			nil,
+			64*1024*1024,
+			8*1024*1024,
+			2*time.Second,
+			250*time.Millisecond,
+			30*time.Second,
+			t.TempDir(),
+			"",
+			"",
+			false,
+			false,
+		)
+	}()
+	time.Sleep(150 * time.Millisecond)
+
+	// 3. Connect 3 concurrent Agents (pc1, pc2, pc3) to the same Gateway, each registering its own vhosts and TCP/UDP ports
+	pc1Ctx, pc1Cancel := context.WithCancel(ctx)
+	defer pc1Cancel()
+	pc2Ctx, pc2Cancel := context.WithCancel(ctx)
+	defer pc2Cancel()
+	pc3Ctx, pc3Cancel := context.WithCancel(ctx)
+	defer pc3Cancel()
+
+	startPC1Agent := func(agentCtx context.Context) {
+		go func() {
+			_ = runAgentWithServices(
+				agentCtx,
+				"pc1",
+				gwAddr,
+				"127.0.0.1",
+				"multi-node-secret-token",
+				"192.168.1.101",
+				"",
+				[]PortMapping{{PublicPort: pc1PubTCPPort, TargetPort: pc1TCPPort, Proto: "tcp"}},
+				[]VHostRoute{{Domain: "media.example.com", NodeID: "pc1", TargetPort: pc1HTTPPort}},
+				8*1024*1024,
+				64*1024*1024,
+				2*time.Second,
+				250*time.Millisecond,
+				30*time.Second,
+				nil,
+			)
+		}()
+	}
+
+	startPC1Agent(pc1Ctx)
+	go func() {
+		_ = runAgentWithServices(
+			pc2Ctx,
+			"pc2",
+			gwAddr,
+			"127.0.0.1",
+			"multi-node-secret-token",
+			"192.168.1.102",
+			"",
+			[]PortMapping{{PublicPort: pc2PubTCPPort, TargetPort: pc2TCPPort, Proto: "tcp"}},
+			[]VHostRoute{{Domain: "site.example.com", NodeID: "pc2", TargetPort: pc2HTTPPort}},
+			8*1024*1024,
+			64*1024*1024,
+			2*time.Second,
+			250*time.Millisecond,
+			30*time.Second,
+			nil,
+		)
+	}()
+	go func() {
+		_ = runAgentWithServices(
+			pc3Ctx,
+			"pc3",
+			gwAddr,
+			"127.0.0.1",
+			"multi-node-secret-token",
+			"192.168.1.103",
+			"",
+			[]PortMapping{{PublicPort: pc3PubUDPPort, TargetPort: pc3UDPPort, Proto: "udp"}},
+			[]VHostRoute{{Domain: "game.example.com", NodeID: "pc3", TargetPort: pc3HTTPPort}},
+			8*1024*1024,
+			64*1024*1024,
+			2*time.Second,
+			250*time.Millisecond,
+			30*time.Second,
+			nil,
+		)
+	}()
+	time.Sleep(350 * time.Millisecond)
+
+	// Helper to query HTTP vhost through the shared Gateway HTTP port
+	checkVHost := func(hostHeader, path, wantSubstr string) error {
+		client := &http.Client{Timeout: 3 * time.Second}
+		req, err := http.NewRequest("GET", fmt.Sprintf("http://%s%s", httpBindAddr, path), nil)
+		if err != nil {
+			return err
+		}
+		req.Host = hostHeader
+		req.Close = true
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), wantSubstr) {
+			return fmt.Errorf("status=%d body=%q (want %q)", resp.StatusCode, string(body), wantSubstr)
+		}
+		return nil
+	}
+
+	// Helper to test dedicated TCP port forwarding
+	checkTCPPort := func(pubPort uint16, payload, wantReply string) error {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", pubPort), 3*time.Second)
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		if _, err := c.Write([]byte(payload)); err != nil {
+			return err
+		}
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		got, err := io.ReadAll(c)
+		if err != nil || string(got) != wantReply {
+			return fmt.Errorf("err=%v got=%q want=%q", err, string(got), wantReply)
+		}
+		return nil
+	}
+
+	// Helper to test dedicated UDP port forwarding
+	checkUDPPort := func(pubPort uint16, payload, wantReply string) error {
+		uc, err := net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", pubPort))
+		if err != nil {
+			return err
+		}
+		defer uc.Close()
+		for attempt := 0; attempt < 10; attempt++ {
+			_, _ = uc.Write([]byte(payload))
+			_ = uc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			var buf [256]byte
+			n, rErr := uc.Read(buf[:])
+			if rErr == nil && string(buf[:n]) == wantReply {
+				return nil
+			}
+		}
+		return fmt.Errorf("failed to receive UDP reply %q on port %d", wantReply, pubPort)
+	}
+
+	// 4. Verify all 3 Agents work simultaneously through the single Gateway
+	if err := checkVHost("media.example.com", "/stream", "NODE=pc1 HOST=media.example.com PATH=/stream"); err != nil {
+		t.Fatalf("pc1 vhost failed: %v", err)
+	}
+	if err := checkVHost("site.example.com", "/index", "NODE=pc2 HOST=site.example.com PATH=/index"); err != nil {
+		t.Fatalf("pc2 vhost failed: %v", err)
+	}
+	if err := checkVHost("game.example.com", "/status", "NODE=pc3 HOST=game.example.com PATH=/status"); err != nil {
+		t.Fatalf("pc3 vhost failed: %v", err)
+	}
+	if err := checkTCPPort(pc1PubTCPPort, "hello-pc1", "pc1:hello-pc1"); err != nil {
+		t.Fatalf("pc1 TCP port failed: %v", err)
+	}
+	if err := checkTCPPort(pc2PubTCPPort, "hello-pc2", "pc2:hello-pc2"); err != nil {
+		t.Fatalf("pc2 TCP port failed: %v", err)
+	}
+	if err := checkUDPPort(pc3PubUDPPort, "udp-pkt-3", "pc3:udp-pkt-3"); err != nil {
+		t.Fatalf("pc3 UDP port failed: %v", err)
+	}
+
+	// 5. Disconnect pc1 -> verify pc2 and pc3 continue working without any interruption
+	pc1Cancel()
+	time.Sleep(250 * time.Millisecond)
+
+	if err := checkVHost("site.example.com", "/still-alive", "NODE=pc2 HOST=site.example.com PATH=/still-alive"); err != nil {
+		t.Fatalf("pc2 vhost failed after pc1 disconnected: %v", err)
+	}
+	if err := checkTCPPort(pc2PubTCPPort, "after-pc1-drop", "pc2:after-pc1-drop"); err != nil {
+		t.Fatalf("pc2 TCP port failed after pc1 disconnected: %v", err)
+	}
+	if err := checkVHost("game.example.com", "/still-alive", "NODE=pc3 HOST=game.example.com PATH=/still-alive"); err != nil {
+		t.Fatalf("pc3 vhost failed after pc1 disconnected: %v", err)
+	}
+	if err := checkUDPPort(pc3PubUDPPort, "udp-after-pc1-drop", "pc3:udp-after-pc1-drop"); err != nil {
+		t.Fatalf("pc3 UDP port failed after pc1 disconnected: %v", err)
+	}
+
+	// 6. Reconnect pc1 -> verify pc1 automatically resumes serving vhost and TCP port
+	pc1Ctx2, pc1Cancel2 := context.WithCancel(ctx)
+	defer pc1Cancel2()
+	startPC1Agent(pc1Ctx2)
+	time.Sleep(350 * time.Millisecond)
+
+	if err := checkVHost("media.example.com", "/recovered", "NODE=pc1 HOST=media.example.com PATH=/recovered"); err != nil {
+		t.Fatalf("pc1 vhost failed after reconnect: %v", err)
+	}
+	if err := checkTCPPort(pc1PubTCPPort, "reconnected-pc1", "pc1:reconnected-pc1"); err != nil {
+		t.Fatalf("pc1 TCP port failed after reconnect: %v", err)
+	}
+}
+
+func TestProduction24x7WebsiteUnderLoadAndIPRotation(t *testing.T) {
+	// 1. Mock RFC 5389 STUN server that dynamically rotates simulated WAN IPs
+	stunConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stunConn.Close()
+
+	var currentSimulatedIP atomic.Value
+	currentSimulatedIP.Store("198.51.100.10")
+
+	go func() {
+		var buf [512]byte
+		for {
+			n, raddr, err := stunConn.ReadFromUDP(buf[:])
+			if err != nil {
+				return
+			}
+			if n < 20 || binary.BigEndian.Uint16(buf[0:2]) != 0x0001 {
+				continue
+			}
+			ipStr := currentSimulatedIP.Load().(string)
+			ip := net.ParseIP(ipStr).To4()
+			var resp [32]byte
+			binary.BigEndian.PutUint16(resp[0:2], 0x0101) // Binding Success Response
+			binary.BigEndian.PutUint16(resp[2:4], 12)     // Attribute length
+			binary.BigEndian.PutUint32(resp[4:8], 0x2112A442)
+			copy(resp[8:20], buf[8:20])                    // Echo 12-byte Transaction ID
+			binary.BigEndian.PutUint16(resp[20:22], 0x0020) // XOR-MAPPED-ADDRESS
+			binary.BigEndian.PutUint16(resp[22:24], 8)
+			resp[24] = 0
+			resp[25] = 0x01 // IPv4
+			cookie := [4]byte{0x21, 0x12, 0xA4, 0x42}
+			binary.BigEndian.PutUint16(resp[26:28], uint16(raddr.Port)^0x2112)
+			for i := 0; i < 4; i++ {
+				resp[28+i] = ip[i] ^ cookie[i]
+			}
+			_, _ = stunConn.WriteToUDP(resp[:], raddr)
+		}
+	}()
+
+	// 2. Mock DDNS webhook server recording every dynamic IP update
+	var ddnsMu sync.Mutex
+	var ddnsUpdates []string
+	ddnsSrv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ip := r.URL.Query().Get("ip")
+			ddnsMu.Lock()
+			ddnsUpdates = append(ddnsUpdates, ip)
+			ddnsMu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("OK"))
+		}),
+	}
+	ddnsLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ddnsLn.Close()
+	go func() { _ = ddnsSrv.Serve(ddnsLn) }()
+	defer ddnsSrv.Close()
+
+	// 3. Local 24/7 Website backend
+	siteLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer siteLn.Close()
+	siteBackendPort := uint16(siteLn.Addr().(*net.TCPAddr).Port)
+	var totalSiteHits atomic.Int64
+	siteSrv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hit := totalSiteHits.Add(1)
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = fmt.Fprintf(w, "SITE-ONLINE-HIT-%d", hit)
+		}),
+	}
+	go func() { _ = siteSrv.Serve(siteLn) }()
+	defer siteSrv.Close()
+
+	pubSitePort := uint16(getFreePort(t, "tcp"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := StandaloneConfig{
+		TargetHost:   "127.0.0.1",
+		Mappings:     []PortMapping{{BindIP: "127.0.0.1", PublicPort: pubSitePort, TargetPort: siteBackendPort, Proto: "tcp"}},
+		EnableUPnP:   false,
+		EnableTLS:    false,
+		STUNServer:   stunConn.LocalAddr().String(),
+		STUNInterval: 250 * time.Millisecond,
+		CertDir:      t.TempDir(),
+		DDNS: DDNSConfig{
+			Domain:  "mysite.duckdns.org",
+			Webhook: fmt.Sprintf("http://%s/ddns?ip={ip}", ddnsLn.Addr().String()),
+		},
+	}
+
+	doneStandalone := make(chan error, 1)
+	go func() {
+		doneStandalone <- runStandalone(ctx, cfg)
+	}()
+	time.Sleep(150 * time.Millisecond)
+
+	// 4. Hammer the website with 16 concurrent workers while rotating the ISP WAN IP 3 times
+	var wg sync.WaitGroup
+	var errCount atomic.Int32
+	for w := 0; w < 16; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client := &http.Client{Timeout: 2 * time.Second}
+			for i := 0; i < 15; i++ {
+				resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", pubSitePort))
+				if err != nil {
+					errCount.Add(1)
+					continue
+				}
+				b, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode != 200 || !strings.HasPrefix(string(b), "SITE-ONLINE-HIT-") {
+					errCount.Add(1)
+				}
+				time.Sleep(15 * time.Millisecond)
+			}
+		}()
+	}
+
+	// Rotate ISP WAN IP while traffic is actively flowing
+	for _, nextIP := range []string{"198.51.100.11", "198.51.100.12", "198.51.100.13"} {
+		time.Sleep(280 * time.Millisecond)
+		currentSimulatedIP.Store(nextIP)
+	}
+
+	wg.Wait()
+	time.Sleep(350 * time.Millisecond)
+	cancel()
+	<-doneStandalone
+
+	if errCount.Load() != 0 {
+		t.Fatalf("expected 0 HTTP errors during 24/7 website load + WAN IP rotations, got %d", errCount.Load())
+	}
+	if totalSiteHits.Load() < 240 {
+		t.Fatalf("expected at least 240 successful website hits, got %d", totalSiteHits.Load())
+	}
+
+	ddnsMu.Lock()
+	updates := append([]string(nil), ddnsUpdates...)
+	ddnsMu.Unlock()
+	if len(updates) < 2 || updates[len(updates)-1] != "198.51.100.13" {
+		t.Fatalf("expected DDNS to automatically track IP rotations ending at 198.51.100.13, got updates=%v", updates)
+	}
+
+	// 5. Verify copyWithIdleTimeout cleans up abandoned half-open connections without leaking sockets
+	c1, s1 := net.Pipe()
+	c2, s2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	doneIdle := make(chan struct{})
+	go func() {
+		defer close(doneIdle)
+		copyWithIdleTimeout(s1, s2, 60*time.Millisecond)
+	}()
+	select {
+	case <-doneIdle:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("expected copyWithIdleTimeout to terminate idle half-open connections within 60ms")
+	}
+}
+
+func TestProductionStopRestartPersistenceAndReachabilityCheck(t *testing.T) {
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpDir := t.TempDir()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	// 1. First run: user passes '-duck mypc:secretDuckToken123'
+	cfg1 := resolveAndPersistDDNS(DDNSConfig{}, "mypc:secretDuckToken123")
+	if cfg1.Provider != "duckdns" || cfg1.Domain != "mypc.duckdns.org" || cfg1.Token != "secretDuckToken123" {
+		t.Fatalf("unexpected first-run DDNS config: %+v", cfg1)
+	}
+
+	// 2. Second run (after stopping and restarting PC): user passes bare '-duck' (which CLI rewrites to '-duck=auto')
+	cfg2 := resolveAndPersistDDNS(DDNSConfig{}, "auto")
+	if cfg2.Provider != "duckdns" || cfg2.Domain != "mypc.duckdns.org" || cfg2.Token != "secretDuckToken123" {
+		t.Fatalf("expected bare '-duck' on restart to reload saved DuckDNS domain & token, got: %+v", cfg2)
+	}
+
+	// 3. Gateway token persistence across stop/restart
+	tok1, err := loadOrGenerateToken(true, "", "")
+	if err != nil || len(tok1) < 32 {
+		t.Fatalf("expected loadOrGenerateToken to generate and persist token, got err=%v", err)
+	}
+	tok2, err := loadOrGenerateToken(true, "", "")
+	if err != nil || tok1 != tok2 {
+		t.Fatalf("expected loadOrGenerateToken on restart to reload identical token (%q != %q, err=%v)", tok1, tok2, err)
+	}
+
+	// 4. External reachability & CGNAT detection (checkExternalReachability)
+	if !isCGNATOrPrivateIP("100.64.12.34") || !isCGNATOrPrivateIP("10.0.0.1") || isCGNATOrPrivateIP("198.51.100.42") {
+		t.Fatalf("unexpected CGNAT/private IP classification")
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	openPort := uint16(ln.Addr().(*net.TCPAddr).Port)
+	closedPort := uint16(getFreePort(t, "tcp"))
+
+	repOpen := checkExternalReachability("127.0.0.1", "127.0.0.1", DDNSConfig{}, []PortMapping{
+		{PublicPort: openPort, TargetPort: openPort, Proto: "tcp"},
+	}, 500*time.Millisecond)
+	if !strings.HasPrefix(repOpen.PortStatus[openPort], "reachable") {
+		t.Fatalf("expected open TCP port %d to be reported reachable, got %q", openPort, repOpen.PortStatus[openPort])
+	}
+
+	repClosed := checkExternalReachability("127.0.0.1", "127.0.0.1", DDNSConfig{}, []PortMapping{
+		{PublicPort: closedPort, TargetPort: closedPort, Proto: "tcp"},
+	}, 300*time.Millisecond)
+	if strings.HasPrefix(repClosed.PortStatus[closedPort], "reachable") {
+		t.Fatalf("expected closed TCP port %d to be reported unreachable, got %q", closedPort, repClosed.PortStatus[closedPort])
 	}
 }
