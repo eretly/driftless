@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	versionString = "v1.5.4"
+	versionString = "v1.5.5"
 	alpnProtocol  = "driftless-v1"
 	cmdAuth       = uint8(0)
 	cmdNewConn    = uint8(1)
@@ -610,6 +610,8 @@ func main() {
 	nodeIDFlag := flag.String("id", "", "unique node ID / computer name for this Agent when connecting multiple Home PCs to one VPS Gateway (e.g. pc1, media-pc)")
 	nodeAliasFlag := flag.String("node", "", "alias for -id (unique node ID / computer name for multi-agent Gateway routing)")
 	quicAddr := flag.String("quic", "0.0.0.0:4242", "gateway address or comma-separated failover list (e.g. VPS1:4242,VPS2:4242)")
+	gatewayAlias := flag.String("gateway", "", "alias for -quic (gateway address or comma-separated failover list)")
+	vps2Addr := flag.String("vps2", "", "optional second backup VPS gateway address for automatic failover (e.g. BACKUP_VPS_IP:4242)")
 	transportMode := flag.String("transport", "auto", "tunnel transport: 'auto' (QUIC with automatic TCP-Mux fallback), 'quic', or 'tcp'")
 	tokenFlag := flag.String("token", "", "shared secret tunnel password or comma-separated rotation list (auto-generated on server if omitted)")
 	tokenFile := flag.String("token-file", "", "path to file containing shared secret tunnel password")
@@ -619,6 +621,7 @@ func main() {
 	httpsAddr := flag.String("https", "", "optional HTTPS VHost router listen address (e.g. :443 or :8443)")
 	tlsCertFile := flag.String("tls-cert", "", "optional path to custom TLS certificate PEM file")
 	tlsKeyFile := flag.String("tls-key", "", "optional path to custom TLS private key PEM file")
+	domainShort := flag.String("domain", "", "custom domain to bind automatically with Auto-TLS (e.g. mysite.com or media.mysite.com:8096)")
 	vhostAddr := flag.String("vhost-addr", "", "optional HTTP/HTTPS Host router listen address (e.g. :80)")
 	vhosts := flag.String("vhosts", "", "comma-separated domain:LOCAL_PORT or domain:NODE_ID:LOCAL_PORT mappings (e.g. media.example.com:pc1:8096,site.example.com:pc2:3000)")
 	direct := flag.String("direct", ":8888", "direct LAN/WAN HTTP redirector listen address (empty to disable)")
@@ -643,7 +646,7 @@ func main() {
 	enableUPnP := flag.Bool("upnp", true, "automatically open ports on home router via UPnP IGD / NAT-PMP / PCP (standalone mode)")
 	stunServer := flag.String("stun", "stun.cloudflare.com:3478", "STUN server or comma-separated list for 5ms external IP change detection (standalone mode)")
 	stunInterval := flag.Duration("stun-interval", 1*time.Second, "how often to check external IP via STUN (standalone mode)")
-	duckShort := flag.String("duck", "", "shorthand DuckDNS 'subdomain:token' or update URL (saved automatically for next runs)")
+	duckShort := flag.String("duck", "", "automatic zero-config domain & DuckDNS sync (just pass -duck)")
 	ddnsProvider := flag.String("ddns-provider", "", "built-in Dynamic DNS provider: 'duckdns', 'cloudflare', or 'noip'")
 	ddnsDomain := flag.String("ddns-domain", "", "domain/subdomain to update when IP changes (e.g. myhome.duckdns.org)")
 	ddnsToken := flag.String("ddns-token", "", "API token or password for Dynamic DNS provider")
@@ -664,6 +667,29 @@ func main() {
 		}
 	}
 	flag.Parse()
+
+	if strings.TrimSpace(*gatewayAlias) != "" {
+		*quicAddr = strings.TrimSpace(*gatewayAlias)
+	}
+	if strings.TrimSpace(*vps2Addr) != "" {
+		second := strings.TrimSpace(*vps2Addr)
+		if !strings.Contains(second, ":") {
+			second += ":4242"
+		}
+		*quicAddr = strings.TrimSpace(*quicAddr) + "," + second
+	}
+	if d := strings.TrimSpace(*domainShort); d != "" {
+		*enableTLS = true
+		if strings.Contains(d, ":") {
+			if *vhosts == "" {
+				*vhosts = d
+			} else {
+				*vhosts = *vhosts + "," + d
+			}
+		} else if *ddnsDomain == "" {
+			*ddnsDomain = d
+		}
+	}
 
 	if runCheckCmd {
 		runInteractiveCheck(*stunServer, *host, *ports, *duckShort)

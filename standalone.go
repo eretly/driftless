@@ -1982,9 +1982,6 @@ func printStandaloneBanner(pubIP string, ddns DDNSConfig, mappings []PortMapping
 		log.Printf("[standalone]   %s", line)
 		fmt.Fprintf(&summary, "  %s\n", line)
 	}
-	if ddns.Provider == "" && ddns.Webhook == "" {
-		log.Printf("[standalone]   Tip: pass '-duck subdomain:YOUR_DUCKDNS_TOKEN' once (saved automatically; next time just '-duck')")
-	}
 	log.Printf("[standalone] ==========================================================")
 
 	saveDir := strings.TrimSpace(certDir)
