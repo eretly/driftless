@@ -24,45 +24,59 @@ When your ISP gives you a **dynamic public IPv4 address** (or places you behind 
 
 ### 1. Run Without a VPS (`standalone` + `-duck`)
 
-If your router receives a public IPv4 address from your ISP (even if it is dynamic), run on your PC:
+If your router receives a public IPv4 address from your ISP (even if it is dynamic), you have two ways to run with `-duck`:
 
+#### Option 1A: Zero-Config Instant Start (`-duck` without a token)
 **Windows (PowerShell):**
 ```powershell
 .\driftless-windows-amd64.exe standalone -ports 8096,3389,22 -duck
 ```
-
 **Linux / macOS:**
 ```bash
 ./driftless standalone -ports 8096,3389,22 -duck
 ```
+- If you previously saved a DuckDNS token, Driftless automatically reloads it from `.driftless-ddns.json`.
+- If no token is configured yet, Driftless binds a **temporary IP-based hostname** (`<ip>.sslip.io`, e.g. `198-51-100-42.sslip.io`) for immediate HTTPS/TLS access. *(Note: `sslip.io` embeds your current IP and changes if your ISP rotates your IP).*
+
+#### Option 1B: Permanent Free Domain via DuckDNS (`-duck SUBDOMAIN:TOKEN`)
+To get a **permanent** `*.duckdns.org` address that never changes when your ISP rotates your IP:
+1. Sign in at **[https://www.duckdns.org](https://www.duckdns.org)**, create a subdomain (for example `myhome`), and copy your **token** from the top of the page.
+2. Run Driftless **once** with `-duck myhome:YOUR_TOKEN`:
+   **Windows (PowerShell):**
+   ```powershell
+   .\driftless-windows-amd64.exe standalone -ports 8096,3389,22 -duck myhome:a1b2c3d4-e5f6-7890-abcd-ef1234567890
+   ```
+   **Linux / macOS:**
+   ```bash
+   ./driftless standalone -ports 8096,3389,22 -duck myhome:a1b2c3d4-e5f6-7890-abcd-ef1234567890
+   ```
+3. Driftless saves `myhome.duckdns.org` and your token to `.driftless-ddns.json` (mode `0600`) and updates your IP automatically. On all future starts, you only need `-duck` (or just `./driftless standalone -ports 8096,3389,22`) without typing the token again.
 
 **What happens automatically:**
 1. **UPnP / NAT-PMP / PCP** opens TCP and UDP ports `8096`, `3389`, and `22` on your home router and re-applies them automatically if the router reboots.
 2. **UDP STUN (`1s`)** detects your external IPv4 address and tracks any ISP IP rotation in real time.
-3. **`-duck` (Domain behavior):**
-   - **If a DuckDNS/DDNS configuration is saved** (in `.driftless-ddns.json`, `DRIFTLESS_DUCKDNS`, or `duckdns.txt`), Driftless updates your permanent `*.duckdns.org` domain whenever your IP changes.
-   - **If no DDNS token is configured**, Driftless binds a **temporary IP-based hostname** (`<ip>.sslip.io`, e.g. `198-51-100-42.sslip.io`) for immediate HTTPS/TLS access. Note: an `sslip.io` hostname embeds your current IP address and will change if your ISP assigns a new IP. For a permanent name that never changes, configure DuckDNS, Cloudflare, No-IP, or your own domain (see Section 2).
+3. **Domain & Auto-TLS:** updates your DuckDNS `A` record (`myhome.duckdns.org`) or binds `<ip>.sslip.io` and provisions TLS certificates automatically.
 
 **What you see in the console:**
 ```text
 [standalone] ==========================================================
-[standalone] Published Endpoints (Temporary IP-based hostname: 198-51-100-42.sslip.io [changes when ISP IP changes] | Public IP: 198.51.100.42):
-[standalone]   Port :8096  -> :8096  : https://198-51-100-42.sslip.io:8096  (TCP/UDP: 198-51-100-42.sslip.io:8096)
-[standalone]   Remote Desktop (RDP)  : 198-51-100-42.sslip.io:3389 (uses your Windows account credentials)
-[standalone]   SSH Service           : 198-51-100-42.sslip.io:22 (uses your system SSH server & OS credentials)
+[standalone] Published Endpoints (Domain [ddns (duckdns)]: myhome.duckdns.org | Public IP: 198.51.100.42):
+[standalone]   Port :8096  -> :8096  : https://myhome.duckdns.org:8096  (TCP/UDP: myhome.duckdns.org:8096)
+[standalone]   Remote Desktop (RDP)  : myhome.duckdns.org:3389 (uses your Windows account credentials)
+[standalone]   SSH Service           : myhome.duckdns.org:22 (uses your system SSH server & OS credentials)
 [standalone] ==========================================================
 ```
 
 **How to connect from anywhere (phone / laptop):**
-- **Browser / Jellyfin / Web App:** open `https://198-51-100-42.sslip.io:8096` (or your permanent DDNS/custom domain).
-- **SSH (Termius / WebSSH / terminal):** Host `198-51-100-42.sslip.io`, Port `22`, your OS username & password/key.
-- **Windows Remote Desktop (RDP):** Computer `198-51-100-42.sslip.io:3389`, your Windows username & password.
+- **Browser / Jellyfin / Web App:** open `https://myhome.duckdns.org:8096` (or `https://198-51-100-42.sslip.io:8096`).
+- **SSH (Termius / WebSSH / terminal):** Host `myhome.duckdns.org`, Port `22`, your OS username & password/key.
+- **Windows Remote Desktop (RDP):** Computer `myhome.duckdns.org:3389`, your Windows username & password.
 
 ---
 
 ### 2. Permanent Domains: Custom Domains (`-domain`, `-vhosts`) & Dynamic DNS
 
- Driftless separates three types of domains:
+Driftless separates three types of domains:
 1. **Temporary IP-based hostname (`sslip.io`):** generated when `-duck` is used without a DDNS provider; changes when your ISP IP changes.
 2. **Dynamic DNS domain (`duckdns`, `cloudflare`, `noip`, `-ddns-url`):** a permanent hostname automatically updated via DNS API whenever your ISP rotates your IP, persisted in `.driftless-ddns.json` across restarts.
 3. **Custom domain (`-domain`, `-vhosts`):** your own domain pointed to your VPS or home IP.
@@ -82,10 +96,13 @@ Point your domain's `A` record to your PC (or VPS) IP and pass `-domain`:
 ./driftless standalone -vhosts site.mysite.com:3000,media.mysite.com:8096 -vhost-addr :80 -https :443
 ```
 
-#### Option C: Permanent Dynamic DNS (Cloudflare / DuckDNS / No-IP)
+#### Option C: Permanent Dynamic DNS (DuckDNS / Cloudflare / No-IP)
 Settings are saved to `.driftless-ddns.json` (mode `0600`) and automatically restored on future restarts:
 ```bash
-# DuckDNS (saved on first run; subsequent restarts only need -duck)
+# DuckDNS shorthand (get your subdomain & token at https://www.duckdns.org)
+./driftless standalone -ports 8096 -duck myhome:YOUR_DUCKDNS_TOKEN
+
+# Or DuckDNS via explicit flags
 ./driftless standalone -ports 8096 -ddns-provider duckdns -ddns-domain myhome.duckdns.org -ddns-token YOUR_DUCKDNS_TOKEN
 
 # Cloudflare DNS API v4 (TTL=60s)
@@ -184,7 +201,7 @@ Driftless separates reachability into three distinct checks:
 | `-mode` | `"agent"` | Operating mode: `server` (`gateway`), `client` (`agent`), or `standalone` (`direct`, `p2p`) |
 | `-ports` | `"8080:80,8096:8096"` | Port mappings: `PORT`, `PUBLIC:LOCAL`, `PUBLIC:NODE_ID:LOCAL`, or `127.0.0.1:PUBLIC:LOCAL` (supports `/tcp`, `/udp`, `/both`, `/http`, `/https`) |
 | `-udp` | `true` | Forward both TCP and UDP by default on all mapped ports |
-| `-duck` | `""` | Reload saved DuckDNS/DDNS config or bind a temporary `<ip>.sslip.io` HTTPS hostname |
+| `-duck` | `""` | `-duck SUBDOMAIN:TOKEN` (free permanent `*.duckdns.org` domain from duckdns.org) or bare `-duck` (reload saved DDNS / temporary `<ip>.sslip.io` hostname) |
 | `-domain` | `""` | Bind your own custom domain with Auto-TLS (`-domain mysite.com` or `-domain media.mysite.com:8096`) |
 | `-vhosts` | `""` | Virtual Host domain routing (`domain:PORT` or `domain:NODE_ID:PORT`, e.g. `media.mysite.com:pc1:8096`) |
 | `-vhost-addr` | `""` (`:80` if vhosts) | HTTP/HTTPS VHost router listen address (e.g. `:80`) |
@@ -244,39 +261,53 @@ Driftless separates reachability into three distinct checks:
 
 ### 1. Запуск без ВПС (`standalone` + `-duck`)
 
-Если провайдер выдаёт роутеру публичный (пусть и динамический) IPv4-адрес, запустите на домашнем ПК:
+Если провайдер выдаёт роутеру публичный (пусть и динамический) IPv4-адрес, запустить программу с флагом `-duck` можно двумя способами:
 
+#### Вариант 1А: Быстрый старт без токена (`-duck`)
 **Windows (PowerShell):**
 ```powershell
 .\driftless-windows-amd64.exe standalone -ports 8096,3389,22 -duck
 ```
-
 **Linux / macOS:**
 ```bash
 ./driftless standalone -ports 8096,3389,22 -duck
 ```
+- Если вы уже сохраняли токен DuckDNS ранее, программа автоматически загрузит ваш постоянный домен из `.driftless-ddns.json`.
+- Если токен ещё не задан, программа создаст **временный IP-домен** вида `<ip>.sslip.io` (например, `198-51-100-42.sslip.io`) для быстрого входа по HTTPS/TLS. *(Обратите внимание: адрес `sslip.io` содержит текущий IP и изменится при смене IP провайдером).*
 
-**Что делает программа:**
-1. **UPnP / NAT-PMP / PCP** открывает порты `8096`, `3389` и `22` (TCP и UDP) на домашнем роутере и автоматически восстанавливает правила после перезагрузки роутера.
-2. **UDP STUN (`1s`)** определяет внешний IPv4-адрес и отслеживает его смену провайдером.
-3. **Флаг `-duck` (работа с доменом):**
-   - **Если ранее уже был настроен DuckDNS/DDNS** (сохранён в `.driftless-ddns.json`, переменной `DRIFTLESS_DUCKDNS` или файле `duckdns.txt`), программа загрузит сохранённый постоянный домен и обновит его IP.
-   - **Если токен DDNS не задан**, программа сформирует **временный IP-домен** вида `<ip>.sslip.io` (например, `198-51-100-42.sslip.io`) для работы HTTPS/TLS. Важно: домен `sslip.io` содержит в себе текущий IP-адрес и изменится, когда провайдер сменит ваш IP. Для постоянного доменного имени, которое не меняется при смене IP, используйте DuckDNS, Cloudflare, No-IP или собственный домен (см. раздел 2).
+#### Вариант 1Б: Постоянный бесплатный домен DuckDNS с токеном (`-duck ПОДДОМЕН:ТОКЕН`)
+Чтобы получить **постоянный** адрес `*.duckdns.org`, который никогда не меняется при смене вашего IP:
+1. Зайдите на сайт **[https://www.duckdns.org](https://www.duckdns.org)** (вход через GitHub / Google / Reddit), придумайте имя поддомена (например, `myhome`) и скопируйте ваш **token** вверху страницы.
+2. Запустите программу **один раз**, указав имя и токен через двоеточие `-duck myhome:ВАШ_ТОКЕН`:
+   **Windows (PowerShell):**
+   ```powershell
+   .\driftless-windows-amd64.exe standalone -ports 8096,3389,22 -duck myhome:a1b2c3d4-e5f6-7890-abcd-ef1234567890
+   ```
+   **Linux / macOS:**
+   ```bash
+   ./driftless standalone -ports 8096,3389,22 -duck myhome:a1b2c3d4-e5f6-7890-abcd-ef1234567890
+   ```
+3. Программа сохранит `myhome.duckdns.org` и токен в файл `.driftless-ddns.json` (права `0600`) и сразу обновит IP. При всех следующих запусках вводить токен заново не нужно: достаточно запускать с `-duck` (или просто `./driftless standalone -ports 8096,3389,22`).
+
+**Что делает программа автоматически:**
+1. **UPnP / NAT-PMP / PCP** открывает порты `8096`, `3389` и `22` (TCP и UDP) на домашнем роутере и восстанавливает правила после перезагрузки роутера.
+2. **UDP STUN (`1s`)** определяет внешний IPv4-адрес и каждую секунду отслеживает его смену провайдером.
+3. **Домен и Auto-TLS:** при каждой смене IP мгновенно обновляет `A`-запись вашего домена `myhome.duckdns.org` (или `<ip>.sslip.io`) и выпускает TLS-сертификат.
 
 **Что выводится в консоль:**
 ```text
 [standalone] ==========================================================
-[standalone] Published Endpoints (Temporary IP-based hostname: 198-51-100-42.sslip.io [changes when ISP IP changes] | Public IP: 198.51.100.42):
-[standalone]   Port :8096  -> :8096  : https://198-51-100-42.sslip.io:8096  (TCP/UDP: 198-51-100-42.sslip.io:8096)
-[standalone]   Remote Desktop (RDP)  : 198-51-100-42.sslip.io:3389 (uses your Windows account credentials)
-[standalone]   SSH Service           : 198-51-100-42.sslip.io:22 (uses your system SSH server & OS credentials)
+[standalone] Published Endpoints (Domain [ddns (duckdns)]: myhome.duckdns.org | Public IP: 198.51.100.42):
+[standalone]   Port :8096  -> :8096  : https://myhome.duckdns.org:8096  (TCP/UDP: myhome.duckdns.org:8096)
+[standalone]   Remote Desktop (RDP)  : myhome.duckdns.org:3389 (uses your Windows account credentials)
+[standalone]   SSH Service           : myhome.duckdns.org:22 (uses your system SSH server & OS credentials)
 [standalone] ==========================================================
 ```
 
 **Как подключаться с телефона или ноутбука:**
-- **Браузер / Jellyfin / Сайт:** откройте `https://198-51-100-42.sslip.io:8096` (или ваш постоянный домен).
-- **SSH (WebSSH / Termius на iPhone или Android):** Хост `198-51-100-42.sslip.io`, Порт `22`, ваш системный логин и пароль/ключ от Windows/Linux.
-- **Удалённый рабочий стол (Microsoft Remote Desktop):** Компьютер `198-51-100-42.sslip.io:3389`, ваша учётная запись Windows.
+- **Браузер / Jellyfin / Сайт:** откройте `https://myhome.duckdns.org:8096` (или `https://198-51-100-42.sslip.io:8096`).
+- **SSH (WebSSH / Termius на iPhone или Android):** Хост `myhome.duckdns.org`, Порт `22`, ваш системный логин и пароль/ключ от Windows/Linux.
+- **Удалённый рабочий стол (Microsoft Remote Desktop):** Компьютер `myhome.duckdns.org:3389`, ваша учётная запись Windows.
 
 ---
 
@@ -305,7 +336,10 @@ Driftless separates reachability into three distinct checks:
 #### Вариант В: Автообновление постоянного домена в DuckDNS, Cloudflare или No-IP
 Настройки сохраняются в `.driftless-ddns.json` и автоматически подхватываются при следующих запусках:
 ```bash
-# DuckDNS (достаточно указать токен один раз; при следующих запусках настройки восстановятся сами)
+# DuckDNS короткой командой (получите поддомен и токен на https://www.duckdns.org)
+./driftless standalone -ports 8096 -duck myhome:ТОКЕН_DUCKDNS
+
+# Или DuckDNS через отдельные флаги
 ./driftless standalone -ports 8096 -ddns-provider duckdns -ddns-domain myhome.duckdns.org -ddns-token ТОКЕН_DUCKDNS
 
 # Cloudflare (автоматически обновляет A-запись при смене IP провайдером, TTL=60s)
@@ -404,7 +438,7 @@ Driftless separates reachability into three distinct checks:
 | `-mode` | `"agent"` | Режим работы: `server` (`gateway`), `client` (`agent`) или `standalone` (`direct`, `p2p`) |
 | `-ports` | `"8080:80,8096:8096"` | Порты: `8096,25565`, `PUBLIC:LOCAL`, `PUBLIC:NODE_ID:LOCAL` или `127.0.0.1:PUBLIC:LOCAL` (суффиксы `/tcp`, `/udp`, `/both`, `/http`, `/https`) |
 | `-udp` | `true` | Включено по умолчанию: пробрасывает и TCP, и UDP на всех портах |
-| `-duck` | `""` | Подхватить сохранённый DuckDNS/DDNS или выдать временный IP-домен `<ip>.sslip.io` для HTTPS |
+| `-duck` | `""` | `-duck ПОДДОМЕН:ТОКЕН` (постоянный домен `*.duckdns.org` с сайта duckdns.org) или просто `-duck` (подхватить сохранённый DDNS / выдать временный `<ip>.sslip.io`) |
 | `-domain` | `""` | Привязать свой собственный домен с Auto-TLS (`-domain mysite.com` или `-domain media.mysite.com:8096`) |
 | `-vhosts` | `""` | Маршрутизация доменов (`домен:ПОРТ` или `домен:ID_ПК:ПОРТ`, например `media.mysite.com:pc1:8096`) |
 | `-vhost-addr` | `""` (`:80` при vhosts) | Порт приёма HTTP/HTTPS для доменного роутера (например, `:80`) |
