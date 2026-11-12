@@ -2781,10 +2781,16 @@ func TestProductionStopRestartPersistenceAndReachabilityCheck(t *testing.T) {
 		t.Fatalf("expected silent UDP service on :%d to report unconfirmed-udp rather than unreachable, got ExternalStatus=%q",
 			silentUDPPort, repWithProbe.ExternalStatus[silentUDPPort])
 	}
-	// Closed UDP port (ICMP port unreachable / connection refused) must report unreachable-from-internet
-	if !strings.HasPrefix(repWithProbe.ExternalStatus[closedUDPPort], "unreachable-from-internet") {
-		t.Fatalf("expected closed UDP port %d to report unreachable-from-internet, got ExternalStatus=%q",
-			closedUDPPort, repWithProbe.ExternalStatus[closedUDPPort])
+	// Closed UDP port: Linux delivers ICMP Port Unreachable (unreachable-from-internet), whereas Windows
+	// may suppress ICMP on UDP and time out (unconfirmed-udp). In both cases it must never be verified/reachable.
+	closedUDPExt := repWithProbe.ExternalStatus[closedUDPPort]
+	if !strings.HasPrefix(closedUDPExt, "unreachable-from-internet") && !strings.HasPrefix(closedUDPExt, "unconfirmed-udp") {
+		t.Fatalf("expected closed UDP port %d to report unreachable-from-internet or unconfirmed-udp, got ExternalStatus=%q",
+			closedUDPPort, closedUDPExt)
+	}
+	if strings.HasPrefix(repWithProbe.PortStatus[closedUDPPort], "reachable") {
+		t.Fatalf("expected closed UDP port %d PortStatus not to be reachable, got %q",
+			closedUDPPort, repWithProbe.PortStatus[closedUDPPort])
 	}
 
 	// 4c. Verify /probe SSRF & arbitrary third-party host scanning protection + Gateway token authentication
