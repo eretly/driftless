@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	versionString = "v1.5.6"
+	versionString = "v1.5.7"
 	alpnProtocol  = "driftless-v1"
 	cmdAuth       = uint8(0)
 	cmdNewConn    = uint8(1)

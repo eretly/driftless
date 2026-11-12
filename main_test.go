@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -50,17 +51,54 @@ func getFreePort(t *testing.T, network string) int {
 			port = l.Addr().(*net.TCPAddr).Port
 			_ = l.Close()
 		}
-		key := fmt.Sprintf("%s:%d", network, port)
+		// A gateway binds UDP (QUIC) and TCP (TLS-mux) on the same numeric port, so a
+		// port handed out for one protocol must be free for both, and the same number
+		// must never be reused for a second listener inside this test binary.
+		tcpKey := fmt.Sprintf("tcp:%d", port)
+		udpKey := fmt.Sprintf("udp:%d", port)
 		allocatedPortsMu.Lock()
-		if !allocatedPorts[key] {
-			allocatedPorts[key] = true
-			allocatedPortsMu.Unlock()
-			return port
+		taken := allocatedPorts[tcpKey] || allocatedPorts[udpKey]
+		if !taken {
+			allocatedPorts[tcpKey] = true
+			allocatedPorts[udpKey] = true
 		}
 		allocatedPortsMu.Unlock()
+		if taken {
+			continue
+		}
+		if !portBindable("tcp", port) || !portBindable("udp", port) {
+			continue
+		}
+		return port
 	}
 	t.Fatalf("failed to allocate unique free %s port", network)
 	return 0
+}
+
+// portBindable reports whether the numeric port can be bound for the given protocol
+// right now. Both the wildcard and the loopback address are probed because Windows
+// permits a specific-address bind alongside a wildcard bind, and a port still in
+// TIME_WAIT (very common on busy CI machines) rejects a fresh listener even though
+// the UDP probe that picked the number succeeded.
+func portBindable(network string, port int) bool {
+	if network == "tcp" {
+		for _, host := range []string{"0.0.0.0", "127.0.0.1"} {
+			l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
+			if err != nil {
+				return false
+			}
+			_ = l.Close()
+		}
+		return true
+	}
+	for _, host := range []string{"0.0.0.0", "127.0.0.1"} {
+		u, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(host), Port: port})
+		if err != nil {
+			return false
+		}
+		_ = u.Close()
+	}
+	return true
 }
 
 func waitForTCPListener(t *testing.T, addr string, timeout time.Duration) {
@@ -73,6 +111,32 @@ func waitForTCPListener(t *testing.T, addr string, timeout time.Duration) {
 			return
 		}
 		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for TCP listener at %s", addr)
+}
+
+// waitForTCPListenerOrGatewayExit waits until addr accepts TCP connections, but
+// fails fast with the real startup error if runGateway returned before binding.
+func waitForTCPListenerOrGatewayExit(t *testing.T, addr string, timeout time.Duration, gwErrCh <-chan error) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err == nil {
+			_ = c.Close()
+			return
+		}
+		select {
+		case gwErr := <-gwErrCh:
+			t.Fatalf("gateway exited before TCP listener at %s became ready: %v", addr, gwErr)
+		default:
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	select {
+	case gwErr := <-gwErrCh:
+		t.Fatalf("gateway exited before TCP listener at %s became ready: %v", addr, gwErr)
+	default:
 	}
 	t.Fatalf("timed out waiting for TCP listener at %s", addr)
 }
@@ -185,11 +249,12 @@ func TestEndToEndTCPUDPAndVHostWithAutoTLS(t *testing.T) {
 	quicAddr := fmt.Sprintf("127.0.0.1:%d", quicPort)
 	vhostAddr := fmt.Sprintf("127.0.0.1:%d", vhostListenPort)
 
+	gwErrCh := make(chan error, 1)
 	go func() {
-		_ = runGateway(ctx, quicAddr, "test-secret", "", vhostAddr, "", vhosts, mappings, 64*1024*1024, 4*1024*1024, 4*time.Second, 1*time.Second, 30*time.Second, "", "", "", false, false)
+		gwErrCh <- runGateway(ctx, quicAddr, "test-secret", "", vhostAddr, "", vhosts, mappings, 64*1024*1024, 4*1024*1024, 4*time.Second, 1*time.Second, 30*time.Second, "", "", "", false, false)
 	}()
 
-	waitForTCPListener(t, quicAddr, 5*time.Second)
+	waitForTCPListenerOrGatewayExit(t, quicAddr, 15*time.Second, gwErrCh)
 
 	go func() {
 		_ = runAgent(ctx, quicAddr, "127.0.0.1", "test-secret", "192.168.1.50", "", 4*1024*1024, 64*1024*1024, 4*time.Second, 1*time.Second, 30*time.Second, nil)
@@ -515,9 +580,11 @@ func TestMidStreamNetworkOutageAndIPChangeSessionRecovery(t *testing.T) {
 
 	// Use fast 500ms QUIC idle timeout so link drop + IP change triggers reconnect in < 1 second
 	go func() {
-		_ = runGateway(ctx, gwAddr, "resume-secret", "", "", "", nil, mappings, 64*1024*1024, 4*1024*1024, 500*time.Millisecond, 150*time.Millisecond, 30*time.Second, t.TempDir(), "", "", false, false)
+		if err := runGateway(ctx, gwAddr, "resume-secret", "", "", "", nil, mappings, 64*1024*1024, 4*1024*1024, 500*time.Millisecond, 150*time.Millisecond, 30*time.Second, t.TempDir(), "", "", false, false); err != nil {
+			log.Printf("[test] gateway on %s exited before shutdown: %v", gwAddr, err)
+		}
 	}()
-	waitForTCPListener(t, gwAddr, 5*time.Second)
+	waitForTCPListener(t, gwAddr, 15*time.Second)
 
 	go func() {
 		_ = runAgent(ctx, proxyAddr, "127.0.0.1", "resume-secret", "192.168.1.50", "", 4*1024*1024, 64*1024*1024, 500*time.Millisecond, 150*time.Millisecond, 30*time.Second, nil)
@@ -661,9 +728,11 @@ func TestTCPMuxFallbackAndTokenRotation(t *testing.T) {
 
 	// Gateway accepts both "new-rotated-tok" and "legacy-agent-tok"
 	go func() {
-		_ = runGateway(ctx, gwAddr, "new-rotated-tok,legacy-agent-tok", "", "", "", nil, mappings, 32*1024*1024, 4*1024*1024, 4*time.Second, 1*time.Second, 30*time.Second, t.TempDir(), "", "", false, false)
+		if err := runGateway(ctx, gwAddr, "new-rotated-tok,legacy-agent-tok", "", "", "", nil, mappings, 32*1024*1024, 4*1024*1024, 4*time.Second, 1*time.Second, 30*time.Second, t.TempDir(), "", "", false, false); err != nil {
+			log.Printf("[test] gateway on %s exited before shutdown: %v", gwAddr, err)
+		}
 	}()
-	waitForTCPListener(t, gwAddr, 5*time.Second)
+	waitForTCPListener(t, gwAddr, 15*time.Second)
 
 	// Agent connects using "legacy-agent-tok" over TCP-Mux transport and includes an unreachable first gateway to test failover
 	failoverAddrs := fmt.Sprintf("127.0.0.1:1,%s", gwAddr)
@@ -806,17 +875,21 @@ func TestHardeningMultiGatewayFailoverAndResourceLimits(t *testing.T) {
 	gw2Addr := fmt.Sprintf("127.0.0.1:%d", gw2Port)
 
 	go func() {
-		_ = runGateway(ctx1, gw1Addr, "ha-secret", "", "", "", nil, []PortMapping{
+		if err := runGateway(ctx1, gw1Addr, "ha-secret", "", "", "", nil, []PortMapping{
 			{PublicPort: uint16(gw1PubPort), TargetPort: uint16(tcpTargetPort), Proto: "tcp"},
-		}, 32*1024*1024, 4*1024*1024, 600*time.Millisecond, 150*time.Millisecond, 30*time.Second, t.TempDir(), "", "", false, false)
+		}, 32*1024*1024, 4*1024*1024, 600*time.Millisecond, 150*time.Millisecond, 30*time.Second, t.TempDir(), "", "", false, false); err != nil {
+			log.Printf("[test] gateway on %s exited before shutdown: %v", gw1Addr, err)
+		}
 	}()
 	go func() {
-		_ = runGateway(ctx2, gw2Addr, "ha-secret", "", "", "", nil, []PortMapping{
+		if err := runGateway(ctx2, gw2Addr, "ha-secret", "", "", "", nil, []PortMapping{
 			{PublicPort: uint16(gw2PubPort), TargetPort: uint16(tcpTargetPort), Proto: "tcp"},
-		}, 32*1024*1024, 4*1024*1024, 600*time.Millisecond, 150*time.Millisecond, 30*time.Second, t.TempDir(), "", "", false, false)
+		}, 32*1024*1024, 4*1024*1024, 600*time.Millisecond, 150*time.Millisecond, 30*time.Second, t.TempDir(), "", "", false, false); err != nil {
+			log.Printf("[test] gateway on %s exited before shutdown: %v", gw2Addr, err)
+		}
 	}()
-	waitForTCPListener(t, gw1Addr, 5*time.Second)
-	waitForTCPListener(t, gw2Addr, 5*time.Second)
+	waitForTCPListener(t, gw1Addr, 15*time.Second)
+	waitForTCPListener(t, gw2Addr, 15*time.Second)
 
 	go func() {
 		_ = runAgent(agentCtx, fmt.Sprintf("%s,%s", gw1Addr, gw2Addr), "127.0.0.1", "ha-secret", "192.168.1.90", "", 4*1024*1024, 32*1024*1024, 600*time.Millisecond, 150*time.Millisecond, 30*time.Second, nil)
@@ -1953,9 +2026,11 @@ func TestProductionChaosWANFlapsBackendRestartsAndRouterReboot(t *testing.T) {
 
 	certDir := t.TempDir()
 	go func() {
-		_ = runGateway(ctx, gwAddr, "chaos-secret-token", "", "", "", nil, mappings, 64*1024*1024, 8*1024*1024, 2*time.Second, 250*time.Millisecond, 30*time.Second, certDir, "", "", false, false)
+		if err := runGateway(ctx, gwAddr, "chaos-secret-token", "", "", "", nil, mappings, 64*1024*1024, 8*1024*1024, 2*time.Second, 250*time.Millisecond, 30*time.Second, certDir, "", "", false, false); err != nil {
+			log.Printf("[test] gateway on %s exited before shutdown: %v", gwAddr, err)
+		}
 	}()
-	waitForTCPListener(t, gwAddr, 5*time.Second)
+	waitForTCPListener(t, gwAddr, 15*time.Second)
 
 	go func() {
 		_ = runAgent(ctx, wanProxyLn.Addr().String(), "127.0.0.1", "chaos-secret-token", "192.168.1.50", "", 8*1024*1024, 64*1024*1024, 2*time.Second, 250*time.Millisecond, 30*time.Second, nil)
@@ -2176,7 +2251,7 @@ func TestMultiAgentSingleGatewayTCPUDPVHostsAndIsolation(t *testing.T) {
 	httpBindAddr := fmt.Sprintf("127.0.0.1:%d", gwHTTPPort)
 
 	go func() {
-		_ = runGateway(
+		if err := runGateway(
 			ctx,
 			gwAddr,
 			"multi-node-secret-token",
@@ -2195,12 +2270,14 @@ func TestMultiAgentSingleGatewayTCPUDPVHostsAndIsolation(t *testing.T) {
 			"",
 			false,
 			false,
-		)
+		); err != nil {
+			log.Printf("[test] gateway on %s exited before shutdown: %v", gwAddr, err)
+		}
 	}()
 
 	// Wait deterministically until Gateway's tunnel listener and HTTP VHost listener are actually ready
-	waitForTCPListener(t, gwAddr, 5*time.Second)
-	waitForTCPListener(t, httpBindAddr, 5*time.Second)
+	waitForTCPListener(t, gwAddr, 15*time.Second)
+	waitForTCPListener(t, httpBindAddr, 15*time.Second)
 
 	// Helper to query HTTP vhost through the shared Gateway HTTP port
 	checkVHost := func(hostHeader, path, wantSubstr string) error {
@@ -2477,7 +2554,7 @@ func TestProduction24x7WebsiteUnderLoadAndIPRotation(t *testing.T) {
 			binary.BigEndian.PutUint16(resp[0:2], 0x0101) // Binding Success Response
 			binary.BigEndian.PutUint16(resp[2:4], 12)     // Attribute length
 			binary.BigEndian.PutUint32(resp[4:8], 0x2112A442)
-			copy(resp[8:20], buf[8:20])                    // Echo 12-byte Transaction ID
+			copy(resp[8:20], buf[8:20])                     // Echo 12-byte Transaction ID
 			binary.BigEndian.PutUint16(resp[20:22], 0x0020) // XOR-MAPPED-ADDRESS
 			binary.BigEndian.PutUint16(resp[22:24], 8)
 			resp[24] = 0
@@ -2552,7 +2629,7 @@ func TestProduction24x7WebsiteUnderLoadAndIPRotation(t *testing.T) {
 	go func() {
 		doneStandalone <- runStandalone(ctx, cfg)
 	}()
-	waitForTCPListener(t, fmt.Sprintf("127.0.0.1:%d", pubSitePort), 5*time.Second)
+	waitForTCPListener(t, fmt.Sprintf("127.0.0.1:%d", pubSitePort), 15*time.Second)
 
 	// 4. Hammer the website with 16 concurrent workers while rotating the ISP WAN IP 3 times
 	var wg sync.WaitGroup
@@ -3171,3 +3248,119 @@ func TestV156AuditFixesCertDirDynuProtoBothAndEviction(t *testing.T) {
 	s.closeSession()
 }
 
+// getFreePort must never hand out a port number twice inside one test binary and must
+// only hand out numbers that are bindable for BOTH TCP and UDP, because a gateway binds
+// QUIC (UDP) and the agent TCP-mux fallback (TCP) on the same numeric port.
+func TestFreePortAllocatorReservesBothProtocols(t *testing.T) {
+	seen := make(map[int]bool)
+	for i := 0; i < 200; i++ {
+		network := "tcp"
+		if i%2 == 0 {
+			network = "udp"
+		}
+		port := getFreePort(t, network)
+		if seen[port] {
+			t.Fatalf("port %d handed out twice from %s allocation", port, network)
+		}
+		seen[port] = true
+		for _, host := range []string{"0.0.0.0", "127.0.0.1"} {
+			l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
+			if err != nil {
+				t.Fatalf("port %d from %s allocation is not TCP-bindable on %s: %v", port, network, host, err)
+			}
+			_ = l.Close()
+		}
+		u, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port})
+		if err != nil {
+			t.Fatalf("port %d from %s allocation is not UDP-bindable: %v", port, network, err)
+		}
+		_ = u.Close()
+	}
+}
+
+// A port number still held by a listener must be rejected by the allocator probe. This is
+// the class of Windows failure that made CI flake hard to read: the UDP probe picked a
+// number, the TCP side could not bind it, the TCP-mux error was swallowed, and the test
+// readiness wait ran into its timeout with no explanation. Both the wildcard and the
+// loopback address are probed because Windows permits a specific-address bind alongside a
+// wildcard bind, and Hyper-V/WinNAT reserved ranges (common on CI runners) reject binds
+// with WSAEACCES.
+func TestPortBindableRejectsHeldListener(t *testing.T) {
+	for _, host := range []string{"0.0.0.0", "127.0.0.1"} {
+		held, err := net.Listen("tcp", host+":0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		heldPort := held.Addr().(*net.TCPAddr).Port
+		if portBindable("tcp", heldPort) {
+			_ = held.Close()
+			t.Fatalf("portBindable accepted TCP port %d on %s that is actively held by a listener", heldPort, host)
+		}
+		_ = held.Close()
+		if !portBindable("tcp", heldPort) {
+			t.Fatalf("portBindable rejected TCP port %d on %s after the listener was closed", heldPort, host)
+		}
+	}
+}
+
+// If the TCP-mux bind cannot be satisfied the gateway must keep serving QUIC and say so
+// loudly instead of silently pretending both transports are up.
+func TestGatewayDegradesToQUICOnlyWhenTCPMuxPortBusy(t *testing.T) {
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	addr := fmt.Sprintf("127.0.0.1:%d", held.Addr().(*net.TCPAddr).Port)
+
+	logBuf := &lockedLogBuffer{}
+	prevWriter := log.Writer()
+	log.SetOutput(logBuf)
+	defer log.SetOutput(prevWriter)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runGateway(ctx, addr, "mux-conflict-token", "", "", "", nil, nil, 8*1024*1024, 1024*1024, time.Second, 200*time.Millisecond, 5*time.Second, t.TempDir(), "", "", false, false)
+	}()
+	select {
+	case gwErr := <-done:
+		cancel()
+		t.Fatalf("gateway exited instead of degrading to QUIC-only: %v", gwErr)
+	case <-time.After(3 * time.Second):
+	}
+	cancel()
+	select {
+	case gwErr := <-done:
+		if gwErr != nil {
+			t.Fatalf("gateway returned error on shutdown: %v", gwErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("gateway did not shut down after context cancel")
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, "TCP-Mux listener on "+addr+" unavailable") {
+		t.Fatalf("expected explicit TCP-Mux warning, got log:\n%s", out)
+	}
+	if !strings.Contains(out, "(QUIC, cert sha256:") {
+		t.Fatalf("expected transport label to report QUIC-only, got log:\n%s", out)
+	}
+}
+
+type lockedLogBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedLogBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedLogBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}

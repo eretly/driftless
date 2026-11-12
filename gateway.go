@@ -343,9 +343,15 @@ func runGateway(ctx context.Context, quicAddr, token, directHTTPAddr, vhostAddr,
 		}
 	}()
 
-	// Also listen on TCP (TLS-Mux) on the same address so agents behind UDP-blocking firewalls can fall back automatically
-	tcpMuxListener, tcpMuxErr := tls.Listen("tcp", quicAddr, tlsConf)
-	if tcpMuxErr == nil {
+	// Also listen on TCP (TLS-Mux) on the same address so agents behind UDP-blocking firewalls can fall back automatically.
+	// The bind can transiently fail on Windows when the TCP port is still held by a socket in TIME_WAIT or by another
+	// process that grabbed the number between the UDP probe and this bind, so retry briefly before degrading to QUIC-only.
+	tcpMuxEnabled := false
+	tcpMuxListener, tcpMuxErr := listenTCPMuxWithRetry(ctx, quicAddr, tlsConf)
+	if tcpMuxErr != nil {
+		log.Printf("[gateway] WARNING: TCP-Mux listener on %s unavailable (%v); agents can only connect over QUIC/UDP until restart", quicAddr, tcpMuxErr)
+	} else {
+		tcpMuxEnabled = true
 		defer tcpMuxListener.Close()
 		go func() {
 			<-ctx.Done()
@@ -405,7 +411,11 @@ func runGateway(ctx context.Context, quicAddr, token, directHTTPAddr, vhostAddr,
 		return fmt.Errorf("save client connect command file %s: %w", connectCmdPath, err)
 	}
 
-	log.Printf("[gateway] driftless %s listening on %s (QUIC+TCP-Mux, cert sha256: %s, auth=[token=valid, hidden, slots=%d])", versionString, quicAddr, fp[:16], len(tokList))
+	transportLabel := "QUIC"
+	if tcpMuxEnabled {
+		transportLabel = "QUIC+TCP-Mux"
+	}
+	log.Printf("[gateway] driftless %s listening on %s (%s, cert sha256: %s, auth=[token=valid, hidden, slots=%d])", versionString, quicAddr, transportLabel, fp[:16], len(tokList))
 	log.Printf("[gateway] ==========================================================")
 	if tryPrintInteractiveTerminalCommand(connectCmdLine) {
 		log.Printf("[gateway] Ready-to-copy command displayed on terminal (saved in %s; run './driftless show-token' anytime to view again)", connectCmdPath)
@@ -483,6 +493,27 @@ func (gw *Gateway) ensurePublicPortListeners(ctx context.Context, m PortMapping,
 	gw.portRoutes[m.PublicPort] = m
 	gw.mu.Unlock()
 	return nil
+}
+
+// listenTCPMuxWithRetry binds the TLS-mux (agent TCP fallback) listener, retrying briefly on
+// transient bind failures such as WSAEADDRINUSE from a socket still in TIME_WAIT.
+func listenTCPMuxWithRetry(ctx context.Context, addr string, tlsConf *tls.Config) (net.Listener, error) {
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+			}
+		}
+		l, err := tls.Listen("tcp", addr, tlsConf)
+		if err == nil {
+			return l, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 // tryPrintInteractiveTerminalCommand writes the ready-to-copy client command directly to the

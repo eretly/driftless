@@ -12,6 +12,7 @@ import (
 	mrand "math/rand"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -576,7 +577,7 @@ func (ag *Agent) handleUDPStream(sessID uint64, targetPort uint16, st TunnelStre
 				delete(ag.udpSessions, oldestID)
 			}
 		}
-		c, err := net.Dial("udp", fmt.Sprintf("%s:%d", ag.targetHost, targetPort))
+		c, err := net.Dial("udp", net.JoinHostPort(ag.targetHost, strconv.Itoa(int(targetPort))))
 		if err != nil {
 			ag.mu.Unlock()
 			_ = st.Close()
