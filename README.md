@@ -24,7 +24,7 @@ When your ISP gives you a **dynamic public IP** (or places you behind **CGNAT**)
 
 ### 1. Run Without a VPS (`standalone` + `-duck`)
 
-If your router has a dynamic public IP, run a single command on your PC. You do **not** need to paste tokens or configure your router manually:
+If your router has a dynamic public IP, run a single command on your PC:
 
 **Windows (PowerShell):**
 ```powershell
@@ -39,7 +39,7 @@ If your router has a dynamic public IP, run a single command on your PC. You do 
 **What happens automatically:**
 1. **UPnP / NAT-PMP / PCP** opens TCP and UDP ports `8096`, `3389`, and `22` on your home router.
 2. **UDP STUN (`1s`)** detects your external IP in 5 ms and tracks any ISP IP rotation in real time.
-3. **`-duck`** automatically binds an HTTPS domain (uses your saved DuckDNS config if present, or generates an automatic `<IP>.sslip.io` domain + TLS certificate on the fly).
+3. **`-duck`** automatically binds an HTTPS domain and updates it whenever your IP changes.
 
 **What you see in the console:**
 ```text
@@ -161,7 +161,7 @@ Test your external IP via STUN, check for ISP CGNAT (`100.64.0.0/10`), verify ro
 | `-mode` | `"agent"` | Operating mode: `server` (`gateway`), `client` (`agent`), or `standalone` (`direct`, `p2p`) |
 | `-ports` | `"8080:80,8096:8096"` | Port mappings: `PORT`, `PUBLIC:LOCAL`, `PUBLIC:NODE_ID:LOCAL`, or `127.0.0.1:PUBLIC:LOCAL` (supports `/tcp`, `/udp`, `/both`, `/http`, `/https`) |
 | `-udp` | `true` | Forward both TCP and UDP by default on all mapped ports |
-| `-duck` | `""` | Automatic zero-config domain & DuckDNS sync in standalone/server mode (just pass `-duck`) |
+| `-duck` | `""` | Automatic domain & dynamic IP sync in standalone/server mode |
 | `-domain` | `""` | Bind your own custom domain with Auto-TLS (`-domain mysite.com` or `-domain media.mysite.com:8096`) |
 | `-vhosts` | `""` | Virtual Host domain routing (`domain:PORT` or `domain:NODE_ID:PORT`, e.g. `media.mysite.com:pc1:8096`) |
 | `-vhost-addr` | `""` (`:80` if vhosts) | HTTP/HTTPS VHost router listen address (e.g. `:80`) |
@@ -220,7 +220,7 @@ Test your external IP via STUN, check for ISP CGNAT (`100.64.0.0/10`), verify ro
 
 ### 1. Запуск БЕЗ ВПС одной командой (`standalone` + `-duck`)
 
-Если дома «белый» (пусть и динамический) IP, просто запустите программу с флагом `-duck`. Никакие токены вводить в команду не нужно:
+Если дома «белый» (пусть и динамический) IP, запустите программу на своём ПК:
 
 **Windows (PowerShell):**
 ```powershell
@@ -235,7 +235,7 @@ Test your external IP via STUN, check for ISP CGNAT (`100.64.0.0/10`), verify ro
 **Что программа сделает сама за 1 секунду:**
 1. **UPnP / NAT-PMP / PCP** автоматически откроет порты `8096`, `3389` и `22` (TCP и UDP) на вашем роутере.
 2. **UDP STUN (`1s`)** за 5 мс узнает ваш внешний IP и будет каждую секунду следить за его сменой.
-3. **`-duck`** автоматически выдаст готовый HTTPS-домен (если в папке уже есть конфиг DuckDNS - подхватит его автоматически; если нет - мгновенно создаст домен `<ВАШ_IP>.sslip.io` и выпустит TLS-сертификат).
+3. **`-duck`** автоматически выдаст готовый HTTPS-домен и будет обновлять его при смене IP.
 
 **Что вы увидите в консоли:**
 ```text
@@ -357,7 +357,7 @@ Test your external IP via STUN, check for ISP CGNAT (`100.64.0.0/10`), verify ro
 | `-mode` | `"agent"` | Режим работы: `server` (`gateway`), `client` (`agent`) или `standalone` (`direct`, `p2p`) |
 | `-ports` | `"8080:80,8096:8096"` | Порты: можно коротко `8096,25565`, `PUBLIC:LOCAL`, `PUBLIC:NODE_ID:LOCAL` или `127.0.0.1:PUBLIC:LOCAL` (суффиксы `/tcp`, `/udp`, `/both`, `/http`, `/https`) |
 | `-udp` | `true` | Включено по умолчанию: пробрасывает сразу и TCP, и UDP на всех портах |
-| `-duck` | `""` | Автоматический домен и обновление IP без возни с токенами (просто укажите `-duck`) |
+| `-duck` | `""` | Автоматический домен и обновление IP при смене адреса провайдером |
 | `-domain` | `""` | Привязать свой собственный домен с Auto-TLS (`-domain mysite.com` или `-domain media.mysite.com:8096`) |
 | `-vhosts` | `""` | Маршрутизация доменов (`домен:ПОРТ` или `домен:ID_ПК:ПОРТ`, например `media.mysite.com:pc1:8096`) |
 | `-vhost-addr` | `""` (`:80` при vhosts) | Порт приёма HTTP/HTTPS для доменного роутера (например, `:80`) |
