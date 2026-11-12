@@ -167,13 +167,15 @@ Driftless separates reachability into three distinct checks:
 
 **Why local hairpin checks are not enough:** Dialing your own public IP from inside the same LAN (NAT hairpinning) often succeeds on the local router even when the ISP blocks inbound connections from the internet. Therefore:
 - Without `-probe-url`, Driftless **never** claims a port is reachable from the internet based on a local dial; it reports `unverified-from-internet` (`не удалось проверить извне`).
-- Every Driftless Gateway (`driftless server`) exposes an external probe endpoint on its `-direct` HTTP port (`http://VPS_IP:8888/probe`). Passing `-probe-url http://VPS_IP:8888/probe` performs a real external TCP dial and a bidirectional UDP probe (`DRIFTLESS-UDP-PROBE` / `DRIFTLESS-UDP-PONG`) from outside your network:
+- Every Driftless Gateway (`driftless server`) exposes a protected external probe endpoint on its `-direct` HTTP port (`http://VPS_IP:8888/probe`):
+  - **Security & SSRF Protection:** `/probe` requires a valid Gateway token (`-token` / `Authorization: Bearer` / `?token=...`) or an authenticated Agent session, blocks all private/link-local/CGNAT addresses, and only checks the caller's own public IP (or registered Agent IP) so it can never be abused to scan third-party hosts.
+  - **UDP 3-State Classification:** distinguishes between a confirmed UDP reply (`verified-from-internet`), a closed UDP port (`unreachable-from-internet` on ICMP Port Unreachable / `connection refused`), and an ordinary silent UDP service that ignores generic probes (`unconfirmed-udp` / `open|silent`), since absence of a reply from a protocol-specific UDP service does not mean the port is closed.
 ```bash
 # Local + router check (reports external_status as unverified-from-internet)
 ./driftless check -ports 8096,25565,22 -duck
 
-# Full external internet verification via an independent probe endpoint
-./driftless check -ports 8096,25565,22 -probe-url http://YOUR_VPS_IP:8888/probe
+# Full external internet verification via an authenticated Gateway probe endpoint
+./driftless check -ports 8096,25565,22 -probe-url http://YOUR_VPS_IP:8888/probe -token YOUR_VPS_TOKEN
 ```
 
 ### 5. Known Limitations & Unsupported Scenarios
@@ -404,13 +406,15 @@ Driftless separates reachability into three distinct checks:
 
 **Почему локальное подключение к своему публичному IP не считается доказательством:** подключение из домашней сети к собственному внешнему IP (NAT hairpinning) часто проходит внутри домашнего роутера даже тогда, когда провайдер блокирует входящие соединения из интернета. Поэтому:
 - Без внешнего probe-сервера Driftless **не выдаёт** локальную проверку за интернет-доступность и честно возвращает статус `unverified-from-internet` (`не удалось проверить извне`).
-- Для реальной внешней проверки TCP и UDP (с подтверждением ответа `DRIFTLESS-UDP-PROBE` / `DRIFTLESS-UDP-PONG`) укажите `-probe-url http://IP_ВАШЕГО_ВПС:8888/probe` (эндпоинт `/probe` встроен в каждый `driftless server` на порту `-direct`):
+- Для реальной внешней проверки TCP и UDP укажите `-probe-url http://IP_ВАШЕГО_ВПС:8888/probe -token ВАШ_ТОКЕН` (эндпоинт `/probe` встроен в каждый `driftless server` на порту `-direct`):
+  - **Защита `/probe` от сканирования и SSRF:** на Gateway эндпоинт `/probe` требует токен (`-token`, заголовок `Authorization: Bearer` или `?token=...`) либо активную сессию авторизованного агента, жестко блокирует локальные/частные/CGNAT-сети и разрешает проверять только собственный внешний IP вызывающего клиента (или зарегистрированного агента), исключая использование ВПС для сканирования чужих адресов.
+  - **Трёхстадийная оценка UDP (`confirmed` / `open|silent` / `closed`):** если UDP-сервис отвечает на пробник (или работает через UDP-прокси Driftless), возвращается `verified-from-internet`; если ОС явно вернула `connection refused` (ICMP Port Unreachable), возвращается `closed` / `unreachable-from-internet`; если обычный UDP-сервис ждёт специфичный пакет протокола и молча игнорирует неизвестные датаграммы, выводится честный статус `open|silent` / `unconfirmed-udp` (отсутствие ответа по UDP само по себе не означает, что порт закрыт).
 ```bash
 # Проверка локального сервиса, CGNAT и правил роутера (внешний статус: не удалось проверить извне)
 ./driftless check -ports 8096,25565,22 -duck
 
-# Независимая проверка реальной доступности TCP и UDP извне через внешний узел
-./driftless check -ports 8096,25565,22 -probe-url http://IP_ВАШЕГО_ВПС:8888/probe
+# Независимая проверка реальной доступности TCP и UDP извне через защищённый эндпоинт ВПС
+./driftless check -ports 8096,25565,22 -probe-url http://IP_ВАШЕГО_ВПС:8888/probe -token ВАШ_ТОКЕН_ВПС
 ```
 
 ### 5. Ограничения и неподдерживаемые сценарии

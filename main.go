@@ -73,6 +73,7 @@ var (
 	defaultAgentVHosts      []VHostRoute
 	defaultVHostNodeMap     = make(map[string]string)
 	defaultExternalProbeURL string
+	defaultProbeAuthToken   string
 	lastAgentAuthConflict   atomic.Value
 
 	chunkBufPool = sync.Pool{
@@ -694,6 +695,12 @@ func main() {
 		}
 	}
 	defaultExternalProbeURL = strings.TrimSpace(*probeURL)
+	defaultProbeAuthToken = strings.TrimSpace(*tokenFlag)
+	if defaultProbeAuthToken == "" && strings.TrimSpace(*tokenFile) != "" {
+		if b, err := os.ReadFile(strings.TrimSpace(*tokenFile)); err == nil {
+			defaultProbeAuthToken = strings.TrimSpace(string(b))
+		}
+	}
 
 	if runCheckCmd {
 		runInteractiveCheck(*stunServer, *host, *ports, *duckShort, defaultExternalProbeURL)

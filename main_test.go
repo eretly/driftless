@@ -2702,12 +2702,23 @@ func TestProductionStopRestartPersistenceAndReachabilityCheck(t *testing.T) {
 		t.Fatalf("startStandaloneUDP failed: %v", err)
 	}
 
+	// Also start a silent UDP service (ordinary UDP server that reads datagrams without replying to generic probes)
+	silentUDPAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	silentUDPConn, err := net.ListenUDP("udp", silentUDPAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silentUDPConn.Close()
+	silentUDPPort := uint16(silentUDPConn.LocalAddr().(*net.UDPAddr).Port)
+	closedUDPPort := uint16(getFreePort(t, "udp"))
+
 	// 4a. Without external probe (-probe-url=""), checkExternalReachability must report local service OK
 	// but explicitly mark ExternalStatus as "unverified-from-internet" ("не удалось проверить извне")
 	repNoProbe := checkExternalReachabilityWithProbe("127.0.0.1", "127.0.0.1", DDNSConfig{}, []PortMapping{
 		{PublicPort: openPort, TargetPort: openPort, Proto: "tcp"},
 		{PublicPort: openUDPPort, TargetPort: udpTargetPort, Proto: "udp", RouterUDPPort: openUDPPort},
-	}, "", 500*time.Millisecond)
+		{PublicPort: silentUDPPort, TargetPort: silentUDPPort, Proto: "udp"},
+	}, "", 250*time.Millisecond)
 	if repNoProbe.ExternalProbeUsed {
 		t.Fatalf("expected ExternalProbeUsed=false when probeURL is empty")
 	}
@@ -2721,10 +2732,16 @@ func TestProductionStopRestartPersistenceAndReachabilityCheck(t *testing.T) {
 	if !strings.Contains(repNoProbe.ExternalStatus[openUDPPort], "unverified-from-internet") {
 		t.Fatalf("expected UDP port without probe to report unverified-from-internet, got %q", repNoProbe.ExternalStatus[openUDPPort])
 	}
+	if !strings.HasPrefix(repNoProbe.LocalServiceStatus[silentUDPPort], "open|silent") {
+		t.Fatalf("expected silent UDP service on :%d to report open|silent locally, got %q", silentUDPPort, repNoProbe.LocalServiceStatus[silentUDPPort])
+	}
 
-	// 4b. With an independent external probe server (handleExternalProbeHTTP), TCP and UDP (with response confirmation) are verified
+	// 4b. With an independent external probe server (handleExternalProbeHTTP), TCP and UDP (confirmed, silent, and closed) are accurately classified
 	probeMux := http.NewServeMux()
 	probeMux.HandleFunc("/probe", handleExternalProbeHTTP)
+	probeMux.HandleFunc("/gw-probe", func(w http.ResponseWriter, r *http.Request) {
+		serveExternalProbeHTTP(w, r, []string{"gw-probe-secret-token"}, nil, true)
+	})
 	probeSrv := &http.Server{Handler: probeMux}
 	probeLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -2734,12 +2751,15 @@ func TestProductionStopRestartPersistenceAndReachabilityCheck(t *testing.T) {
 	go func() { _ = probeSrv.Serve(probeLn) }()
 	defer probeSrv.Close()
 	probeURL := fmt.Sprintf("http://%s/probe", probeLn.Addr().String())
+	gwProbeURL := fmt.Sprintf("http://%s/gw-probe", probeLn.Addr().String())
 
 	repWithProbe := checkExternalReachabilityWithProbe("127.0.0.1", "127.0.0.1", DDNSConfig{}, []PortMapping{
 		{PublicPort: openPort, TargetPort: openPort, Proto: "tcp"},
 		{PublicPort: closedPort, TargetPort: closedPort, Proto: "tcp"},
 		{PublicPort: openUDPPort, TargetPort: udpTargetPort, Proto: "udp", RouterUDPPort: openUDPPort},
-	}, probeURL, 500*time.Millisecond)
+		{PublicPort: silentUDPPort, TargetPort: silentUDPPort, Proto: "udp"},
+		{PublicPort: closedUDPPort, TargetPort: closedUDPPort, Proto: "udp"},
+	}, probeURL, 250*time.Millisecond)
 
 	if !repWithProbe.ExternalProbeUsed {
 		t.Fatalf("expected ExternalProbeUsed=true when probeURL is provided")
@@ -2755,6 +2775,49 @@ func TestProductionStopRestartPersistenceAndReachabilityCheck(t *testing.T) {
 	if !strings.HasPrefix(repWithProbe.ExternalStatus[openUDPPort], "verified-from-internet") || !strings.HasPrefix(repWithProbe.PortStatus[openUDPPort], "reachable") {
 		t.Fatalf("expected open UDP port %d with external probe response confirmation to be verified-from-internet, got ExternalStatus=%q PortStatus=%q",
 			openUDPPort, repWithProbe.ExternalStatus[openUDPPort], repWithProbe.PortStatus[openUDPPort])
+	}
+	// Ordinary silent UDP service must report unconfirmed-udp rather than unreachable-from-internet
+	if !strings.HasPrefix(repWithProbe.ExternalStatus[silentUDPPort], "unconfirmed-udp") {
+		t.Fatalf("expected silent UDP service on :%d to report unconfirmed-udp rather than unreachable, got ExternalStatus=%q",
+			silentUDPPort, repWithProbe.ExternalStatus[silentUDPPort])
+	}
+	// Closed UDP port (ICMP port unreachable / connection refused) must report unreachable-from-internet
+	if !strings.HasPrefix(repWithProbe.ExternalStatus[closedUDPPort], "unreachable-from-internet") {
+		t.Fatalf("expected closed UDP port %d to report unreachable-from-internet, got ExternalStatus=%q",
+			closedUDPPort, repWithProbe.ExternalStatus[closedUDPPort])
+	}
+
+	// 4c. Verify /probe SSRF & arbitrary third-party host scanning protection + Gateway token authentication
+	httpClient := &http.Client{Timeout: 2 * time.Second}
+	for _, forbiddenHost := range []string{"10.0.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "8.8.8.8"} {
+		resp, err := httpClient.Get(fmt.Sprintf("%s?proto=tcp&host=%s&port=%d", probeURL, forbiddenHost, openPort))
+		if err != nil {
+			t.Fatalf("probe request for forbidden host %s failed: %v", forbiddenHost, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected /probe to reject target host %s with 403 Forbidden, got HTTP %d", forbiddenHost, resp.StatusCode)
+		}
+	}
+
+	// Gateway /gw-probe must reject unauthenticated or wrong-token requests with 401 Unauthorized
+	unauthResp, err := httpClient.Get(fmt.Sprintf("%s?proto=tcp&host=127.0.0.1&port=%d", gwProbeURL, openPort))
+	if err != nil {
+		t.Fatalf("unauthenticated gw-probe request failed: %v", err)
+	}
+	_ = unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected unauthenticated Gateway /probe request to return 401 Unauthorized, got HTTP %d", unauthResp.StatusCode)
+	}
+
+	// Gateway /gw-probe with valid token and caller-owned IP succeeds
+	authResp, err := httpClient.Get(fmt.Sprintf("%s?proto=tcp&host=127.0.0.1&port=%d&token=gw-probe-secret-token", gwProbeURL, openPort))
+	if err != nil {
+		t.Fatalf("authenticated gw-probe request failed: %v", err)
+	}
+	_ = authResp.Body.Close()
+	if authResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected authenticated Gateway /probe request for caller IP to return 200 OK, got HTTP %d", authResp.StatusCode)
 	}
 }
 

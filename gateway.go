@@ -1301,6 +1301,25 @@ func (gw *Gateway) flushUDPSessionToAgent(agent TunnelConn, us *gwUDPSession) {
 	go gw.readUDPFromAgentStream(us, newSt)
 }
 
+func (gw *Gateway) handleProbeHTTP(w http.ResponseWriter, r *http.Request) {
+	gw.mu.RLock()
+	tokens := append([]string(nil), gw.tokens...)
+	if len(tokens) == 0 && gw.token != "" {
+		tokens = []string{gw.token}
+	}
+	var agentIPs []string
+	if gw.agentPubIP != "" {
+		agentIPs = append(agentIPs, gw.agentPubIP)
+	}
+	for _, ag := range gw.agents {
+		if ag != nil && ag.conn != nil && ag.pubIP != "" {
+			agentIPs = append(agentIPs, ag.pubIP)
+		}
+	}
+	gw.mu.RUnlock()
+	serveExternalProbeHTTP(w, r, tokens, agentIPs, true)
+}
+
 func (gw *Gateway) startDirectRedirector(ctx context.Context, listenAddr string, mappings []PortMapping, sameLAN bool) {
 	defaultTargetPort := uint16(8096)
 	defaultScheme := "http"
@@ -1315,7 +1334,7 @@ func (gw *Gateway) startDirectRedirector(ctx context.Context, listenAddr string,
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/probe", handleExternalProbeHTTP)
+	mux.HandleFunc("/probe", gw.handleProbeHTTP)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		nodeParam := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("node")))
 		gw.mu.RLock()

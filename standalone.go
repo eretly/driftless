@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
@@ -1966,20 +1967,119 @@ type ExternalProbeResponse struct {
 	Target    string `json:"target"`
 	Reachable bool   `json:"reachable"`
 	Confirmed bool   `json:"confirmed"`
+	Status    string `json:"status,omitempty"`
 	Error     string `json:"error,omitempty"`
 }
 
-// handleExternalProbeHTTP serves GET /probe?proto=tcp|udp&host=IP&port=PORT on a remote VPS Gateway
-// so standalone nodes or `driftless check -probe-url` can perform a true external reachability test
-// from outside the home LAN instead of relying on local NAT hairpinning.
+type UDPProbeStatus string
+
+const (
+	UDPProbeConfirmed  UDPProbeStatus = "confirmed"
+	UDPProbeNoResponse UDPProbeStatus = "no-response"
+	UDPProbeRefused    UDPProbeStatus = "refused"
+)
+
+func extractProbeRequestToken(r *http.Request) string {
+	if auth := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	if hdr := strings.TrimSpace(r.Header.Get("X-Driftless-Token")); hdr != "" {
+		return hdr
+	}
+	if u := r.URL.User; u != nil {
+		if pass, ok := u.Password(); ok && pass != "" {
+			return pass
+		}
+		if u.Username() != "" {
+			return u.Username()
+		}
+	}
+	return strings.TrimSpace(r.URL.Query().Get("token"))
+}
+
+func isForbiddenProbeTargetIP(targetIP, callerIP net.IP) (bool, string) {
+	if targetIP == nil {
+		return true, "invalid target IP"
+	}
+	if targetIP.IsUnspecified() || targetIP.IsMulticast() || targetIP.IsLinkLocalUnicast() || targetIP.IsLinkLocalMulticast() {
+		return true, "probing unspecified, link-local, or multicast addresses is forbidden"
+	}
+	// Block private RFC1918, CGNAT (100.64.0.0/10), and IPv6 ULA (fc00::/7) unconditionally to prevent SSRF
+	if targetIP.IsPrivate() {
+		return true, "probing private network addresses is forbidden (SSRF protection)"
+	}
+	if ip4 := targetIP.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+		return true, "probing CGNAT shared address space is forbidden"
+	}
+	// Loopback (127.0.0.1 / ::1) is only permitted when the caller itself is on loopback
+	if targetIP.IsLoopback() && (callerIP == nil || !callerIP.IsLoopback()) {
+		return true, "probing loopback from a non-loopback client is forbidden"
+	}
+	return false, ""
+}
+
+// handleExternalProbeHTTP serves GET /probe?proto=tcp|udp&host=IP&port=PORT with strict target-IP
+// validation (caller-IP binding + SSRF blocklist) and optional token authentication.
 func handleExternalProbeHTTP(w http.ResponseWriter, r *http.Request) {
+	var allowedTokens []string
+	if tok := strings.TrimSpace(defaultProbeAuthToken); tok != "" {
+		allowedTokens = parseTokensList(tok)
+	}
+	serveExternalProbeHTTP(w, r, allowedTokens, nil, len(allowedTokens) > 0)
+}
+
+func serveExternalProbeHTTP(w http.ResponseWriter, r *http.Request, allowedTokens []string, registeredAgentIPs []string, requireAuth bool) {
+	w.Header().Set("Content-Type", "application/json")
 	proto := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("proto")))
 	if proto == "" {
 		proto = "tcp"
 	}
+
+	callerHost, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		callerHost = strings.TrimSpace(r.RemoteAddr)
+	}
+	callerIP := net.ParseIP(callerHost)
+
+	reqToken := extractProbeRequestToken(r)
+	tokenMatched := false
+	for _, tok := range allowedTokens {
+		if tok != "" && subtle.ConstantTimeCompare([]byte(reqToken), []byte(tok)) == 1 {
+			tokenMatched = true
+		}
+	}
+	callerIsRegisteredAgent := false
+	for _, agIP := range registeredAgentIPs {
+		if agIP != "" && agIP == callerHost {
+			callerIsRegisteredAgent = true
+			break
+		}
+	}
+
+	// If a token was explicitly supplied in the request and allowedTokens is configured, it must be valid
+	if reqToken != "" && len(allowedTokens) > 0 && !tokenMatched {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(ExternalProbeResponse{
+			Proto:     proto,
+			Reachable: false,
+			Error:     "unauthorized: invalid probe token",
+		})
+		return
+	}
+	// On a Gateway (requireAuth=true), require either a valid token or a registered authenticated Agent caller IP
+	if requireAuth && len(allowedTokens) > 0 && !tokenMatched && !callerIsRegisteredAgent {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(ExternalProbeResponse{
+			Proto:     proto,
+			Reachable: false,
+			Error:     "unauthorized: valid gateway token or authenticated agent session required for /probe",
+		})
+		return
+	}
+
 	host := strings.TrimSpace(r.URL.Query().Get("host"))
 	if host == "" {
-		host, _, _ = net.SplitHostPort(r.RemoteAddr)
+		host = callerHost
 	}
 	portStr := strings.TrimSpace(r.URL.Query().Get("port"))
 	port, err := strconv.Atoi(portStr)
@@ -1993,20 +2093,76 @@ func handleExternalProbeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	targetIP := net.ParseIP(host)
+	if targetIP == nil {
+		ips, lErr := net.LookupIP(host)
+		if lErr != nil || len(ips) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(ExternalProbeResponse{
+				Proto:     proto,
+				Target:    fmt.Sprintf("%s:%d", host, port),
+				Reachable: false,
+				Error:     "could not resolve target host",
+			})
+			return
+		}
+		targetIP = ips[0]
+		for _, cand := range ips {
+			if cand.To4() != nil {
+				targetIP = cand
+				break
+			}
+		}
+	}
+
+	// Enforce SSRF & reserved-address protection
+	if forbidden, reason := isForbiddenProbeTargetIP(targetIP, callerIP); forbidden {
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(ExternalProbeResponse{
+			Proto:     proto,
+			Target:    net.JoinHostPort(targetIP.String(), strconv.Itoa(port)),
+			Reachable: false,
+			Error:     "forbidden target address: " + reason,
+		})
+		return
+	}
+
+	// Enforce caller-IP / registered-agent-IP ownership so /probe can never be used to scan third-party hosts
+	allowedTarget := callerIP != nil && targetIP.Equal(callerIP)
+	if !allowedTarget {
+		for _, agIP := range registeredAgentIPs {
+			if parsedAg := net.ParseIP(agIP); parsedAg != nil && targetIP.Equal(parsedAg) {
+				allowedTarget = true
+				break
+			}
+		}
+	}
+	if !allowedTarget {
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(ExternalProbeResponse{
+			Proto:     proto,
+			Target:    net.JoinHostPort(targetIP.String(), strconv.Itoa(port)),
+			Reachable: false,
+			Error:     "forbidden target address: /probe only checks the caller's own IP or a registered agent IP",
+		})
+		return
+	}
+
 	timeout := 1500 * time.Millisecond
 	if tMs, err := strconv.Atoi(r.URL.Query().Get("timeout_ms")); err == nil && tMs >= 100 && tMs <= 5000 {
 		timeout = time.Duration(tMs) * time.Millisecond
 	}
-	target := net.JoinHostPort(host, strconv.Itoa(port))
-	w.Header().Set("Content-Type", "application/json")
+	target := net.JoinHostPort(targetIP.String(), strconv.Itoa(port))
 
 	if proto == "udp" {
-		ok, err := probeUDPWithConfirmation(target, timeout)
+		udpStatus, err := probeUDPStatus(target, timeout)
 		resp := ExternalProbeResponse{
 			Proto:     "udp",
 			Target:    target,
-			Reachable: ok,
-			Confirmed: ok,
+			Reachable: udpStatus == UDPProbeConfirmed,
+			Confirmed: udpStatus == UDPProbeConfirmed,
+			Status:    string(udpStatus),
 		}
 		if err != nil {
 			resp.Error = err.Error()
@@ -2022,6 +2178,7 @@ func handleExternalProbeHTTP(w http.ResponseWriter, r *http.Request) {
 			Target:    target,
 			Reachable: false,
 			Confirmed: false,
+			Status:    "refused",
 			Error:     err.Error(),
 		})
 		return
@@ -2032,22 +2189,37 @@ func handleExternalProbeHTTP(w http.ResponseWriter, r *http.Request) {
 		Target:    target,
 		Reachable: true,
 		Confirmed: true,
+		Status:    "confirmed",
 	})
 }
 
-// probeUDPWithConfirmation sends a UDP probe packet and waits for a verified response (either a Driftless
-// UDP probe pong or an application-level datagram reply) to confirm bidirectional UDP reachability.
-func probeUDPWithConfirmation(targetAddr string, timeout time.Duration) (bool, error) {
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// probeUDPStatus sends a UDP probe packet and classifies the outcome into three states:
+// 1. UDPProbeConfirmed ("confirmed"): received a verified UDP reply (Driftless pong or application datagram).
+// 2. UDPProbeNoResponse ("no-response"): datagram sent without ICMP error, but read timed out (note: ordinary
+//    silent UDP services that require a protocol-specific handshake may not reply even when the port is open).
+// 3. UDPProbeRefused ("refused"): OS/ICMP explicitly rejected the packet (e.g. ECONNREFUSED / port closed).
+func probeUDPStatus(targetAddr string, timeout time.Duration) (UDPProbeStatus, error) {
 	if timeout <= 0 {
 		timeout = 1200 * time.Millisecond
 	}
 	raddr, err := net.ResolveUDPAddr("udp", targetAddr)
 	if err != nil {
-		return false, err
+		return UDPProbeRefused, err
 	}
 	conn, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
-		return false, err
+		return UDPProbeRefused, err
 	}
 	defer conn.Close()
 
@@ -2058,27 +2230,40 @@ func probeUDPWithConfirmation(targetAddr string, timeout time.Duration) (bool, e
 
 	_ = conn.SetDeadline(time.Now().Add(timeout))
 	if _, err := conn.Write(payload); err != nil {
-		return false, err
+		if isTimeoutError(err) {
+			return UDPProbeNoResponse, err
+		}
+		return UDPProbeRefused, err
 	}
 	buf := make([]byte, 256)
 	n, err := conn.Read(buf)
 	if err != nil {
-		return false, err
+		if isTimeoutError(err) {
+			return UDPProbeNoResponse, errors.New("no UDP response within timeout (target UDP service may ignore generic probes, or packets are filtered)")
+		}
+		return UDPProbeRefused, err
 	}
 	if n == 0 {
-		return false, errors.New("empty UDP response")
+		return UDPProbeNoResponse, errors.New("empty UDP response")
 	}
 	respStr := string(buf[:n])
 	if strings.HasPrefix(respStr, udpProbeRespPrefix) && strings.TrimPrefix(respStr, udpProbeRespPrefix) != nonce {
-		return false, errors.New("mismatched UDP probe nonce")
+		return UDPProbeRefused, errors.New("mismatched UDP probe nonce")
 	}
-	return true, nil
+	return UDPProbeConfirmed, nil
 }
 
-func queryExternalProbeEndpoint(probeURL, proto, host string, port uint16, timeout time.Duration) (bool, error) {
+// probeUDPWithConfirmation sends a UDP probe packet and waits for a verified response (either a Driftless
+// UDP probe pong or an application-level datagram reply) to confirm bidirectional UDP reachability.
+func probeUDPWithConfirmation(targetAddr string, timeout time.Duration) (bool, error) {
+	status, err := probeUDPStatus(targetAddr, timeout)
+	return status == UDPProbeConfirmed, err
+}
+
+func queryExternalProbeEndpointDetailed(probeURL, proto, host string, port uint16, timeout time.Duration) (ExternalProbeResponse, error) {
 	u, err := url.Parse(strings.TrimSpace(probeURL))
 	if err != nil {
-		return false, err
+		return ExternalProbeResponse{}, err
 	}
 	q := u.Query()
 	q.Set("proto", proto)
@@ -2089,23 +2274,45 @@ func queryExternalProbeEndpoint(probeURL, proto, host string, port uint16, timeo
 	q.Set("timeout_ms", strconv.Itoa(int(timeout.Milliseconds())))
 	u.RawQuery = q.Encode()
 
-	client := &http.Client{Timeout: timeout + 1500*time.Millisecond}
-	resp, err := client.Get(u.String())
+	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
-		return false, err
+		return ExternalProbeResponse{}, err
+	}
+	if tok := strings.TrimSpace(defaultProbeAuthToken); tok != "" && req.Header.Get("Authorization") == "" {
+		firstTok := parseTokensList(tok)
+		if len(firstTok) > 0 {
+			req.Header.Set("Authorization", "Bearer "+firstTok[0])
+		}
+	}
+
+	client := &http.Client{Timeout: timeout + 1500*time.Millisecond}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ExternalProbeResponse{}, err
 	}
 	defer resp.Body.Close()
 	var pr ExternalProbeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
-		return false, err
+		return ExternalProbeResponse{}, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		if pr.Error != "" {
+			return pr, errors.New(pr.Error)
+		}
+		return pr, fmt.Errorf("probe endpoint returned HTTP %d", resp.StatusCode)
 	}
 	if !pr.Reachable {
 		if pr.Error != "" {
-			return false, errors.New(pr.Error)
+			return pr, errors.New(pr.Error)
 		}
-		return false, errors.New("external probe reported port unreachable")
+		return pr, errors.New("external probe reported port unreachable")
 	}
-	return true, nil
+	return pr, nil
+}
+
+func queryExternalProbeEndpoint(probeURL, proto, host string, port uint16, timeout time.Duration) (bool, error) {
+	pr, err := queryExternalProbeEndpointDetailed(probeURL, proto, host, port, timeout)
+	return pr.Reachable, err
 }
 
 type ReachabilityReport struct {
@@ -2175,24 +2382,33 @@ func checkExternalReachabilityWithProbe(pubIP, targetHost string, ddns DDNSConfi
 		}
 
 		if m.Proto == "udp" {
-			// Verify local UDP response confirmation first
-			localUDPOK, _ := probeUDPWithConfirmation(fmt.Sprintf("%s:%d", targetHost, m.TargetPort), timeout)
-			if !localUDPOK && m.RouterUDPPort > 0 {
-				localUDPOK, _ = probeUDPWithConfirmation(fmt.Sprintf("127.0.0.1:%d", m.RouterUDPPort), timeout)
+			// Verify local UDP service state (confirmed response vs silent/no-response vs ICMP connection refused)
+			localUDPStatus, _ := probeUDPStatus(fmt.Sprintf("%s:%d", targetHost, m.TargetPort), timeout)
+			if localUDPStatus != UDPProbeConfirmed && m.RouterUDPPort > 0 {
+				if rStatus, _ := probeUDPStatus(fmt.Sprintf("127.0.0.1:%d", m.RouterUDPPort), timeout); rStatus == UDPProbeConfirmed {
+					localUDPStatus = UDPProbeConfirmed
+				}
 			}
-			if localUDPOK {
+			switch localUDPStatus {
+			case UDPProbeConfirmed:
 				rep.LocalServiceStatus[m.PublicPort] = "ok (udp response confirmed)"
-			} else {
-				rep.LocalServiceStatus[m.PublicPort] = "unverified (no udp response on :" + strconv.Itoa(int(m.TargetPort)) + ")"
+			case UDPProbeNoResponse:
+				rep.LocalServiceStatus[m.PublicPort] = "open|silent (no ICMP error on :" + strconv.Itoa(int(m.TargetPort)) + "; UDP service did not reply to generic probe, which is normal for silent UDP protocols)"
+			default:
+				rep.LocalServiceStatus[m.PublicPort] = "closed (connection refused / ICMP port unreachable on :" + strconv.Itoa(int(m.TargetPort)) + ")"
 			}
 
 			if probeURL != "" && pubIP != "" {
-				extUDPOK, err := queryExternalProbeEndpoint(probeURL, "udp", pubIP, m.PublicPort, timeout)
-				if extUDPOK {
+				pr, err := queryExternalProbeEndpointDetailed(probeURL, "udp", pubIP, m.PublicPort, timeout)
+				switch {
+				case pr.Confirmed || pr.Reachable:
 					rep.ExternalStatus[m.PublicPort] = "verified-from-internet (external UDP probe response confirmed)"
 					rep.PortStatus[m.PublicPort] = "reachable (verified externally via UDP response confirmation)"
-				} else {
-					errMsg := "timeout/filtered"
+				case pr.Status == string(UDPProbeNoResponse):
+					rep.ExternalStatus[m.PublicPort] = "unconfirmed-udp (ответа на пробный UDP-пакет нет: обычный UDP-сервис может не отвечать на неспецифичные пакеты, либо порт фильтруется)"
+					rep.PortStatus[m.PublicPort] = "udp unconfirmed: no reply to generic UDP probe (silent UDP service or filtered; absence of reply does not prove port is closed)"
+				default:
+					errMsg := "connection refused"
 					if err != nil {
 						errMsg = err.Error()
 					}
@@ -2201,10 +2417,12 @@ func checkExternalReachabilityWithProbe(pubIP, targetHost string, ddns DDNSConfi
 				}
 			} else {
 				rep.ExternalStatus[m.PublicPort] = "unverified-from-internet (не удалось проверить извне: specify -probe-url for external UDP verification)"
-				if localUDPOK {
+				if localUDPStatus == UDPProbeConfirmed {
 					rep.PortStatus[m.PublicPort] = "local UDP OK; не удалось проверить извне (no external probe configured)"
+				} else if localUDPStatus == UDPProbeNoResponse {
+					rep.PortStatus[m.PublicPort] = "local UDP open|silent (no reply to generic probe); не удалось проверить извне (no external probe configured)"
 				} else {
-					rep.PortStatus[m.PublicPort] = "udp listener active; не удалось проверить извне (no external probe configured)"
+					rep.PortStatus[m.PublicPort] = "local UDP closed; не удалось проверить извне (no external probe configured)"
 				}
 			}
 			continue
