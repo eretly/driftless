@@ -1319,11 +1319,11 @@ func upnpGetSpecificPortMappingEntry(ctrlURL, serviceType string, extPort uint16
 	return "", "", false, false
 }
 
-func upnpCanSafelyOverwriteMapping(ctrlURL, serviceType, lanIP string, extPort uint16, proto string) bool {
+func upnpCanSafelyOverwriteMapping(ctrlURL, serviceType, lanIP string, extPort uint16, proto string, requireExplicitEntry bool) bool {
 	ic, desc, exists, supported := upnpGetSpecificPortMappingEntry(ctrlURL, serviceType, extPort, proto)
 	if !supported {
-		// Router does not implement GetSpecificPortMappingEntry; allow delete-retry when SOAP error code matched
-		return true
+		// For ambiguous 501/402 errors, never delete without explicit GetSpecificPortMappingEntry confirmation
+		return !requireExplicitEntry
 	}
 	if !exists {
 		return false
@@ -1356,7 +1356,7 @@ func upnpAddPortMappingExtInt(ctrlURL, serviceType, lanIP string, extPort, intPo
 		return nil
 	}
 	// 2. If port already has a conflicting/stale mapping (ErrorCode 718 on Asuswrt/TP-Link/Netgear/miniupnpd), verify ownership and retry 3600s
-	if isUPnPConflictError(err) && upnpCanSafelyOverwriteMapping(ctrlURL, serviceType, lanIP, extPort, proto) {
+	if isUPnPConflictError(err) && upnpCanSafelyOverwriteMapping(ctrlURL, serviceType, lanIP, extPort, proto, false) {
 		_ = upnpDeletePortMapping(ctrlURL, serviceType, extPort, proto)
 		if retryErr := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, extPort, intPort, proto, 3600); retryErr == nil {
 			return nil
@@ -1367,15 +1367,16 @@ func upnpAddPortMappingExtInt(ctrlURL, serviceType, lanIP string, extPort, intPo
 	if permErr == nil {
 		return nil
 	}
-	if isUPnPConflictError(permErr) && upnpCanSafelyOverwriteMapping(ctrlURL, serviceType, lanIP, extPort, proto) {
+	if isUPnPConflictError(permErr) && upnpCanSafelyOverwriteMapping(ctrlURL, serviceType, lanIP, extPort, proto, false) {
 		_ = upnpDeletePortMapping(ctrlURL, serviceType, extPort, proto)
 		if retryPermErr := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, extPort, intPort, proto, 0); retryPermErr == nil {
 			return nil
 		}
 	}
-	// 4. Restricted delete-then-recreate fallback ONLY for routers returning 501 Action Failed or 402 Invalid Args on a stale rule owned by us
+	// 4. Restricted delete-then-recreate fallback ONLY for routers returning 501 Action Failed or 402 Invalid Args
+	// when GetSpecificPortMappingEntry explicitly confirms a stale rule owned by driftless / this LAN IP.
 	if (isUPnPStaleRuleError(err) || isUPnPStaleRuleError(permErr)) &&
-		upnpCanSafelyOverwriteMapping(ctrlURL, serviceType, lanIP, extPort, proto) {
+		upnpCanSafelyOverwriteMapping(ctrlURL, serviceType, lanIP, extPort, proto, true) {
 		_ = upnpDeletePortMapping(ctrlURL, serviceType, extPort, proto)
 		if retryErr := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, extPort, intPort, proto, 3600); retryErr == nil {
 			return nil
