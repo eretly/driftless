@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	versionString = "v1.5.7"
+	versionString = "v1.5.8"
 	alpnProtocol  = "driftless-v1"
 	cmdAuth       = uint8(0)
 	cmdNewConn    = uint8(1)
@@ -162,22 +162,58 @@ func startMetricsServer(ctx context.Context, listenAddr string) {
 	}()
 }
 
+func joinHostPortUint16(host string, port uint16) string {
+	return net.JoinHostPort(host, strconv.Itoa(int(port)))
+}
+
 func detectPublicIP() string {
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("https://api.ipify.org")
-	if err != nil {
-		return ""
+	endpoints := []string{
+		"https://api4.ipify.org",
+		"https://checkip.amazonaws.com",
+		"https://icanhazip.com",
+		"https://ifconfig.me/ip",
 	}
-	defer resp.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 64))
-	if err != nil {
-		return ""
-	}
-	ip := strings.TrimSpace(string(b))
-	if net.ParseIP(ip) != nil {
-		return ip
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	for _, ep := range endpoints {
+		req, err := http.NewRequest("GET", ep, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "driftless/"+versionString)
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		b, rErr := io.ReadAll(io.LimitReader(resp.Body, 64))
+		_ = resp.Body.Close()
+		if rErr != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			continue
+		}
+		ipStr := strings.TrimSpace(string(b))
+		if parsed := net.ParseIP(ipStr); parsed != nil && parsed.To4() != nil {
+			return parsed.To4().String()
+		}
 	}
 	return ""
+}
+
+func isVirtualOrVPNInterfaceName(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	for _, prefix := range []string{
+		"docker", "br-", "veth", "virbr", "vethernet", "vmnet", "vboxnet",
+		"tailscale", "zerotier", "zt", "wg", "tun", "tap", "utun",
+		"radmin", "hamachi", "nordlynx", "proton", "warp", "virbr", "lo",
+	} {
+		if strings.HasPrefix(n, prefix) {
+			return true
+		}
+	}
+	for _, sub := range []string{"wsl", "hyper-v", "virtualbox", "vmware", "loopback", "tap-", "vpn", "wireguard", "tailscale", "zerotier", "radmin"} {
+		if strings.Contains(n, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 func detectLocalLANIP() string {
@@ -185,11 +221,15 @@ func detectLocalLANIP() string {
 	if err != nil {
 		return "127.0.0.1"
 	}
+	allowedIPs := make(map[string]bool)
+	var preferred192 []string
+	var fallbackPrivate []string
+
 	for _, iface := range ifaces {
-		name := strings.ToLower(iface.Name)
-		if strings.HasPrefix(name, "docker") || strings.HasPrefix(name, "br-") ||
-			strings.HasPrefix(name, "veth") || strings.HasPrefix(name, "virbr") ||
-			strings.HasPrefix(name, "vethernet") || strings.Contains(name, "wsl") {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagPointToPoint != 0 {
+			continue
+		}
+		if isVirtualOrVPNInterfaceName(iface.Name) {
 			continue
 		}
 		addrs, err := iface.Addrs()
@@ -202,10 +242,41 @@ func detectLocalLANIP() string {
 				continue
 			}
 			ip := ipNet.IP.To4()
-			if ip[0] == 10 || (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) || (ip[0] == 192 && ip[1] == 168) {
-				return ip.String()
+			// Skip VirtualBox default host-only subnet 192.168.56.0/24 unless no other LAN IP exists
+			if ip[0] == 192 && ip[1] == 168 && ip[2] == 56 {
+				fallbackPrivate = append(fallbackPrivate, ip.String())
+				continue
+			}
+			if ip[0] == 192 && ip[1] == 168 {
+				s := ip.String()
+				allowedIPs[s] = true
+				preferred192 = append(preferred192, s)
+			} else if ip[0] == 10 || (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) {
+				s := ip.String()
+				allowedIPs[s] = true
+				fallbackPrivate = append(fallbackPrivate, s)
 			}
 		}
+	}
+
+	// Ask OS routing table which physical interface routes to standard LAN/WAN targets (0 packets sent over network)
+	for _, probeDst := range []string{"192.168.1.1:80", "192.168.0.1:80", "1.1.1.1:80"} {
+		if c, err := net.Dial("udp4", probeDst); err == nil {
+			localAddr, ok := c.LocalAddr().(*net.UDPAddr)
+			_ = c.Close()
+			if ok && localAddr != nil && localAddr.IP != nil {
+				if v4 := localAddr.IP.To4(); v4 != nil && allowedIPs[v4.String()] {
+					return v4.String()
+				}
+			}
+		}
+	}
+
+	if len(preferred192) > 0 {
+		return preferred192[0]
+	}
+	if len(fallbackPrivate) > 0 {
+		return fallbackPrivate[0]
 	}
 	return "127.0.0.1"
 }
@@ -319,7 +390,8 @@ func parseVHostRoutes(raw string) ([]VHostRoute, error) {
 		if entry == "" {
 			continue
 		}
-		parts := strings.Split(entry, ":")
+		normalized := strings.ReplaceAll(entry, "=", ":")
+		parts := strings.Split(normalized, ":")
 		var domain, nodeID, portStr string
 		switch len(parts) {
 		case 2:
@@ -589,7 +661,7 @@ func printSavedTokenAndCommandInDir(certDir string) error {
 func runInteractiveCheck(stunAddr, targetHost, portsRaw, duckFlag, probeURL string) {
 	stunFailCount.Store(3)
 	pubIP, _ := querySTUNPublicIP(stunAddr, 1200*time.Millisecond)
-	if pubIP == "" {
+	if pubIP == "" && !isLoopbackOnlySTUNList(stunAddr) {
 		pubIP = detectPublicIP()
 	}
 	mappings, _ := parseMappingsWithDefault(portsRaw, true)
@@ -643,6 +715,7 @@ func main() {
 	nodeAliasFlag := flag.String("node", "", "alias for -id (unique node ID / computer name for multi-agent Gateway routing)")
 	quicAddr := flag.String("quic", "0.0.0.0:4242", "gateway address or comma-separated failover list (e.g. VPS1:4242,VPS2:4242)")
 	gatewayAlias := flag.String("gateway", "", "alias for -quic (gateway address or comma-separated failover list)")
+	gwShortAlias := flag.String("gw", "", "alias for -quic (gateway address or comma-separated failover list)")
 	vps2Addr := flag.String("vps2", "", "optional second backup VPS gateway address for automatic failover (e.g. BACKUP_VPS_IP:4242)")
 	transportMode := flag.String("transport", "auto", "tunnel transport: 'auto' (QUIC with automatic TCP-Mux fallback), 'quic', or 'tcp'")
 	tokenFlag := flag.String("token", "", "shared secret tunnel password or comma-separated rotation list (auto-generated on server if omitted)")
@@ -656,6 +729,7 @@ func main() {
 	domainShort := flag.String("domain", "", "custom domain to bind automatically with Auto-TLS (e.g. mysite.com or media.mysite.com:8096)")
 	vhostAddr := flag.String("vhost-addr", "", "optional HTTP/HTTPS Host router listen address (e.g. :80)")
 	vhosts := flag.String("vhosts", "", "comma-separated domain:LOCAL_PORT or domain:NODE_ID:LOCAL_PORT mappings (e.g. media.example.com:pc1:8096,site.example.com:pc2:3000)")
+	vhostSingular := flag.String("vhost", "", "alias for -vhosts")
 	direct := flag.String("direct", ":8888", "direct LAN/WAN HTTP redirector listen address (empty to disable)")
 	host := flag.String("host", "127.0.0.1", "local target host on agent/standalone")
 	maxBuf := flag.Int64("max-buf", 16*1024*1024, "max per-session ring buffer in bytes (default 16 MiB)")
@@ -703,6 +777,16 @@ func main() {
 
 	if strings.TrimSpace(*gatewayAlias) != "" {
 		*quicAddr = strings.TrimSpace(*gatewayAlias)
+	}
+	if strings.TrimSpace(*gwShortAlias) != "" {
+		*quicAddr = strings.TrimSpace(*gwShortAlias)
+	}
+	if strings.TrimSpace(*vhostSingular) != "" {
+		if *vhosts == "" {
+			*vhosts = strings.TrimSpace(*vhostSingular)
+		} else {
+			*vhosts = *vhosts + "," + strings.TrimSpace(*vhostSingular)
+		}
 	}
 	if strings.TrimSpace(*vps2Addr) != "" {
 		second := strings.TrimSpace(*vps2Addr)
@@ -773,13 +857,16 @@ func main() {
 	}
 
 	if *mode == "standalone" || *mode == "direct" || *mode == "p2p" {
-		mappings, err := parseMappingsWithDefault(*ports, *udpDefault)
-		if err != nil {
-			log.Fatalf("[standalone] %v", err)
-		}
 		vhostMap, err := parseVHosts(*vhosts)
 		if err != nil {
 			log.Fatalf("[standalone] %v", err)
+		}
+		var mappings []PortMapping
+		if strings.TrimSpace(*ports) != "" || len(vhostMap) == 0 {
+			mappings, err = parseMappingsWithDefault(*ports, *udpDefault)
+			if err != nil {
+				log.Fatalf("[standalone] %v", err)
+			}
 		}
 		if *vhostAddr == "" && len(vhostMap) > 0 {
 			*vhostAddr = "0.0.0.0:80"
@@ -823,9 +910,12 @@ func main() {
 	}
 
 	if isServer {
-		mappings, err := parseMappingsWithDefault(*ports, *udpDefault)
-		if err != nil {
-			log.Fatalf("[gateway] %v", err)
+		var mappings []PortMapping
+		if strings.TrimSpace(*ports) != "" {
+			mappings, err = parseMappingsWithDefault(*ports, *udpDefault)
+			if err != nil {
+				log.Fatalf("[gateway] %v", err)
+			}
 		}
 		vhostMap, err := parseVHosts(*vhosts)
 		if err != nil {

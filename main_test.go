@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -83,7 +84,7 @@ func getFreePort(t *testing.T, network string) int {
 func portBindable(network string, port int) bool {
 	if network == "tcp" {
 		for _, host := range []string{"0.0.0.0", "127.0.0.1"} {
-			l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
+			l, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 			if err != nil {
 				return false
 			}
@@ -3264,7 +3265,7 @@ func TestFreePortAllocatorReservesBothProtocols(t *testing.T) {
 		}
 		seen[port] = true
 		for _, host := range []string{"0.0.0.0", "127.0.0.1"} {
-			l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
+			l, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 			if err != nil {
 				t.Fatalf("port %d from %s allocation is not TCP-bindable on %s: %v", port, network, host, err)
 			}
@@ -3364,3 +3365,76 @@ func (l *lockedLogBuffer) String() string {
 	defer l.mu.Unlock()
 	return l.b.String()
 }
+
+func TestV158RouterStaleOverwriteLoopbackSTUNAndBlockedUDPFallback(t *testing.T) {
+	// 1. Loopback STUN isolation: when pinned to 127.0.0.1:PORT and offline, querySTUNPublicIP must NOT leak to external internet
+	closedSTUNPort := getFreePort(t, "udp")
+	stunFailCount.Store(5)
+	if ip, err := querySTUNPublicIP(fmt.Sprintf("127.0.0.1:%d", closedSTUNPort), 80*time.Millisecond); err == nil || ip != "" {
+		t.Fatalf("expected loopback STUN failure to return error without external IP leak, got ip=%q err=%v", ip, err)
+	}
+
+	// 2. VPN/virtual adapter filtering and /16 + /24 candidate gateway discovery
+	for _, vpnName := range []string{"wg0", "tun0", "tailscale0", "vEthernet (WSL)", "docker0", "radmin0", "vmnet8"} {
+		if !isVirtualOrVPNInterfaceName(vpnName) {
+			t.Fatalf("expected %q to be classified as virtual/VPN interface", vpnName)
+		}
+	}
+	for _, realName := range []string{"eth0", "en0", "wlan0", "Ethernet", "Wi-Fi"} {
+		if isVirtualOrVPNInterfaceName(realName) {
+			t.Fatalf("expected %q to be classified as physical LAN interface", realName)
+		}
+	}
+	gws := discoverCandidateGatewayIPs("10.0.5.42", nil)
+	found10001 := false
+	for _, g := range gws {
+		if g == "10.0.0.1" {
+			found10001 = true
+		}
+	}
+	if !found10001 {
+		t.Fatalf("expected 10.0.0.1 in candidate gateways for 10.0.5.42, got %v", gws)
+	}
+
+	// 3. Router UPnP overwrite quirk: router returns 501 Action Failed when adding a port that already has a stale rule,
+	// requiring DeletePortMapping before AddPortMapping succeeds.
+	var staleRuleDeleted atomic.Bool
+	routerLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer routerLn.Close()
+	routerSrv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sa := r.Header.Get("SOAPAction")
+			if strings.Contains(sa, "#DeletePortMapping") {
+				staleRuleDeleted.Store(true)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`<s:Envelope><s:Body><u:DeletePortMappingResponse/></s:Body></s:Envelope>`))
+				return
+			}
+			if strings.Contains(sa, "#AddPortMapping") {
+				if !staleRuleDeleted.Load() {
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte(`<s:Envelope><s:Body><s:Fault><detail><UPnPError><errorCode>501</errorCode><errorDescription>Action Failed</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>`))
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`<s:Envelope><s:Body><u:AddPortMappingResponse/></s:Body></s:Envelope>`))
+				return
+			}
+			w.WriteHeader(http.StatusBadRequest)
+		}),
+	}
+	go func() { _ = routerSrv.Serve(routerLn) }()
+	defer routerSrv.Close()
+
+	ctrlURL := fmt.Sprintf("http://%s/ctl/IGD", routerLn.Addr().String())
+	if err := upnpAddPortMappingExtInt(ctrlURL, "urn:schemas-upnp-org:service:WANIPConnection:1", "127.0.0.1", 8096, 8096, "TCP"); err != nil {
+		t.Fatalf("expected upnpAddPortMappingExtInt to recover from 501 Action Failed via DeletePortMapping+retry, got %v", err)
+	}
+	if !staleRuleDeleted.Load() {
+		t.Fatalf("expected DeletePortMapping to be called on 501 overwrite recovery")
+	}
+}
+

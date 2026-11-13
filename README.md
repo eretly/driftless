@@ -1,4 +1,4 @@
-# Driftless (v1.5.7)
+# Driftless (v1.5.8)
 
 > 🌐 **Choose Language / Выберите язык:** [🇺🇸 English (Full Documentation)](#english-documentation) · [🇷🇺 Русский (Полная инструкция)](#ru)
 
@@ -196,7 +196,7 @@ Driftless separates reachability into three distinct checks:
 | `driftless client` | Run Agent on a Home PC (connects to VPS Gateway, supports `-id` and `-vps2`) |
 | `driftless check` | Run external IP, CGNAT, local service, router port-forward, and external probe diagnostics |
 | `driftless show-token` | Print the saved Gateway token and ready-to-copy client connection command |
-| `driftless version` | Print `driftless v1.5.7` version string |
+| `driftless version` | Print `driftless v1.5.8` version string |
 
 #### All CLI Flags
 | Flag | Default | Description |
@@ -436,7 +436,7 @@ Driftless separates reachability into three distinct checks:
 | `driftless client` | Запуск агента на домашнем ПК (подключается к ВПС, поддерживает `-id` и `-vps2`) |
 | `driftless check` | Диагностика внешнего IP по STUN, CGNAT, локальных сервисов, проброса портов и внешней доступности |
 | `driftless show-token` | Показать сохранённый токен ВПС и готовую команду подключения для домашнего ПК |
-| `driftless version` | Вывести версию `driftless v1.5.7` |
+| `driftless version` | Вывести версию `driftless v1.5.8` |
 
 #### Все флаги (полная таблица)
 | Флаг | По умолчанию | Описание |

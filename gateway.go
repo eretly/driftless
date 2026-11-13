@@ -677,7 +677,7 @@ func (gw *Gateway) listenPublicUDPPort(ctx context.Context, m PortMapping) error
 	if bindIP == "" {
 		bindIP = "0.0.0.0"
 	}
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", bindIP, m.PublicPort))
+	addr, err := net.ResolveUDPAddr("udp", joinHostPortUint16(bindIP, m.PublicPort))
 	if err != nil {
 		return err
 	}
@@ -1438,7 +1438,7 @@ func (gw *Gateway) listenPublicPort(ctx context.Context, m PortMapping) error {
 	if bindIP == "" {
 		bindIP = "0.0.0.0"
 	}
-	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindIP, m.PublicPort))
+	l, err := net.Listen("tcp", joinHostPortUint16(bindIP, m.PublicPort))
 	if err != nil {
 		return fmt.Errorf("listen port %d: %w", m.PublicPort, err)
 	}

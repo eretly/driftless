@@ -507,7 +507,7 @@ func (ag *Agent) acceptGatewayStreams(ctx context.Context, conn TunnelConn) {
 			sess, exists := ag.sessions[sessID]
 			ag.mu.Unlock()
 			if !exists && (cmd == cmdNewConn || cmd == cmdResume) {
-				c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ag.targetHost, targetPort), 5*time.Second)
+				c, err := net.DialTimeout("tcp", joinHostPortUint16(ag.targetHost, targetPort), 5*time.Second)
 				if err != nil || c == nil {
 					_ = s.Close()
 					return

@@ -86,6 +86,35 @@ func normalizeSTUNAddr(raw string) string {
 	return s
 }
 
+func isLoopbackSTUNHost(stunAddr string) bool {
+	norm := normalizeSTUNAddr(stunAddr)
+	host, _, err := net.SplitHostPort(norm)
+	if err != nil {
+		host = norm
+	}
+	host = strings.TrimSpace(host)
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func isLoopbackOnlySTUNList(stunAddr string) bool {
+	hasAny := false
+	for _, part := range strings.Split(stunAddr, ",") {
+		norm := normalizeSTUNAddr(part)
+		if norm == "" {
+			continue
+		}
+		hasAny = true
+		if !isLoopbackSTUNHost(norm) {
+			return false
+		}
+	}
+	return hasAny
+}
+
 func buildSTUNServerList(stunAddr string) []string {
 	var list []string
 	for _, part := range strings.Split(stunAddr, ",") {
@@ -93,13 +122,15 @@ func buildSTUNServerList(stunAddr string) []string {
 			list = append(list, norm)
 		}
 	}
-	defaults := []string{
-		"stun.cloudflare.com:3478",
-		"stun.nextcloud.com:443",
-		"stun.l.google.com:19302",
-		"stun1.l.google.com:19302",
+	if !isLoopbackOnlySTUNList(stunAddr) {
+		defaults := []string{
+			"stun.cloudflare.com:3478",
+			"stun.nextcloud.com:443",
+			"stun.l.google.com:19302",
+			"stun1.l.google.com:19302",
+		}
+		list = append(list, defaults...)
 	}
-	list = append(list, defaults...)
 	seen := make(map[string]struct{}, len(list))
 	var out []string
 	for _, srv := range list {
@@ -155,8 +186,8 @@ func querySTUNPublicIP(stunAddr string, timeout time.Duration) (string, error) {
 		}
 		invalidateSTUNCache(srv)
 	}
-	// Only fall back to HTTP if UDP STUN failed on startup or 3 consecutive times
-	if stunFailCount.Add(1) >= 3 {
+	// Only fall back to external HTTP IP lookup when not pinned to a local loopback STUN endpoint
+	if !isLoopbackOnlySTUNList(stunAddr) && stunFailCount.Add(1) >= 3 {
 		if ip := detectPublicIP(); ip != "" {
 			stunFailCount.Store(0)
 			return ip, nil
@@ -1026,9 +1057,16 @@ func discoverUPnPEndpoints(timeout time.Duration) []upnpEndpoint {
 	if err != nil {
 		return nil
 	}
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	if err != nil {
-		return nil
+	lanIP := detectLocalLANIP()
+	var conn *net.UDPConn
+	if parsedLAN := net.ParseIP(lanIP).To4(); parsedLAN != nil && !parsedLAN.IsLoopback() {
+		conn, _ = net.ListenUDP("udp4", &net.UDPAddr{IP: parsedLAN, Port: 0})
+	}
+	if conn == nil {
+		conn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		if err != nil {
+			return nil
+		}
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(timeout))
@@ -1042,9 +1080,19 @@ func discoverUPnPEndpoints(timeout time.Duration) []upnpEndpoint {
 		"urn:schemas-upnp-org:device:InternetGatewayDevice:2",
 		"upnp:rootdevice",
 	}
+	var unicastGWs []*net.UDPAddr
+	for _, gwIP := range discoverCandidateGatewayIPs(lanIP, nil) {
+		if uAddr, uErr := net.ResolveUDPAddr("udp4", net.JoinHostPort(gwIP, "1900")); uErr == nil {
+			unicastGWs = append(unicastGWs, uAddr)
+		}
+	}
 	for _, st := range targets {
 		req := fmt.Sprintf("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: %s\r\n\r\n", st)
 		_, _ = conn.WriteToUDP([]byte(req), ssdpAddr)
+		for _, gwAddr := range unicastGWs {
+			uReq := fmt.Sprintf("M-SEARCH * HTTP/1.1\r\nHOST: %s\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: %s\r\n\r\n", gwAddr.String(), st)
+			_, _ = conn.WriteToUDP([]byte(uReq), gwAddr)
+		}
 	}
 
 	var locations []string
@@ -1226,7 +1274,17 @@ func upnpAddPortMappingExtInt(ctrlURL, serviceType, lanIP string, extPort, intPo
 			return nil
 		}
 	}
-	// 4. Strict IGDv2 fallback: AddAnyPortMapping (when AddPortMapping is disabled with 606 Action Not Authorized on WANIPConnection:2 / WANPPPConnection:2)
+	// 4. Unconditional delete-then-recreate fallback for routers that return 501 Action Failed or 402 Invalid Args instead of 718 when overwriting a stale mapping
+	if !isUPnPConflictError(err) && !isUPnPConflictError(permErr) {
+		_ = upnpDeletePortMapping(ctrlURL, serviceType, extPort, proto)
+		if retryErr := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, extPort, intPort, proto, 3600); retryErr == nil {
+			return nil
+		}
+		if retryPermErr := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, extPort, intPort, proto, 0); retryPermErr == nil {
+			return nil
+		}
+	}
+	// 5. Strict IGDv2 fallback: AddAnyPortMapping (when AddPortMapping is disabled with 606 Action Not Authorized on WANIPConnection:2 / WANPPPConnection:2)
 	if strings.HasSuffix(strings.TrimSpace(serviceType), ":2") {
 		if anyErr := upnpAddAnyPortMappingIGDv2(ctrlURL, serviceType, lanIP, extPort, intPort, proto, 3600); anyErr == nil {
 			return nil
@@ -1412,6 +1470,9 @@ func discoverCandidateGatewayIPs(lanIP string, endpoints []upnpEndpoint) []strin
 	}
 	if ip := net.ParseIP(lanIP).To4(); ip != nil {
 		addCandidate(net.IPv4(ip[0], ip[1], ip[2], 254).String())
+		if ip[2] != 0 {
+			addCandidate(net.IPv4(ip[0], ip[1], 0, 1).String())
+		}
 	}
 	return list
 }
@@ -2389,9 +2450,9 @@ func checkExternalReachabilityWithProbe(pubIP, targetHost string, ddns DDNSConfi
 
 		if m.Proto == "udp" {
 			// Verify local UDP service state (confirmed response vs silent/no-response vs ICMP connection refused)
-			localUDPStatus, _ := probeUDPStatus(fmt.Sprintf("%s:%d", targetHost, m.TargetPort), timeout)
+			localUDPStatus, _ := probeUDPStatus(joinHostPortUint16(targetHost, m.TargetPort), timeout)
 			if localUDPStatus != UDPProbeConfirmed && m.RouterUDPPort > 0 {
-				if rStatus, _ := probeUDPStatus(fmt.Sprintf("127.0.0.1:%d", m.RouterUDPPort), timeout); rStatus == UDPProbeConfirmed {
+				if rStatus, _ := probeUDPStatus(joinHostPortUint16("127.0.0.1", m.RouterUDPPort), timeout); rStatus == UDPProbeConfirmed {
 					localUDPStatus = UDPProbeConfirmed
 				}
 			}
@@ -2437,7 +2498,7 @@ func checkExternalReachabilityWithProbe(pubIP, targetHost string, ddns DDNSConfi
 
 		// 2. Check local TCP target service
 		localOK := false
-		if c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", targetHost, m.TargetPort), timeout); err == nil {
+		if c, err := net.DialTimeout("tcp", joinHostPortUint16(targetHost, m.TargetPort), timeout); err == nil {
 			_ = c.Close()
 			localOK = true
 			rep.LocalServiceStatus[m.PublicPort] = "ok (local TCP :" + strconv.Itoa(int(m.TargetPort)) + " reachable)"
@@ -2882,10 +2943,10 @@ func startStandaloneTCP(ctx context.Context, targetHost string, m *PortMapping, 
 	if bindIP == "" {
 		bindIP = "0.0.0.0"
 	}
-	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindIP, m.PublicPort))
+	l, err := net.Listen("tcp", joinHostPortUint16(bindIP, m.PublicPort))
 	if err != nil {
 		if m.PublicPort == m.TargetPort && isAddrInUseError(err) {
-			bridgeLn, bErr := net.Listen("tcp", fmt.Sprintf("%s:0", bindIP))
+			bridgeLn, bErr := net.Listen("tcp", net.JoinHostPort(bindIP, "0"))
 			if bErr == nil {
 				if tcpAddr, ok := bridgeLn.Addr().(*net.TCPAddr); ok && tcpAddr.Port > 0 {
 					m.RouterTCPPort = uint16(tcpAddr.Port)
@@ -2946,7 +3007,7 @@ func startStandaloneTCP(ctx context.Context, targetHost string, m *PortMapping, 
 					wrapped = pc
 				}
 
-				outConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", targetHost, dstPort), 5*time.Second)
+				outConn, err := net.DialTimeout("tcp", joinHostPortUint16(targetHost, dstPort), 5*time.Second)
 				if err != nil {
 					return
 				}
@@ -2973,14 +3034,14 @@ func startStandaloneUDP(ctx context.Context, targetHost string, m *PortMapping) 
 	if bindIP == "" {
 		bindIP = "0.0.0.0"
 	}
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", bindIP, m.PublicPort))
+	addr, err := net.ResolveUDPAddr("udp", joinHostPortUint16(bindIP, m.PublicPort))
 	if err != nil {
 		return err
 	}
 	pubConn, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		if m.PublicPort == m.TargetPort && isAddrInUseError(err) {
-			bridgeAddr, bErr := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:0", bindIP))
+			bridgeAddr, bErr := net.ResolveUDPAddr("udp", net.JoinHostPort(bindIP, "0"))
 			if bErr == nil {
 				if bridgeConn, lErr := net.ListenUDP("udp", bridgeAddr); lErr == nil {
 					if uAddr, ok := bridgeConn.LocalAddr().(*net.UDPAddr); ok && uAddr.Port > 0 {
@@ -3046,7 +3107,7 @@ func startStandaloneUDP(ctx context.Context, targetHost string, m *PortMapping) 
 					mu.Unlock()
 					continue
 				}
-				raddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", targetHost, dstPort))
+				raddr, err := net.ResolveUDPAddr("udp", joinHostPortUint16(targetHost, dstPort))
 				if err != nil {
 					mu.Unlock()
 					continue
@@ -3147,7 +3208,7 @@ func startStandaloneVHost(ctx context.Context, listenAddr, targetHost string, vh
 					_, _ = wrapped.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Length: 21\r\nConnection: close\r\n\r\ndriftless: unknown host"))
 					return
 				}
-				outConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", targetHost, targetPort), 5*time.Second)
+				outConn, err := net.DialTimeout("tcp", joinHostPortUint16(targetHost, targetPort), 5*time.Second)
 				if err != nil {
 					return
 				}

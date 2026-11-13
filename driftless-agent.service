@@ -8,14 +8,17 @@ Wants=network-online.target
 Type=simple
 User=driftless
 Group=driftless
+ExecStartPre=/usr/bin/install -d -o driftless -g driftless -m 0700 /etc/driftless
+WorkingDirectory=/etc/driftless
 EnvironmentFile=-/etc/driftless/agent.env
-ExecStart=/usr/local/bin/driftless client   -quic VPS_IP:4242   -host 127.0.0.1   -token-file /etc/driftless/token
+ExecStart=/usr/local/bin/driftless client -quic VPS_IP:4242 -host 127.0.0.1 -token-file /etc/driftless/token
 Restart=always
 RestartSec=2
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+ReadWritePaths=/etc/driftless
 
 [Install]
 WantedBy=multi-user.target
