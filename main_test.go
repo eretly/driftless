@@ -3375,12 +3375,12 @@ func TestV158RouterStaleOverwriteLoopbackSTUNAndBlockedUDPFallback(t *testing.T)
 	}
 
 	// 2. VPN/virtual adapter filtering and /16 + /24 candidate gateway discovery
-	for _, vpnName := range []string{"wg0", "tun0", "tailscale0", "vEthernet (WSL)", "docker0", "radmin0", "vmnet8"} {
+	for _, vpnName := range []string{"wg0", "tun0", "tailscale0", "vEthernet (WSL)", "docker0", "radmin0", "vmnet8", "lo", "lo0"} {
 		if !isVirtualOrVPNInterfaceName(vpnName) {
 			t.Fatalf("expected %q to be classified as virtual/VPN interface", vpnName)
 		}
 	}
-	for _, realName := range []string{"eth0", "en0", "wlan0", "Ethernet", "Wi-Fi"} {
+	for _, realName := range []string{"eth0", "en0", "wlan0", "Ethernet", "Wi-Fi", "Local Area Connection", "Local Area Connection 2"} {
 		if isVirtualOrVPNInterfaceName(realName) {
 			t.Fatalf("expected %q to be classified as physical LAN interface", realName)
 		}
@@ -3396,9 +3396,14 @@ func TestV158RouterStaleOverwriteLoopbackSTUNAndBlockedUDPFallback(t *testing.T)
 		t.Fatalf("expected 10.0.0.1 in candidate gateways for 10.0.5.42, got %v", gws)
 	}
 
-	// 3. Router UPnP overwrite quirk: router returns 501 Action Failed when adding a port that already has a stale rule,
-	// requiring DeletePortMapping before AddPortMapping succeeds.
+	// 3. Router UPnP overwrite & ownership protection via GetSpecificPortMappingEntry:
+	// - Port 8096: stale rule owned by driftless (127.0.0.1) returns 501 Action Failed -> verified via GetSpecificPortMappingEntry -> deleted & recreated.
+	// - Port 9000: rule owned by another LAN device (192.168.1.250, "PlayStation 5") returns 501 Action Failed -> must NOT be deleted.
+	// - Port 9001: router returns 606 Action Not Authorized -> must NOT trigger DeletePortMapping.
 	var staleRuleDeleted atomic.Bool
+	var foreignRuleDeleted atomic.Bool
+	var authErrDeleted atomic.Bool
+
 	routerLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -3406,22 +3411,57 @@ func TestV158RouterStaleOverwriteLoopbackSTUNAndBlockedUDPFallback(t *testing.T)
 	defer routerLn.Close()
 	routerSrv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			bodyBytes, _ := io.ReadAll(r.Body)
+			bodyStr := string(bodyBytes)
 			sa := r.Header.Get("SOAPAction")
+
+			if strings.Contains(sa, "#GetSpecificPortMappingEntry") {
+				switch {
+				case strings.Contains(bodyStr, "<NewExternalPort>8096</NewExternalPort>"):
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`<s:Envelope><s:Body><u:GetSpecificPortMappingEntryResponse><NewInternalPort>8096</NewInternalPort><NewInternalClient>127.0.0.1</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>driftless</NewPortMappingDescription><NewLeaseDuration>3600</NewLeaseDuration></u:GetSpecificPortMappingEntryResponse></s:Body></s:Envelope>`))
+				case strings.Contains(bodyStr, "<NewExternalPort>9000</NewExternalPort>"):
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`<s:Envelope><s:Body><u:GetSpecificPortMappingEntryResponse><NewInternalPort>9000</NewInternalPort><NewInternalClient>192.168.1.250</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>PlayStation 5</NewPortMappingDescription><NewLeaseDuration>3600</NewLeaseDuration></u:GetSpecificPortMappingEntryResponse></s:Body></s:Envelope>`))
+				default:
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte(`<s:Envelope><s:Body><s:Fault><detail><UPnPError><errorCode>714</errorCode><errorDescription>NoSuchEntryInArray</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>`))
+				}
+				return
+			}
 			if strings.Contains(sa, "#DeletePortMapping") {
-				staleRuleDeleted.Store(true)
+				switch {
+				case strings.Contains(bodyStr, "<NewExternalPort>8096</NewExternalPort>"):
+					staleRuleDeleted.Store(true)
+				case strings.Contains(bodyStr, "<NewExternalPort>9000</NewExternalPort>"):
+					foreignRuleDeleted.Store(true)
+				case strings.Contains(bodyStr, "<NewExternalPort>9001</NewExternalPort>"):
+					authErrDeleted.Store(true)
+				}
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(`<s:Envelope><s:Body><u:DeletePortMappingResponse/></s:Body></s:Envelope>`))
 				return
 			}
 			if strings.Contains(sa, "#AddPortMapping") {
-				if !staleRuleDeleted.Load() {
+				switch {
+				case strings.Contains(bodyStr, "<NewExternalPort>8096</NewExternalPort>"):
+					if !staleRuleDeleted.Load() {
+						w.WriteHeader(http.StatusInternalServerError)
+						_, _ = w.Write([]byte(`<s:Envelope><s:Body><s:Fault><detail><UPnPError><errorCode>501</errorCode><errorDescription>Action Failed</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>`))
+						return
+					}
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`<s:Envelope><s:Body><u:AddPortMappingResponse/></s:Body></s:Envelope>`))
+					return
+				case strings.Contains(bodyStr, "<NewExternalPort>9000</NewExternalPort>"):
 					w.WriteHeader(http.StatusInternalServerError)
 					_, _ = w.Write([]byte(`<s:Envelope><s:Body><s:Fault><detail><UPnPError><errorCode>501</errorCode><errorDescription>Action Failed</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>`))
 					return
+				case strings.Contains(bodyStr, "<NewExternalPort>9001</NewExternalPort>"):
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte(`<s:Envelope><s:Body><s:Fault><detail><UPnPError><errorCode>606</errorCode><errorDescription>Action Not Authorized</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>`))
+					return
 				}
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`<s:Envelope><s:Body><u:AddPortMappingResponse/></s:Body></s:Envelope>`))
-				return
 			}
 			w.WriteHeader(http.StatusBadRequest)
 		}),
@@ -3431,10 +3471,159 @@ func TestV158RouterStaleOverwriteLoopbackSTUNAndBlockedUDPFallback(t *testing.T)
 
 	ctrlURL := fmt.Sprintf("http://%s/ctl/IGD", routerLn.Addr().String())
 	if err := upnpAddPortMappingExtInt(ctrlURL, "urn:schemas-upnp-org:service:WANIPConnection:1", "127.0.0.1", 8096, 8096, "TCP"); err != nil {
-		t.Fatalf("expected upnpAddPortMappingExtInt to recover from 501 Action Failed via DeletePortMapping+retry, got %v", err)
+		t.Fatalf("expected upnpAddPortMappingExtInt to recover from 501 Action Failed on own stale rule, got %v", err)
 	}
 	if !staleRuleDeleted.Load() {
-		t.Fatalf("expected DeletePortMapping to be called on 501 overwrite recovery")
+		t.Fatalf("expected DeletePortMapping to be called on our own stale rule (port 8096)")
+	}
+
+	if err := upnpAddPortMappingExtInt(ctrlURL, "urn:schemas-upnp-org:service:WANIPConnection:1", "127.0.0.1", 9000, 9000, "TCP"); err == nil {
+		t.Fatalf("expected foreign rule on port 9000 to fail without deleting another device's mapping")
+	}
+	if foreignRuleDeleted.Load() {
+		t.Fatalf("expected DeletePortMapping NOT to be called when GetSpecificPortMappingEntry shows rule belongs to another LAN IP/device")
+	}
+
+	_ = upnpAddPortMappingExtInt(ctrlURL, "urn:schemas-upnp-org:service:WANIPConnection:1", "127.0.0.1", 9001, 9001, "TCP")
+	if authErrDeleted.Load() {
+		t.Fatalf("expected DeletePortMapping NOT to be called on 606 Action Not Authorized")
+	}
+
+	// 4. Blocked-UDP Fallback: when UDP packets to the Gateway port are dropped by the network,
+	// an Agent in "auto" transport mode must automatically fall back to TCP-Mux and forward both TCP and UDP traffic.
+	localTCPTarget, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localTCPTarget.Close()
+	localTCPPort := uint16(localTCPTarget.Addr().(*net.TCPAddr).Port)
+	go func() {
+		for {
+			c, err := localTCPTarget.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	localUDPTarget, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localUDPTarget.Close()
+	localUDPPort := uint16(localUDPTarget.LocalAddr().(*net.UDPAddr).Port)
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := localUDPTarget.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = localUDPTarget.WriteTo(append([]byte("UDP-FALLBACK-OK:"), buf[:n]...), addr)
+		}
+	}()
+
+	gwPort := getFreePort(t, "both")
+	gwAddr := fmt.Sprintf("127.0.0.1:%d", gwPort)
+	pubTCPPort := getFreePort(t, "tcp")
+	pubUDPPort := getFreePort(t, "udp")
+
+	// Start a proxy endpoint where UDP is completely blackholed (drops all packets) while TCP is forwarded to gwAddr
+	proxyPort := getFreePort(t, "both")
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
+	blackholeUDP, err := net.ListenPacket("udp", proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blackholeUDP.Close()
+	tcpProxyLn, err := net.Listen("tcp", proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcpProxyLn.Close()
+	go func() {
+		for {
+			inConn, err := tcpProxyLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				outConn, err := net.DialTimeout("tcp", gwAddr, 2*time.Second)
+				if err != nil {
+					return
+				}
+				defer outConn.Close()
+				go func() { _, _ = io.Copy(outConn, c) }()
+				_, _ = io.Copy(c, outConn)
+			}(inConn)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	prevTransport := defaultTransportMode
+	defaultTransportMode = "auto"
+	defer func() { defaultTransportMode = prevTransport }()
+
+	certDir := t.TempDir()
+	token := "v158-blocked-udp-fallback-token"
+	mappings := []PortMapping{
+		{BindIP: "127.0.0.1", PublicPort: uint16(pubTCPPort), TargetPort: localTCPPort, Proto: "tcp"},
+		{BindIP: "127.0.0.1", PublicPort: uint16(pubUDPPort), TargetPort: localUDPPort, Proto: "udp"},
+	}
+
+	go func() {
+		_ = runGateway(ctx, gwAddr, token, "", "", "", nil, mappings, 32*1024*1024, 4*1024*1024, 4*time.Second, 1*time.Second, 10*time.Second, certDir, "", "", false, false)
+	}()
+	waitForTCPListener(t, gwAddr, 3*time.Second)
+
+	go func() {
+		_ = runAgentWithServices(ctx, "pc-auto-fallback", proxyAddr, "127.0.0.1", token, "127.0.0.1", "", nil, nil, 4*1024*1024, 32*1024*1024, 4*time.Second, 1*time.Second, 10*time.Second, nil)
+	}()
+
+	// Verify TCP traffic succeeds after automatic fallback from blocked UDP (QUIC) to TCP-Mux
+	var tcpOK bool
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", pubTCPPort), 300*time.Millisecond)
+		if err == nil {
+			_ = c.SetDeadline(time.Now().Add(500 * time.Millisecond))
+			_, _ = c.Write([]byte("HELLO-OVER-TCPMUX"))
+			buf := make([]byte, 32)
+			n, rErr := c.Read(buf)
+			_ = c.Close()
+			if rErr == nil && string(buf[:n]) == "HELLO-OVER-TCPMUX" {
+				tcpOK = true
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !tcpOK {
+		t.Fatalf("expected agent in 'auto' mode to fall back to tcp-mux when UDP is blocked and forward TCP traffic")
+	}
+
+	// Verify UDP traffic is also encapsulated over TCP-Mux when UDP to Gateway is blocked
+	udpClient, err := net.DialTimeout("udp", fmt.Sprintf("127.0.0.1:%d", pubUDPPort), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpClient.Close()
+	_ = udpClient.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := udpClient.Write([]byte("PING-UDP")); err != nil {
+		t.Fatal(err)
+	}
+	ubuf := make([]byte, 128)
+	un, err := udpClient.Read(ubuf)
+	if err != nil || string(ubuf[:un]) != "UDP-FALLBACK-OK:PING-UDP" {
+		t.Fatalf("expected UDP over tcp-mux fallback to return 'UDP-FALLBACK-OK:PING-UDP', got %q (err=%v)", string(ubuf[:un]), err)
 	}
 }
+
 

@@ -197,14 +197,31 @@ func detectPublicIP() string {
 	return ""
 }
 
+func hasInterfacePrefix(n, prefix string) bool {
+	if !strings.HasPrefix(n, prefix) {
+		return false
+	}
+	if len(n) == len(prefix) {
+		return true
+	}
+	next := n[len(prefix)]
+	return (next >= '0' && next <= '9') || next == '-' || next == '_' || next == '.' || next == ' ' || next == '('
+}
+
 func isVirtualOrVPNInterfaceName(name string) bool {
 	n := strings.ToLower(strings.TrimSpace(name))
+	if n == "" || strings.HasPrefix(n, "local area connection") {
+		return false
+	}
+	if n == "lo" || n == "lo0" {
+		return true
+	}
 	for _, prefix := range []string{
 		"docker", "br-", "veth", "virbr", "vethernet", "vmnet", "vboxnet",
 		"tailscale", "zerotier", "zt", "wg", "tun", "tap", "utun",
-		"radmin", "hamachi", "nordlynx", "proton", "warp", "virbr", "lo",
+		"radmin", "hamachi", "nordlynx", "proton", "warp",
 	} {
-		if strings.HasPrefix(n, prefix) {
+		if hasInterfacePrefix(n, prefix) {
 			return true
 		}
 	}

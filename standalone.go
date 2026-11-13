@@ -1243,6 +1243,105 @@ func isUPnPConflictError(err error) bool {
 	return strings.Contains(msg, "718") || strings.Contains(msg, "ConflictInMappingEntry") || strings.Contains(msg, "729")
 }
 
+func isUPnPStaleRuleError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "606") || strings.Contains(msg, "Action Not Authorized") ||
+		strings.Contains(msg, "401") || strings.Contains(msg, "Invalid Action") ||
+		strings.Contains(msg, "725") || isUPnPConflictError(err) {
+		return false
+	}
+	return strings.Contains(msg, "<errorCode>501</errorCode>") ||
+		strings.Contains(msg, "501") && strings.Contains(msg, "Action Failed") ||
+		strings.Contains(msg, "<errorCode>402</errorCode>") ||
+		strings.Contains(msg, "402") && strings.Contains(msg, "Invalid Args")
+}
+
+func extractXMLTagValue(xmlBody, tag string) string {
+	openTag := "<" + tag + ">"
+	closeTag := "</" + tag + ">"
+	start := strings.Index(xmlBody, openTag)
+	if start < 0 {
+		return ""
+	}
+	start += len(openTag)
+	end := strings.Index(xmlBody[start:], closeTag)
+	if end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(xmlBody[start : start+end])
+}
+
+func upnpGetSpecificPortMappingEntry(ctrlURL, serviceType string, extPort uint16, proto string) (internalClient string, description string, exists bool, supported bool) {
+	if !isSafeRouterURL(ctrlURL) {
+		return "", "", false, false
+	}
+	proto = strings.ToUpper(strings.TrimSpace(proto))
+	soapBody := fmt.Sprintf(`<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:GetSpecificPortMappingEntry xmlns:u="%s">
+<NewRemoteHost></NewRemoteHost>
+<NewExternalPort>%d</NewExternalPort>
+<NewProtocol>%s</NewProtocol>
+</u:GetSpecificPortMappingEntry>
+</s:Body>
+</s:Envelope>`, serviceType, extPort, proto)
+
+	req, err := http.NewRequest("POST", ctrlURL, strings.NewReader(soapBody))
+	if err != nil {
+		return "", "", false, false
+	}
+	req.Header.Set("Content-Type", "text/xml; charset=\"utf-8\"")
+	req.Header.Set("SOAPAction", fmt.Sprintf("\"%s#GetSpecificPortMappingEntry\"", serviceType))
+	client := newSafeRouterHTTPClient(1200 * time.Millisecond)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", false, false
+	}
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+	_ = resp.Body.Close()
+	bodyStr := string(bodyBytes)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		ic := extractXMLTagValue(bodyStr, "NewInternalClient")
+		desc := extractXMLTagValue(bodyStr, "NewPortMappingDescription")
+		if ic != "" || desc != "" || strings.Contains(bodyStr, "GetSpecificPortMappingEntryResponse") {
+			return ic, desc, true, true
+		}
+		return "", "", false, false
+	}
+	if strings.Contains(bodyStr, "714") || strings.Contains(bodyStr, "NoSuchEntryInArray") ||
+		strings.Contains(bodyStr, "713") || strings.Contains(bodyStr, "SpecifiedArrayIndexInvalid") {
+		return "", "", false, true
+	}
+	return "", "", false, false
+}
+
+func upnpCanSafelyOverwriteMapping(ctrlURL, serviceType, lanIP string, extPort uint16, proto string) bool {
+	ic, desc, exists, supported := upnpGetSpecificPortMappingEntry(ctrlURL, serviceType, extPort, proto)
+	if !supported {
+		// Router does not implement GetSpecificPortMappingEntry; allow delete-retry when SOAP error code matched
+		return true
+	}
+	if !exists {
+		return false
+	}
+	descLower := strings.ToLower(strings.TrimSpace(desc))
+	if strings.Contains(descLower, "driftless") {
+		return true
+	}
+	lanIP = strings.TrimSpace(lanIP)
+	if ic != "" && !strings.EqualFold(ic, lanIP) {
+		return false
+	}
+	if descLower != "" && !strings.Contains(descLower, "driftless") {
+		return false
+	}
+	return true
+}
+
 func upnpAddPortMapping(ctrlURL, serviceType, lanIP string, port uint16, proto string) error {
 	return upnpAddPortMappingExtInt(ctrlURL, serviceType, lanIP, port, port, proto)
 }
@@ -1256,8 +1355,8 @@ func upnpAddPortMappingExtInt(ctrlURL, serviceType, lanIP string, extPort, intPo
 	if err == nil {
 		return nil
 	}
-	// 2. If port already has a conflicting/stale mapping (ErrorCode 718 on Asuswrt/TP-Link/Netgear/miniupnpd), delete and retry 3600s
-	if isUPnPConflictError(err) {
+	// 2. If port already has a conflicting/stale mapping (ErrorCode 718 on Asuswrt/TP-Link/Netgear/miniupnpd), verify ownership and retry 3600s
+	if isUPnPConflictError(err) && upnpCanSafelyOverwriteMapping(ctrlURL, serviceType, lanIP, extPort, proto) {
 		_ = upnpDeletePortMapping(ctrlURL, serviceType, extPort, proto)
 		if retryErr := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, extPort, intPort, proto, 3600); retryErr == nil {
 			return nil
@@ -1268,14 +1367,15 @@ func upnpAddPortMappingExtInt(ctrlURL, serviceType, lanIP string, extPort, intPo
 	if permErr == nil {
 		return nil
 	}
-	if isUPnPConflictError(permErr) {
+	if isUPnPConflictError(permErr) && upnpCanSafelyOverwriteMapping(ctrlURL, serviceType, lanIP, extPort, proto) {
 		_ = upnpDeletePortMapping(ctrlURL, serviceType, extPort, proto)
 		if retryPermErr := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, extPort, intPort, proto, 0); retryPermErr == nil {
 			return nil
 		}
 	}
-	// 4. Unconditional delete-then-recreate fallback for routers that return 501 Action Failed or 402 Invalid Args instead of 718 when overwriting a stale mapping
-	if !isUPnPConflictError(err) && !isUPnPConflictError(permErr) {
+	// 4. Restricted delete-then-recreate fallback ONLY for routers returning 501 Action Failed or 402 Invalid Args on a stale rule owned by us
+	if (isUPnPStaleRuleError(err) || isUPnPStaleRuleError(permErr)) &&
+		upnpCanSafelyOverwriteMapping(ctrlURL, serviceType, lanIP, extPort, proto) {
 		_ = upnpDeletePortMapping(ctrlURL, serviceType, extPort, proto)
 		if retryErr := upnpAddPortMappingWithLease(ctrlURL, serviceType, lanIP, extPort, intPort, proto, 3600); retryErr == nil {
 			return nil
