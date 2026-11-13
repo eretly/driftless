@@ -3403,6 +3403,7 @@ func TestV158RouterStaleOverwriteLoopbackSTUNAndBlockedUDPFallback(t *testing.T)
 	var staleRuleDeleted atomic.Bool
 	var foreignRuleDeleted atomic.Bool
 	var authErrDeleted atomic.Bool
+	var unsupportedGetDeleted atomic.Bool
 
 	routerLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -3423,6 +3424,9 @@ func TestV158RouterStaleOverwriteLoopbackSTUNAndBlockedUDPFallback(t *testing.T)
 				case strings.Contains(bodyStr, "<NewExternalPort>9000</NewExternalPort>"):
 					w.WriteHeader(http.StatusOK)
 					_, _ = w.Write([]byte(`<s:Envelope><s:Body><u:GetSpecificPortMappingEntryResponse><NewInternalPort>9000</NewInternalPort><NewInternalClient>192.168.1.250</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>PlayStation 5</NewPortMappingDescription><NewLeaseDuration>3600</NewLeaseDuration></u:GetSpecificPortMappingEntryResponse></s:Body></s:Envelope>`))
+				case strings.Contains(bodyStr, "<NewExternalPort>9002</NewExternalPort>"):
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte(`<s:Envelope><s:Body><s:Fault><detail><UPnPError><errorCode>401</errorCode><errorDescription>Invalid Action</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>`))
 				default:
 					w.WriteHeader(http.StatusInternalServerError)
 					_, _ = w.Write([]byte(`<s:Envelope><s:Body><s:Fault><detail><UPnPError><errorCode>714</errorCode><errorDescription>NoSuchEntryInArray</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>`))
@@ -3437,6 +3441,8 @@ func TestV158RouterStaleOverwriteLoopbackSTUNAndBlockedUDPFallback(t *testing.T)
 					foreignRuleDeleted.Store(true)
 				case strings.Contains(bodyStr, "<NewExternalPort>9001</NewExternalPort>"):
 					authErrDeleted.Store(true)
+				case strings.Contains(bodyStr, "<NewExternalPort>9002</NewExternalPort>"):
+					unsupportedGetDeleted.Store(true)
 				}
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(`<s:Envelope><s:Body><u:DeletePortMappingResponse/></s:Body></s:Envelope>`))
@@ -3453,7 +3459,7 @@ func TestV158RouterStaleOverwriteLoopbackSTUNAndBlockedUDPFallback(t *testing.T)
 					w.WriteHeader(http.StatusOK)
 					_, _ = w.Write([]byte(`<s:Envelope><s:Body><u:AddPortMappingResponse/></s:Body></s:Envelope>`))
 					return
-				case strings.Contains(bodyStr, "<NewExternalPort>9000</NewExternalPort>"):
+				case strings.Contains(bodyStr, "<NewExternalPort>9000</NewExternalPort>"), strings.Contains(bodyStr, "<NewExternalPort>9002</NewExternalPort>"):
 					w.WriteHeader(http.StatusInternalServerError)
 					_, _ = w.Write([]byte(`<s:Envelope><s:Body><s:Fault><detail><UPnPError><errorCode>501</errorCode><errorDescription>Action Failed</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>`))
 					return
@@ -3487,6 +3493,11 @@ func TestV158RouterStaleOverwriteLoopbackSTUNAndBlockedUDPFallback(t *testing.T)
 	_ = upnpAddPortMappingExtInt(ctrlURL, "urn:schemas-upnp-org:service:WANIPConnection:1", "127.0.0.1", 9001, 9001, "TCP")
 	if authErrDeleted.Load() {
 		t.Fatalf("expected DeletePortMapping NOT to be called on 606 Action Not Authorized")
+	}
+
+	_ = upnpAddPortMappingExtInt(ctrlURL, "urn:schemas-upnp-org:service:WANIPConnection:1", "127.0.0.1", 9002, 9002, "TCP")
+	if unsupportedGetDeleted.Load() {
+		t.Fatalf("expected DeletePortMapping NOT to be called on 501 when GetSpecificPortMappingEntry is unsupported")
 	}
 
 	// 4. Blocked-UDP Fallback: when UDP packets to the Gateway port are dropped by the network,
